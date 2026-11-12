@@ -47,6 +47,41 @@ export type SemanticZoomLevel = 'macro' | 'compact' | 'rich'
 export type PillNeighborDotState = 'active' | 'loading' | 'live' | 'hibernated' | 'ghost'
 
 /* ------------------------------------------------------------------ */
+/* Phase 1.5 — deterministic preview specs                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Phase 1.5 — which deterministic preview render a reference card shows.
+ * The UI chrome is dead-neutral; these preview renders are where 100%
+ * of the color lives (ZCODE_MASTER_PROMPT.md §Phase 1.5).
+ */
+export type PreviewSpecKind =
+  | 'type-specimen'
+  | 'ui-grid'
+  | 'duotone'
+  | 'wireframe'
+  | 'swatch-board'
+  | 'logo-mark'
+
+/**
+ * Declarative directive for a node's preview artwork, persisted per node
+ * (optional — pre-1.5 persisted state has no `preview` field).
+ * `ink`/`paper` are optional CSS color overrides for duotone-style
+ * treatments; when absent consumers fall back to the neutral ink/paper
+ * tokens. `seed` must always drive the artwork — never Math.random(),
+ * never per-render variation.
+ */
+export type PreviewSpec = {
+  kind: PreviewSpecKind
+  /** Deterministic generator seed — stable per node, never per render. */
+  seed: number
+  /** Optional ink override (any CSS color); default = neutral ink token. */
+  ink?: string
+  /** Optional paper override (any CSS color); default = neutral paper token. */
+  paper?: string
+}
+
+/* ------------------------------------------------------------------ */
 /* Domain records                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -120,6 +155,13 @@ export type SpatialTabNodeRecord = {
   /** Persisted anchor lock — non-null iff `isPinned`. */
   fx: number | null
   fy: number | null
+  /**
+   * Phase 1.5 — optional persisted preview directive. Absent in all
+   * pre-1.5 persisted state, so old stores still load unchanged;
+   * consumers MUST fall back to `defaultPreviewSpecFor(node)`
+   * (deterministic from domain + uuid), never to a random value.
+   */
+  preview?: PreviewSpec
 }
 
 /** Directional edge between two nodes; id is `${source}->${target}`. */
@@ -245,7 +287,7 @@ export type SpatialDragPayload = {
 export const SPATIAL_DRAG_MIME = 'application/x-spatial-tab-seed'
 
 /** §3 slash commands rendered by the expanded palette. */
-export type SlashCommandId = 'canvas' | 'hibernate-all' | 'new' | 'note' | 'cluster' | 'seed-600'
+export type SlashCommandId = 'canvas' | 'hibernate-all' | 'new' | 'note' | 'cluster' | 'seed-700'
 
 export type SlashCommand = {
   id: SlashCommandId
@@ -259,7 +301,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { id: 'new', label: '/new', description: 'Spawn a fresh live tab near the active node' },
   { id: 'note', label: '/note', description: 'Quick sticky note on the active node' },
   { id: 'cluster', label: '/cluster', description: 'Wrap the active 1-hop neighbourhood into a region' },
-  { id: 'seed-600', label: '/seed-600', description: '600-tab stress seed across 6 regions' },
+  { id: 'seed-700', label: '/seed-700', description: '700-node designer seed across 7 clusters' },
 ]
 
 /* ------------------------------------------------------------------ */
@@ -269,14 +311,37 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
 /** §4.2 — untouched > 14 simulated days dims into a "Cold Archive" chip. */
 export const COLD_ARCHIVE_DAYS = 14
 
-/** Region accent palette cycled by region/cluster creation (§2 accents). */
+/** All preview kinds, in the fixed cycle order used by `defaultPreviewSpecFor`. */
+export const PREVIEW_KINDS: readonly PreviewSpecKind[] = [
+  'type-specimen',
+  'ui-grid',
+  'duotone',
+  'wireframe',
+  'swatch-board',
+  'logo-mark',
+]
+
+/**
+ * Deterministic fallback preview for nodes persisted before Phase 1.5
+ * (no `preview` field). Derived purely from `${domain}:${uuid}` via
+ * FNV-1a, so the same node renders the same preview on every machine,
+ * in every session — old persisted state loads unchanged.
+ */
+export function defaultPreviewSpecFor(node: Pick<SpatialTabNodeRecord, 'uuid' | 'domain'>): PreviewSpec {
+  const hash = fnv1a32(`${node.domain}:${node.uuid}`)
+  return { kind: PREVIEW_KINDS[hash % PREVIEW_KINDS.length], seed: hash }
+}
+
+/** Region accent palette cycled by region/cluster creation — dead-neutral
+ * architectural tones in the same family as the seed's designer islands
+ * (the UI owns no hue; reference thumbnails own the color). */
 export const REGION_COLORS: readonly string[] = [
-  '#34D399', // pine/sage — primary accent
-  '#60A5FA', // sky
-  '#22D3EE', // cyan
-  '#A78BFA', // ghost violet
-  '#FDE047', // sticky amber
-  '#FB7185', // rose
+  '#8E8E96', // cool slate gray
+  '#B5B0A5', // warm stone
+  '#6E6A61', // umber
+  '#5A5A63', // deep slate
+  '#9B968B', // paper taupe
+  '#767B85', // blue-gray
 ]
 
 const DAY_MS = 86_400_000
@@ -354,9 +419,14 @@ export function looksLikeAuthOrPaymentUrl(rawUrl: string): boolean {
   )
 }
 
-/** §4 semantic zoom → LOD level; the override toggle pins the richest level. */
-export function lodForZoom(zoom: number, override: boolean): SemanticZoomLevel {
-  if (override) return 'rich'
+/**
+ * §4 semantic zoom → LOD level. The LOD lock (`override`) pins the tier that
+ * was current when it was engaged (`SemanticZoomLevel | null`, null = off):
+ * while locked, the wheel keeps zooming but the tier holds; unlocking
+ * resumes natural tier-stepping at the thresholds below.
+ */
+export function lodForZoom(zoom: number, override: SemanticZoomLevel | null): SemanticZoomLevel {
+  if (override) return override
   if (zoom < 0.35) return 'macro'
   if (zoom < 0.65) return 'compact'
   return 'rich'
@@ -369,15 +439,15 @@ export function lodForZoom(zoom: number, override: boolean): SemanticZoomLevel {
 /**
  * @xyflow/react custom-node data for `SpatialTabNode`. Built per render by
  * SpatialCanvas from the store record; everything the card renders is here
- * so the node component stays pure.
+ * so the node component stays pure. The §4 semantic-zoom tier is NOT part
+ * of the data — it flows through `CanvasLodContext`
+ * (components/canvas/canvasLodContext.ts) so a tier crossing re-renders only
+ * the mounted card components instead of rebuilding every React Flow node
+ * object in the graph (the Phase 1.5 700-node freeze fix).
  */
 export type SpatialTabNodeData = {
   /** The full domain record (never mutate it inside the component). */
   node: SpatialTabNodeRecord
-  /** §4 semantic zoom level for this frame. */
-  lod: SemanticZoomLevel
-  /** §3 semantic-zoom override toggle state. */
-  semanticZoomOverride: boolean
   regionName: string | null
   regionColor: string | null
   isActive: boolean

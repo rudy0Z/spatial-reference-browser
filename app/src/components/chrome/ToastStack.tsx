@@ -9,9 +9,9 @@
  *
  * Two toast kinds:
  *  - `auto-hibernate` — §5.2: the live pool (max 5) evicted the oldest
- *    non-immune tab to `HIBERNATED (0 MB)`.
+ *    non-immune tab to hibernation.
  *  - `ghost-echo` — §6: a Ghost Echo suggestion materialized beside the
- *    active cluster (violet spectral styling).
+ *    active cluster (frosted muted styling, same silent state grammar).
  */
 import { AnimatePresence, motion } from 'framer-motion'
 import { Ghost, Moon, X } from 'lucide-react'
@@ -37,20 +37,19 @@ function ToastCard({ toast }: { toast: Toast }) {
       key={toast.id}
       role="status"
       className={cn(
-        'pointer-events-auto flex w-[300px] items-start gap-2 rounded-lg border px-3 py-2 shadow-[0_14px_44px_rgba(0,0,0,0.55)] backdrop-blur-xl',
-        isGhost ? 'border-ghost/40 bg-violet-950/40' : 'border-hairline bg-surface-glass',
+        'pointer-events-auto flex w-[300px] items-start gap-2 rounded-lg border border-hairline bg-surface-glass shadow-[var(--shadow-pop)] backdrop-blur-xl',
       )}
       initial={{ opacity: 0, y: 14, scale: 0.96 }}
       animate={{ opacity: 1, y: 0, scale: 1 }}
       exit={{ opacity: 0, y: 8, scale: 0.97, transition: { duration: 0.16, ease: 'easeIn' } }}
       transition={TOAST_SPRING}
     >
-      <span className={cn('mt-0.5 shrink-0', isGhost ? 'text-ghost' : 'text-white/55')} aria-hidden="true">
+      <span className={cn('mt-0.5 shrink-0', isGhost ? 'text-ghost' : 'text-[color:var(--ink-secondary)]')} aria-hidden="true">
         {isGhost ? <Ghost size={13} /> : <Moon size={13} />}
       </span>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-[12px] font-medium leading-tight text-white/90">{toast.title}</p>
-        <p className={cn('mt-0.5 font-mono text-[9.5px] tracking-wide', isGhost ? 'text-ghost/80' : 'text-white/40')}>
+        <p className="truncate text-[12px] font-medium leading-tight text-[color:var(--ink-primary)]">{toast.title}</p>
+        <p className={cn('mt-0.5 text-[10px] tracking-ui', isGhost ? 'text-ghost' : 'text-[color:var(--ink-muted)]')}>
           {toast.body}
         </p>
       </div>
@@ -58,7 +57,7 @@ function ToastCard({ toast }: { toast: Toast }) {
         type="button"
         aria-label="Dismiss notification"
         onClick={() => dismissToast(toast.id)}
-        className="mt-0.5 shrink-0 rounded p-0.5 text-white/30 transition-colors hover:bg-white/[0.08] hover:text-white/70"
+        className="mt-0.5 shrink-0 rounded p-0.5 text-[color:var(--ink-muted)] transition-colors hover:bg-[color:var(--glass-soft)] hover:text-[color:var(--ink-primary)]"
       >
         <X size={11} />
       </button>

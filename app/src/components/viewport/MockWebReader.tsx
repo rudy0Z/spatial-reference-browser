@@ -1,31 +1,40 @@
 /**
  * app/src/components/viewport/MockWebReader.tsx — Mode A: the full-bleed
  * simulated webpage viewport (SPEC §3) and the §5.1 live link-spawning
- * testbed. Everything on the page is mocked but functional:
+ * testbed, restyled for the Phase 1.5 dead-neutral editorial design
+ * (ZCODE_MASTER_PROMPT.md §Phase 1.5). Everything on the page is mocked but
+ * functional:
  *
  *   • deterministic article/hero generation per node (url-hash driven), with
  *     curated pages for the seeded vocabulary (React Flow performance docs,
  *     WebGPU Fluid Shaders, Rust Servo Architecture, F1 Telemetry API, …)
  *   • outbound links (§5.1): normal click → `onNavigate` (navigate the active
- *     node in place), Cmd/Ctrl+Click or the visible "Branch Node" button →
+ *     node in place), Cmd/Ctrl+Click or the visible "Branch" button →
  *     `onBranch` (spawn child satellite + directional spawn edge), and every
  *     link is draggable with `SPATIAL_DRAG_MIME` + a JSON `SpatialDragPayload`
  *     for the pill drop zone (§6 drag-to-anchor)
  *   • google.com hub nodes render as a search-hub SERP (§7.1) whose results
- *     carry the `searchQuery` tag; oauth/payment nodes show a "via auth" chip
+ *     carry the `searchQuery` tag; oauth/payment nodes note "via sign-in"
  *     (§7.2); `noCapture` nodes render a blur-glass private page (§7.4);
  *     dead links surface the cached Readability excerpt (§7.5)
- *   • SPA-style pages (§7.3) render an "on this page" section nav that fires
+ *   • SPA-style pages (§7.3) render an "On this page" section nav that fires
  *     `onSubNavigate` (the mock did-navigate-in-page path — App wires it to
- *     `pushSubPage`) and shows the recorded pushState trail as chips
+ *     `pushSubPage`) and shows the recorded pushState trail as quiet chips
  *   • SoundCloud-style media bar (§5.3): play/pause toggles the store's
  *     `isAudible` immunity flag; audible tabs are never auto-hibernated
  *   • sticky rail (§7.6): quick capture affordance for Alt+N (the keyboard
  *     shortcut itself is wired globally in App), inline editing, and notes
  *     attached to the node's `url_hash`
  *
- * Design language: SPEC §2 dark tactical glass, framer-motion springs
- * (stiffness 380 / damping 30), lucide-react icons, clsx + tailwind-merge.
+ * Design language: Phase 1.5 matte editorial. Surfaces resolve through the
+ * canonical tokens (bg-card reading surface, hairline borders, ink steps) —
+ * zero neon, zero uppercase debug badges (`SLEEP · 0 MB`, `GHOST ECHO · 92%
+ * MATCH`, `NO CAPTURE`, `VIA AUTH`, `HUB`, `CACHED`, `LOADING` are gone —
+ * states speak through quiet sentence-case notes, dimming and small icons).
+ * The only hue is the page's own muted content accent (`--page-accent`,
+ * derived from the node hash) plus the hero artwork — content owns the
+ * color, the chrome is matte. `--font-mono` is reserved for URLs/paths,
+ * URL fragments and code; everything else is Inter at --tracking-ui.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, DragEvent, MouseEvent, ReactNode } from 'react'
@@ -153,7 +162,7 @@ const L = {
   readcv: { url: 'https://read.cv/guides/design-engineer-resume', title: 'read.cv — Design Engineer Resume Guide' },
 } satisfies Record<string, MockLinkTarget>
 
-/** Generic pool for uncurated domains (the 600-node stress seed). */
+/** Generic pool for uncurated domains (the 700-node stress seed). */
 const GENERIC_LINK_POOL: readonly MockLinkTarget[] = [
   { url: 'https://web.dev/articles/rendering-performance', title: 'Rendering Performance — web.dev' },
   { url: 'https://developer.mozilla.org/en-US/docs/WebAssembly', title: 'WebAssembly — MDN' },
@@ -219,19 +228,25 @@ const BLURBS: readonly string[] = [
 
 const blurbFor = (target: MockLinkTarget): string => BLURBS[fnv1a32(target.url) % BLURBS.length]
 
+/** Muted content-marker tone for the small link dots (content hue, quiet). */
+function linkDotColor(url: string): string {
+  return `hsl(${fnv1a32(url) % 360} 45% 58%)`
+}
+
 /* ------------------------------------------------------------------ */
 /* Page generation (deterministic per node)                            */
 /* ------------------------------------------------------------------ */
 
 type Topic = 'gpu' | 'browser' | 'data' | 'ui' | 'ai' | 'general'
 
+/** Sentence case — the Phase 1.5 chrome never shouts. */
 const TOPIC_LABELS: Record<Topic, string> = {
-  gpu: 'GPU RENDERING',
-  browser: 'BROWSER ENGINEERING',
-  data: 'DATA VIZ & TELEMETRY',
-  ui: 'INTERFACE ENGINEERING',
-  ai: 'LOCAL AI SYSTEMS',
-  general: 'FIELD NOTES',
+  gpu: 'GPU rendering',
+  browser: 'Browser engineering',
+  data: 'Data viz & telemetry',
+  ui: 'Interface engineering',
+  ai: 'Local AI systems',
+  general: 'Field notes',
 }
 
 function classifyTopic(node: SpatialTabNodeRecord): Topic {
@@ -651,7 +666,6 @@ type PageModel = {
   hash: number
   hue: number
   accent: string
-  bg: string
   pattern: 'wave' | 'grid' | 'bars'
   heroBars: number[]
   wavePath: string
@@ -674,7 +688,9 @@ type PageModel = {
 
 /**
  * Builds the whole mock page from the node record — deterministic given the
- * node, so re-renders and remounts never reshuffle content.
+ * node, so re-renders and remounts never reshuffle content. The content
+ * accent is deliberately muted (34% saturation) — restrained editorial hue
+ * for links, list marks and the hero artwork, never neon.
  */
 function buildPage(node: SpatialTabNodeRecord): PageModel {
   const hash = fnv1a32(node.url)
@@ -738,8 +754,7 @@ function buildPage(node: SpatialTabNodeRecord): PageModel {
   return {
     hash,
     hue,
-    accent: `hsl(${hue} 68% 62%)`,
-    bg: `radial-gradient(140% 110% at 50% 0%, hsl(${hue} 40% 9%) 0%, #0a0b0e 58%, #090a0c 100%)`,
+    accent: `hsl(${hue} 34% 58%)`,
     pattern: (['wave', 'grid', 'bars'] as const)[hash % 3],
     heroBars,
     wavePath: wavePoints.join(' '),
@@ -803,8 +818,8 @@ function BranchButton({ target, onBranch, className }: { target: MockLinkTarget;
       title={`Branch node → ${target.title}`}
       aria-label={`Branch node → ${target.title}`}
       className={cn(
-        'inline-flex size-5 shrink-0 items-center justify-center rounded-md border border-hairline bg-white/[0.04] text-white/50',
-        'transition-colors hover:border-accent/50 hover:text-accent',
+        'inline-flex size-5 shrink-0 items-center justify-center rounded-md border border-hairline bg-[color:var(--glass-soft)] text-[color:var(--ink-muted)]',
+        'transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)]',
         className,
       )}
       onClick={(event) => {
@@ -827,7 +842,7 @@ function InlineLink({ target, handlers }: { target: MockLinkTarget; handlers: Li
         draggable
         onClick={(event) => handleLinkActivate(event, target, handlers)}
         onDragStart={(event) => handleLinkDragStart(event, target)}
-        className="cursor-pointer font-medium underline decoration-dotted decoration-from-font underline-offset-2 transition-[text-shadow] hover:[text-shadow:0_0_12px_var(--page-accent)]"
+        className="cursor-pointer font-medium underline decoration-dotted decoration-from-font underline-offset-2 transition-colors hover:underline hover:decoration-solid"
         style={{ color: 'var(--page-accent)' }}
       >
         {target.title}
@@ -840,7 +855,7 @@ function InlineLink({ target, handlers }: { target: MockLinkTarget; handlers: Li
 /** "Linked from this page" card: draggable pill-drop seed with branch action. */
 function LinkCard({ target, handlers }: { target: MockLinkTarget; handlers: LinkHandlers }) {
   return (
-    <div className="group relative flex gap-2 rounded-xl border border-hairline bg-surface-glass p-3 backdrop-blur-md transition-colors hover:border-white/20 hover:bg-white/[0.05]">
+    <div className="group relative flex gap-2 rounded-xl border border-hairline bg-[color:var(--glass-soft)] p-3 transition-colors hover:border-[color:var(--border-hover)]">
       <a
         href={target.url}
         draggable
@@ -849,112 +864,102 @@ function LinkCard({ target, handlers }: { target: MockLinkTarget; handlers: Link
         className="flex min-w-0 flex-1 cursor-grab flex-col gap-1 active:cursor-grabbing"
       >
         <span className="flex items-center gap-1.5">
-          <span className="size-2 rounded-full" style={{ background: `hsl(${fnv1a32(target.url) % 360} 68% 62%)` }} />
-          <span className="truncate font-mono text-[10px] tracking-tight text-white/45">{domainOf(target.url)}</span>
-          <ArrowUpRight className="ml-auto size-3.5 shrink-0 text-white/35 transition-colors group-hover:text-white/75" strokeWidth={1.75} />
+          <span className="size-2 rounded-full" style={{ background: linkDotColor(target.url) }} />
+          <span className="truncate text-[10.5px] text-[color:var(--ink-muted)]">{domainOf(target.url)}</span>
+          <ArrowUpRight className="ml-auto size-3.5 shrink-0 text-[color:var(--ink-muted)] transition-colors group-hover:text-[color:var(--ink-secondary)]" strokeWidth={1.75} />
         </span>
-        <span className="text-[13px] leading-snug text-white/90">{target.title}</span>
-        <span className="truncate text-[11px] text-white/45">{blurbFor(target)}</span>
+        <span className="text-[13px] leading-snug text-[color:var(--ink-primary)]">{target.title}</span>
+        <span className="truncate text-[11px] text-[color:var(--ink-secondary)]">{blurbFor(target)}</span>
         {target.searchQuery ? (
-          <span className="mt-0.5 w-fit rounded-md bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] text-accent">“{target.searchQuery}”</span>
+          <span className="mt-0.5 w-fit text-[11px] italic text-[color:var(--ink-secondary)]">“{target.searchQuery}”</span>
         ) : null}
       </a>
       <span className="flex flex-col items-center gap-1">
         <BranchButton target={target} onBranch={handlers.onBranch} className="opacity-0 group-hover:opacity-100" />
-        <GripVertical className="size-3.5 text-white/20 opacity-0 transition-opacity group-hover:opacity-100" strokeWidth={1.75} />
+        <GripVertical className="size-3.5 text-[color:var(--border-active)] opacity-0 transition-opacity group-hover:opacity-100" strokeWidth={1.75} />
       </span>
     </div>
   )
 }
 
 /* ------------------------------------------------------------------ */
-/* Reader chrome: chips, banners, hero                                 */
+/* Reader chrome: kbd hint, state banners, hero                        */
 /* ------------------------------------------------------------------ */
 
-function Kbd({ children }: { children: string }) {
-  return <kbd className="rounded border border-hairline bg-white/[0.05] px-1 font-mono text-[9px] text-white/60">{children}</kbd>
-}
-
-function HeaderChip({ tone, icon, children }: { tone: 'amber' | 'accent' | 'violet'; icon?: ReactNode; children: ReactNode }) {
-  const tones = {
-    amber: 'border-amber-400/30 bg-amber-400/10 text-amber-300',
-    accent: 'border-accent/30 bg-accent/10 text-accent',
-    violet: 'border-ghost/40 bg-ghost/10 text-ghost',
-  } as const
+/** <kbd> is one of the two legitimate homes of --font-mono. */
+function Kbd({ children }: { children: ReactNode }) {
   return (
-    <span className={cn('inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-mono text-[10px] tracking-tight', tones[tone])}>
-      {icon}
+    <kbd className="rounded border border-hairline bg-[color:var(--glass-soft)] px-1 font-mono text-[9px] leading-[15px] text-[color:var(--ink-secondary)]">
       {children}
-    </span>
+    </kbd>
   )
 }
 
+/**
+ * Silent state grammar — no uppercase debug banners. A ghost is a quiet
+ * frosted note ("Related earlier" per §Phase 1.5), a hibernated tab is a
+ * quiet archived-snapshot note; the prose dims instead.
+ */
 function StateBanner({ node }: { node: SpatialTabNodeRecord }) {
   if (node.nodeType === 'ghost-echo') {
     return (
-      <div className="mb-6 flex items-center gap-3 rounded-xl border border-dashed border-ghost/50 bg-ghost/10 px-4 py-3">
-        <Ghost className="size-4 shrink-0 text-ghost" strokeWidth={1.75} />
-        <div className="min-w-0">
-          <p className="font-mono text-[11px] tracking-tight text-ghost">GHOST ECHO · {Math.round((node.ghostMatch ?? 0.8) * 100)}% MATCH</p>
-          <p className="mt-0.5 truncate text-[12px] text-white/60">Predicted resurfacing — wake the node to read it for real.</p>
-        </div>
+      <div className="mb-6 flex items-center gap-3 rounded-xl border border-hairline bg-[color:var(--glass-soft)] px-4 py-3">
+        <Ghost className="size-4 shrink-0 text-[color:var(--ink-secondary)]" strokeWidth={1.75} aria-hidden />
+        <p className="min-w-0 text-[12.5px] leading-relaxed text-[color:var(--ink-secondary)]">
+          Related earlier — predicted resurfacing
+          {node.ghostMatch != null ? <> · {Math.round(node.ghostMatch * 100)}% match</> : null}. Wake the node to read it
+          for real.
+        </p>
       </div>
     )
   }
   if (node.ramState === 'hibernated') {
     return (
-      <div className="mb-6 flex items-center gap-3 rounded-xl border border-hairline bg-white/[0.03] px-4 py-3">
-        <Clock className="size-4 shrink-0 text-white/40" strokeWidth={1.75} />
-        <p className="font-mono text-[11px] tracking-tight text-white/50">SLEEP · 0 MB — showing the archived snapshot below</p>
+      <div className="mb-6 flex items-center gap-3 rounded-xl border border-hairline bg-[color:var(--glass-soft)] px-4 py-3">
+        <Clock className="size-4 shrink-0 text-[color:var(--ink-muted)]" strokeWidth={1.75} aria-hidden />
+        <p className="min-w-0 text-[12.5px] leading-relaxed text-[color:var(--ink-secondary)]">
+          Archived snapshot — this tab is asleep. Opening it wakes the node.
+        </p>
       </div>
     )
   }
   return null
 }
 
-function HeroBand({ node, page }: { node: SpatialTabNodeRecord; page: PageModel }) {
+/** Editorial hero artwork — the page's own quiet content color, no chips. */
+function HeroBand({ page }: { page: PageModel }) {
   return (
     <motion.div
       initial={{ opacity: 0, scale: 0.985 }}
       animate={{ opacity: 1, scale: 1 }}
       transition={SPRING}
-      className="relative mt-6 h-44 overflow-hidden rounded-2xl border border-hairline"
-      style={{ background: `linear-gradient(135deg, hsl(${page.hue} 45% 12%) 0%, hsl(${(page.hue + 40) % 360} 40% 8%) 100%)` }}
+      className="relative mt-6 h-40 overflow-hidden rounded-2xl border border-hairline"
+      style={{ background: `linear-gradient(135deg, hsl(${page.hue} 26% 13%) 0%, hsl(${(page.hue + 40) % 360} 22% 9%) 100%)` }}
     >
       {page.pattern === 'wave' ? (
-        <svg viewBox="0 0 960 120" preserveAspectRatio="none" className="absolute inset-0 h-full w-full opacity-70">
-          <path d={page.wavePath} fill="none" stroke={page.accent} strokeWidth="1.5" opacity="0.55" />
-          <path d={page.wavePath} fill="none" stroke="#ffffff" strokeWidth="0.75" opacity="0.18" transform="translate(0 26)" />
+        <svg viewBox="0 0 960 120" preserveAspectRatio="none" className="absolute inset-0 h-full w-full opacity-70" aria-hidden>
+          <path d={page.wavePath} fill="none" stroke={page.accent} strokeWidth="1.5" opacity="0.5" />
+          <path d={page.wavePath} fill="none" stroke="#ffffff" strokeWidth="0.75" opacity="0.14" transform="translate(0 26)" />
         </svg>
       ) : null}
       {page.pattern === 'grid' ? (
         <div
-          className="absolute inset-0 opacity-60"
-          style={{ backgroundImage: `radial-gradient(hsl(${page.hue} 68% 62% / 0.35) 1px, transparent 1px)`, backgroundSize: '18px 18px' }}
+          className="absolute inset-0 opacity-50"
+          aria-hidden
+          style={{ backgroundImage: `radial-gradient(hsl(${page.hue} 45% 58% / 0.3) 1px, transparent 1px)`, backgroundSize: '18px 18px' }}
         />
       ) : null}
       {page.pattern === 'bars' ? (
-        <div className="absolute inset-x-6 bottom-0 flex h-full items-end gap-1 opacity-70">
+        <div className="absolute inset-x-6 bottom-0 flex h-full items-end gap-1 opacity-60" aria-hidden>
           {page.heroBars.map((height, index) => (
             <span
               key={index}
               className="flex-1 rounded-t-sm"
-              style={{ height: `${Math.round(height * 62)}%`, background: `hsl(${page.hue} 68% 62% / ${0.16 + height * 0.3})` }}
+              style={{ height: `${Math.round(height * 62)}%`, background: `hsl(${page.hue} 45% 58% / ${0.14 + height * 0.26})` }}
             />
           ))}
         </div>
       ) : null}
-      <div className="absolute left-4 top-4 flex items-center gap-2">
-        <span className="rounded-md border border-hairline bg-black/40 px-2 py-1 font-mono text-[10px] tracking-tight text-white/70 backdrop-blur-md">
-          {page.topicLabel}
-        </span>
-        <span className="rounded-md border border-hairline bg-black/40 px-2 py-1 font-mono text-[10px] tracking-tight text-white/50 backdrop-blur-md">
-          § {page.readMinutes} MIN READ
-        </span>
-      </div>
-      <div className="absolute bottom-4 right-4 rounded-md border border-hairline bg-black/40 px-2 py-1 font-mono text-[10px] tracking-tight text-white/50 backdrop-blur-md">
-        § {node.visitCount} VISITS
-      </div>
     </motion.div>
   )
 }
@@ -971,10 +976,10 @@ function SpaSectionNav({
   onSectionClick: (section: SpaSection) => void
 }) {
   return (
-    <div className="mt-6 rounded-xl border border-hairline bg-surface-glass p-3 backdrop-blur-md">
+    <div className="mt-6 rounded-xl border border-hairline bg-[color:var(--glass-soft)] p-3">
       <div className="flex items-center gap-1.5">
-        <GitCommitHorizontal className="size-3.5 text-white/50" strokeWidth={1.75} />
-        <span className="font-mono text-[10px] tracking-tight text-white/50">ON THIS PAGE · IN-DOMAIN PUSHSTATE</span>
+        <GitCommitHorizontal className="size-3.5 text-[color:var(--ink-muted)]" strokeWidth={1.75} aria-hidden />
+        <span className="text-[11px] text-[color:var(--ink-secondary)]">On this page — in-domain trail</span>
       </div>
       <div className="mt-2 flex flex-wrap gap-1.5">
         {page.spaSections.map((section) => (
@@ -982,10 +987,10 @@ function SpaSectionNav({
             key={section.slug}
             type="button"
             onClick={() => onSectionClick(section)}
-            className="rounded-md border border-hairline bg-white/[0.03] px-2 py-1 text-[11px] text-white/70 transition-colors hover:border-accent/40 hover:text-accent"
+            className="rounded-md border border-hairline px-2 py-1 text-[11px] text-[color:var(--ink-secondary)] transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)]"
           >
             {section.label}
-            <span className="ml-1 font-mono text-[9px] text-white/35">#{section.slug}</span>
+            <span className="ml-1 font-mono text-[9.5px] text-[color:var(--ink-muted)]">#{section.slug}</span>
           </button>
         ))}
       </div>
@@ -997,9 +1002,9 @@ function OutboundSection({ page, handlers }: { page: PageModel; handlers: LinkHa
   return (
     <section className="mt-10">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-[15px] font-semibold tracking-tight text-white/95">Linked from this page</h2>
-        <span className="inline-flex items-center gap-1.5 font-mono text-[10px] text-white/40">
-          <Kbd>⌘/Ctrl</Kbd> click to branch · drag a link onto the pill
+        <h2 className="text-[15px] font-semibold tracking-tight text-[color:var(--ink-primary)]">Linked from this page</h2>
+        <span className="inline-flex items-center gap-1.5 text-[11px] text-[color:var(--ink-muted)]">
+          <Kbd>⌘/Ctrl</Kbd> click to branch · drag a link onto the island
         </span>
       </div>
       <div className="mt-3 grid gap-2.5 sm:grid-cols-2">
@@ -1025,26 +1030,26 @@ function ArticleBody({
   return (
     <>
       <header>
-        <p className="font-mono text-[11px] tracking-tight" style={{ color: page.accent }}>
+        <p className="text-[11px] text-[color:var(--ink-secondary)]">
           {page.topicLabel} · {domainOf(node.url)}
         </p>
-        <h1 className="mt-2 text-3xl font-semibold leading-tight tracking-tight text-white">{node.title}</h1>
-        <p className="mt-3 text-[15px] leading-relaxed text-white/65">{page.dek}</p>
-        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-white/45">
-          <span className="text-white/70">{page.author}</span>
-          <span>·</span>
+        <h1 className="mt-2 text-3xl font-semibold leading-tight tracking-tight text-[color:var(--ink-primary)]">{node.title}</h1>
+        <p className="mt-3 text-[15px] leading-relaxed text-[color:var(--ink-secondary)]">{page.dek}</p>
+        <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-[color:var(--ink-muted)]">
+          <span className="text-[color:var(--ink-secondary)]">{page.author}</span>
+          <span aria-hidden>·</span>
           <span>{page.dateLabel}</span>
-          <span>·</span>
+          <span aria-hidden>·</span>
           <span className="inline-flex items-center gap-1">
-            <Clock className="size-3" strokeWidth={1.75} />
+            <Clock className="size-3" strokeWidth={1.75} aria-hidden />
             {page.readMinutes} min read
           </span>
-          <span>·</span>
+          <span aria-hidden>·</span>
           <span>{node.visitCount} visits</span>
         </div>
       </header>
 
-      <HeroBand node={node} page={page} />
+      <HeroBand page={page} />
 
       {page.isSpa && page.spaSections.length > 0 ? <SpaSectionNav page={page} onSectionClick={onSectionClick} /> : null}
 
@@ -1053,12 +1058,12 @@ function ArticleBody({
           <section key={section.id}>
             <div data-sec={section.id} className="scroll-mt-6">
               <div className="flex items-center gap-2.5">
-                <span className="h-4 w-0.5 rounded-full" style={{ background: page.accent }} />
-                <h2 className="text-[15px] font-semibold tracking-tight text-white/95">{section.heading}</h2>
+                <span className="h-4 w-0.5 rounded-full" style={{ background: page.accent }} aria-hidden />
+                <h2 className="text-[15px] font-semibold tracking-tight text-[color:var(--ink-primary)]">{section.heading}</h2>
               </div>
               <div className="mt-3 space-y-3">
                 {section.paras.map((para, index) => (
-                  <p key={index} className="text-[14.5px] leading-[1.75] text-white/75">
+                  <p key={index} className="text-[14.5px] leading-[1.75] text-[color:var(--ink-secondary)]">
                     {para.map((seg, segIndex) => {
                       if (typeof seg === 'string') return <span key={segIndex}>{seg}</span>
                       const target = page.links[seg]
@@ -1071,8 +1076,8 @@ function ArticleBody({
             {section.list ? (
               <ul className="mt-3 space-y-1.5">
                 {section.list.map((item) => (
-                  <li key={item} className="flex items-start gap-2 text-[13px] leading-relaxed text-white/65">
-                    <span className="mt-1.5 size-1.5 shrink-0 rounded-full" style={{ background: page.accent }} />
+                  <li key={item} className="flex items-start gap-2 text-[13px] leading-relaxed text-[color:var(--ink-secondary)]">
+                    <span className="mt-1.5 size-1.5 shrink-0 rounded-full" style={{ background: page.accent }} aria-hidden />
                     {item}
                   </li>
                 ))}
@@ -1081,27 +1086,27 @@ function ArticleBody({
           </section>
         ))}
 
-        <figure className="rounded-xl border border-hairline bg-surface-glass p-4 backdrop-blur-md">
-          <blockquote className="text-[14px] leading-relaxed text-white/80">{page.quote}</blockquote>
+        <figure className="rounded-xl border border-hairline bg-[color:var(--glass-soft)] p-4">
+          <blockquote className="text-[14px] leading-relaxed text-[color:var(--ink-primary)]">{page.quote}</blockquote>
         </figure>
 
-        <div className="overflow-hidden rounded-xl border border-hairline bg-black/50">
+        <div className="overflow-hidden rounded-xl border border-hairline" style={{ background: 'var(--bg-canvas)' }}>
           <div className="flex items-center justify-between border-b border-hairline px-3 py-1.5">
-            <span className="font-mono text-[10px] tracking-tight text-white/45">{page.code.lang}</span>
-            <span className="font-mono text-[10px] tracking-tight text-white/30">mock · read-only</span>
+            <span className="text-[10.5px] text-[color:var(--ink-secondary)]">{page.code.lang}</span>
+            <span className="text-[10.5px] text-[color:var(--ink-muted)]">mock · read-only</span>
           </div>
-          <pre className="overflow-x-auto p-4 font-mono text-[11.5px] leading-relaxed text-white/80">
+          <pre className="overflow-x-auto p-4 font-mono text-[11.5px] leading-relaxed text-[color:var(--ink-secondary)]">
             <code>{page.code.code}</code>
           </pre>
         </div>
 
         {node.excerpt ? (
-          <div className="rounded-xl border border-sticky/30 bg-sticky-glass p-4">
+          <div className="rounded-xl border border-hairline bg-[color:var(--glass-soft)] p-4">
             <div className="flex items-center gap-2">
-              <FileText className="size-3.5 text-sticky" strokeWidth={1.75} />
-              <span className="font-mono text-[10px] tracking-tight text-sticky">CACHED TEXT · READABILITY SNAPSHOT</span>
+              <FileText className="size-3.5 text-[color:var(--ink-muted)]" strokeWidth={1.75} aria-hidden />
+              <span className="text-[11px] text-[color:var(--ink-muted)]">Cached text — readability snapshot</span>
             </div>
-            <pre className="mt-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-white/70">{node.excerpt}</pre>
+            <p className="mt-2 whitespace-pre-wrap text-[12px] leading-relaxed text-[color:var(--ink-secondary)]">{node.excerpt}</p>
           </div>
         ) : null}
       </div>
@@ -1119,25 +1124,25 @@ function SerpBody({ node, page, handlers }: { node: SpatialTabNodeRecord; page: 
   return (
     <>
       <header>
-        <p className="font-mono text-[11px] tracking-tight text-white/45">SEARCH HUB · EPHEMERAL ROUTER</p>
-        <div className="mt-3 flex items-center gap-2 rounded-xl border border-hairline bg-surface-glass px-3 py-2.5 backdrop-blur-md">
-          <Search className="size-4 shrink-0 text-white/40" strokeWidth={1.75} />
-          <span className="truncate text-[14px] text-white/85">{page.hubQuery}</span>
-          <span className="ml-auto shrink-0 font-mono text-[10px] text-white/30">{page.links.length} results · mock</span>
+        <p className="text-[11px] text-[color:var(--ink-muted)]">Search hub · ephemeral router</p>
+        <div className="mt-3 flex items-center gap-2 rounded-xl border border-hairline bg-[color:var(--glass-soft)] px-3 py-2.5">
+          <Search className="size-4 shrink-0 text-[color:var(--ink-muted)]" strokeWidth={1.75} aria-hidden />
+          <span className="truncate text-[14px] text-[color:var(--ink-primary)]">{page.hubQuery}</span>
+          <span className="ml-auto shrink-0 text-[10.5px] tabular-nums text-[color:var(--ink-muted)]">{page.links.length} results · mock</span>
         </div>
-        <div className="mt-2 flex items-center gap-3 font-mono text-[10px] text-white/40">
-          <span className="text-accent">All</span>
+        <div className="mt-2 flex items-center gap-3 text-[11px] text-[color:var(--ink-muted)]">
+          <span className="font-medium text-[color:var(--ink-primary)] underline decoration-[color:var(--border-active)] underline-offset-4">All</span>
           <span>Forums</span>
           <span>News</span>
           <span>Videos</span>
-          {node.searchQuery ? <span className="ml-auto text-accent">query tag: “{node.searchQuery}”</span> : null}
+          {node.searchQuery ? <span className="ml-auto italic">query tag: “{node.searchQuery}”</span> : null}
         </div>
       </header>
 
       <div className="mt-6 space-y-5">
-        <div className="rounded-xl border border-accent/20 bg-accent/[0.06] p-4">
-          <p className="font-mono text-[10px] tracking-tight text-accent">AI OVERVIEW · MOCK</p>
-          <p className="mt-1.5 text-[13px] leading-relaxed text-white/70">
+        <div className="rounded-xl border border-hairline bg-[color:var(--glass-soft)] p-4">
+          <p className="text-[10.5px] text-[color:var(--ink-muted)]">AI overview · mock</p>
+          <p className="mt-1.5 text-[13px] leading-relaxed text-[color:var(--ink-secondary)]">
             Results for “{page.hubQuery}” cluster around {page.topicLabel.toLowerCase()}. The destination tabs below carry the query tag
             into the graph, so spawned children stay tagged when they orbit the hub.
           </p>
@@ -1146,8 +1151,8 @@ function SerpBody({ node, page, handlers }: { node: SpatialTabNodeRecord; page: 
         {page.links.map((target) => (
           <div key={target.url} className="group relative flex gap-2">
             <div className="flex min-w-0 flex-1 flex-col gap-1">
-              <span className="flex items-center gap-1.5 font-mono text-[11px] text-white/50">
-                <span className="size-2 rounded-full" style={{ background: `hsl(${fnv1a32(target.url) % 360} 68% 62%)` }} />
+              <span className="flex items-center gap-1.5 text-[11px] text-[color:var(--ink-muted)]">
+                <span className="size-2 rounded-full" style={{ background: linkDotColor(target.url) }} aria-hidden />
                 {domainOf(target.url)}
               </span>
               <a
@@ -1155,13 +1160,13 @@ function SerpBody({ node, page, handlers }: { node: SpatialTabNodeRecord; page: 
                 draggable
                 onClick={(event) => handleLinkActivate(event, target, handlers)}
                 onDragStart={(event) => handleLinkDragStart(event, target)}
-                className="w-fit cursor-pointer text-[16px] font-medium leading-snug text-white/90 underline decoration-transparent underline-offset-4 transition-colors hover:text-white hover:decoration-white/40"
+                className="w-fit cursor-pointer text-[16px] font-medium leading-snug text-[color:var(--ink-primary)] underline decoration-transparent underline-offset-4 transition-colors hover:decoration-[color:var(--border-active)]"
               >
                 {target.title}
               </a>
-              <span className="text-[12.5px] leading-relaxed text-white/55">{blurbFor(target)}</span>
+              <span className="text-[12.5px] leading-relaxed text-[color:var(--ink-secondary)]">{blurbFor(target)}</span>
               {target.searchQuery ? (
-                <span className="w-fit rounded-md bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] text-accent">“{target.searchQuery}”</span>
+                <span className="w-fit text-[11px] italic text-[color:var(--ink-secondary)]">“{target.searchQuery}”</span>
               ) : null}
             </div>
             <BranchButton target={target} onBranch={handlers.onBranch} className="opacity-0 group-hover:opacity-100" />
@@ -1170,7 +1175,7 @@ function SerpBody({ node, page, handlers }: { node: SpatialTabNodeRecord; page: 
       </div>
 
       <section className="mt-10">
-        <h2 className="text-[13px] font-semibold tracking-tight text-white/80">Related searches</h2>
+        <h2 className="text-[13px] font-semibold tracking-tight text-[color:var(--ink-primary)]">Related searches</h2>
         <div className="mt-3 flex flex-wrap gap-2">
           {page.relatedSearches.map((target) => (
             <a
@@ -1179,9 +1184,9 @@ function SerpBody({ node, page, handlers }: { node: SpatialTabNodeRecord; page: 
               draggable
               onClick={(event) => handleLinkActivate(event, target, handlers)}
               onDragStart={(event) => handleLinkDragStart(event, target)}
-              className="inline-flex cursor-grab items-center gap-1.5 rounded-full border border-hairline bg-white/[0.04] px-3 py-1.5 text-[12px] text-white/70 transition-colors hover:border-accent/40 hover:text-accent active:cursor-grabbing"
+              className="inline-flex cursor-grab items-center gap-1.5 rounded-full border border-hairline px-3 py-1.5 text-[12px] text-[color:var(--ink-secondary)] transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)] active:cursor-grabbing"
             >
-              <Search className="size-3 text-white/35" strokeWidth={1.75} />
+              <Search className="size-3 text-[color:var(--ink-muted)]" strokeWidth={1.75} aria-hidden />
               {target.title}
             </a>
           ))}
@@ -1199,22 +1204,23 @@ function PrivateBody() {
   return (
     <header>
       <div className="flex items-center gap-2">
-        <HeaderChip tone="violet" icon={<Lock className="size-3" strokeWidth={1.75} />}>
-          NO CAPTURE
-        </HeaderChip>
-        <span className="font-mono text-[11px] text-white/45">private page · blur-glass placeholder</span>
+        <span className="inline-flex items-center gap-1.5 text-[11px] text-[color:var(--ink-muted)]">
+          <Lock className="size-3" strokeWidth={1.75} aria-hidden />
+          Private page
+        </span>
+        <span className="text-[11px] text-[color:var(--ink-muted)]">· blur-glass placeholder</span>
       </div>
       <div className="mt-8 space-y-4" aria-hidden>
-        <div className="h-9 w-2/3 rounded-lg bg-white/[0.06] blur-md" />
-        <div className="h-3 w-full rounded bg-white/[0.05] blur-md" />
-        <div className="h-3 w-11/12 rounded bg-white/[0.05] blur-md" />
-        <div className="h-3 w-4/5 rounded bg-white/[0.05] blur-md" />
-        <div className="h-32 w-full rounded-xl bg-white/[0.04] blur-lg" />
-        <div className="h-3 w-3/4 rounded bg-white/[0.05] blur-md" />
+        <div className="h-9 w-2/3 rounded-lg bg-[color:var(--glass-soft)] blur-md" />
+        <div className="h-3 w-full rounded bg-[color:var(--glass-soft)] blur-md" />
+        <div className="h-3 w-11/12 rounded bg-[color:var(--glass-soft)] blur-md" />
+        <div className="h-3 w-4/5 rounded bg-[color:var(--glass-soft)] blur-md" />
+        <div className="h-32 w-full rounded-xl bg-[color:var(--glass-soft)] blur-lg" />
+        <div className="h-3 w-3/4 rounded bg-[color:var(--glass-soft)] blur-md" />
       </div>
-      <p className="mt-6 max-w-md text-[13px] leading-relaxed text-white/55">
-        This page is marked <span className="font-mono text-[11px] text-ghost">noCapture</span> — thumbnails and text extraction are
-        disabled by design, so the reader renders a blur-glass placeholder instead of real content (§7.4).
+      <p className="mt-6 max-w-md text-[13px] leading-relaxed text-[color:var(--ink-secondary)]">
+        This page is marked private — thumbnails and text extraction are disabled by design, so the reader renders a
+        blur-glass placeholder instead of real content (§7.4).
       </p>
     </header>
   )
@@ -1239,77 +1245,85 @@ function ReaderHeader({
 }) {
   const featured = page.links[0]
   return (
-    <header className="z-30 shrink-0 border-b border-hairline bg-surface-glass backdrop-blur-xl">
+    <header
+      className="z-30 shrink-0 border-b border-hairline"
+      style={{ background: 'var(--bg-glass)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}
+    >
       <div className="flex min-h-[44px] flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2">
-        <span className="flex items-center gap-2">
-          <span className="size-2.5 shrink-0 rounded-full" style={{ background: page.accent, boxShadow: `0 0 8px ${page.accent}` }} />
-          <span className="font-mono text-[12px] tracking-tight text-white/85">{node.domain}</span>
-          <span className="hidden truncate font-mono text-[11px] text-white/40 sm:inline">{pathOf(node.url)}</span>
+        {/* identity: content dot + domain + URL path (mono reserved for URL text) */}
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="size-2.5 shrink-0 rounded-full" style={{ background: page.accent }} aria-hidden />
+          <span className="truncate text-[12px] text-[color:var(--ink-primary)]">{node.domain}</span>
+          <span className="hidden truncate font-mono text-[11px] text-[color:var(--ink-muted)] sm:inline">{pathOf(node.url)}</span>
+          {node.viaAuth ? <span className="shrink-0 text-[11px] text-[color:var(--ink-muted)]">· via sign-in</span> : null}
+          {node.excerpt ? (
+            <span title="Cached text available (§7.5)" className="inline-flex shrink-0 items-center gap-1 text-[11px] text-[color:var(--ink-muted)]">
+              <FileText className="size-3" strokeWidth={1.75} aria-hidden />· cached
+            </span>
+          ) : null}
         </span>
 
-        <span className="flex flex-wrap items-center gap-1.5">
+        {/* quiet status icons — no uppercase chips */}
+        <span className="flex flex-wrap items-center gap-2">
           {node.isAudible ? (
-            <span className="flex items-end gap-0.5" aria-hidden>
+            <span className="flex items-end gap-0.5" aria-hidden title="Playing audio — immune to auto-hibernation">
               {[0, 1, 2].map((bar) => (
-                <span key={bar} className="w-0.5 animate-pulse rounded-full bg-accent" style={{ height: 4 + bar * 4, animationDelay: `${bar * 140}ms` }} />
+                <span
+                  key={bar}
+                  className="w-0.5 animate-pulse rounded-full bg-[color:var(--ink-secondary)]"
+                  style={{ height: 4 + bar * 4, animationDelay: `${bar * 140}ms` }}
+                />
               ))}
             </span>
           ) : null}
-          {node.viaAuth ? <HeaderChip tone="amber">VIA AUTH</HeaderChip> : null}
           {node.noCapture ? (
-            <HeaderChip tone="violet" icon={<Lock className="size-3" strokeWidth={1.75} />}>
-              NO CAPTURE
-            </HeaderChip>
+            <span title="Private page — capture disabled (§7.4)" className="text-[color:var(--ink-muted)]">
+              <Lock className="size-3" strokeWidth={1.75} aria-hidden />
+            </span>
           ) : null}
-          {node.searchQuery ? <HeaderChip tone="accent">“{node.searchQuery}”</HeaderChip> : null}
-          {node.nodeType === 'hub' ? <HeaderChip tone="accent">HUB</HeaderChip> : null}
-          {node.excerpt ? (
-            <HeaderChip tone="amber" icon={<FileText className="size-3" strokeWidth={1.75} />}>
-              CACHED
-            </HeaderChip>
+          {node.searchQuery ? (
+            <span title="Query tag from the search hub (§7.1)" className="max-w-40 truncate text-[11px] italic text-[color:var(--ink-secondary)]">
+              “{node.searchQuery}”
+            </span>
           ) : null}
           {node.isLoading ? (
-            <span className="inline-flex items-center gap-1 rounded-md border border-accent/30 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] text-accent">
-              <LoaderCircle className="size-3 animate-spin" strokeWidth={1.75} />
-              LOADING
-            </span>
+            <LoaderCircle className="size-3.5 animate-spin text-[color:var(--ink-muted)]" strokeWidth={1.75} aria-label="Loading" />
           ) : null}
         </span>
 
-        <span className="ml-auto flex items-center gap-2">
+        <span className="ml-auto flex shrink-0 items-center gap-2">
           <button
             type="button"
             onClick={onQuickNote}
             title="Quick sticky note on this page (Alt+N)"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-hairline bg-white/[0.04] px-2.5 py-1.5 text-[12px] text-white/75 transition-colors hover:border-sticky/50 hover:text-sticky"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-hairline bg-[color:var(--glass-soft)] px-2.5 py-1.5 text-[12px] text-[color:var(--ink-secondary)] transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)]"
           >
-            <StickyNote className="size-3.5" strokeWidth={1.75} />
+            <StickyNote className="size-3.5" strokeWidth={1.75} aria-hidden />
             Note
-            <Kbd>Alt+N</Kbd>
           </button>
           <button
             type="button"
             onClick={() => onBranch(featured ?? { url: node.url, title: node.title })}
-            title={featured ? `Branch node → ${featured.title}` : 'Branch node from this page'}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1.5 text-[12px] font-medium text-accent transition-colors hover:bg-accent/20"
+            title={featured ? `Branch node → ${featured.title} (⌘/Ctrl+Click a link)` : 'Branch node from this page'}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-hairline bg-[color:var(--glass-soft)] px-2.5 py-1.5 text-[12px] text-[color:var(--ink-secondary)] transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)]"
           >
-            <GitBranch className="size-3.5" strokeWidth={1.75} />
-            Branch Node
-            <Kbd>⌘</Kbd>
+            <GitBranch className="size-3.5" strokeWidth={1.75} aria-hidden />
+            Branch
           </button>
         </span>
       </div>
 
       {node.subPages.length > 0 ? (
         <div className="flex flex-wrap items-center gap-1.5 border-t border-hairline px-4 py-1.5">
-          <History className="size-3 text-white/40" strokeWidth={1.75} />
-          <span className="font-mono text-[10px] tracking-tight text-white/40">PUSHSTATE TRAIL · {node.subPages.length}</span>
+          <History className="size-3 text-[color:var(--ink-muted)]" strokeWidth={1.75} aria-hidden />
+          <span className="text-[10.5px] text-[color:var(--ink-muted)]">Trail · {node.subPages.length}</span>
           {node.subPages.map((sub) => (
             <button
               key={sub.url}
               type="button"
               onClick={() => trailOnSelect(sub)}
-              className="max-w-56 truncate rounded-md border border-hairline bg-white/[0.03] px-2 py-0.5 font-mono text-[10px] text-white/60 transition-colors hover:border-accent/40 hover:text-accent"
+              title={sub.url}
+              className="max-w-56 truncate rounded-md border border-hairline px-2 py-0.5 text-[10.5px] text-[color:var(--ink-secondary)] transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)]"
             >
               {sub.title}
             </button>
@@ -1346,32 +1360,32 @@ function MediaBar({
       initial={{ opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}
       transition={SPRING}
-      className="absolute bottom-3 left-1/2 z-30 w-[min(660px,calc(100%-24px))] -translate-x-1/2 rounded-2xl border border-hairline bg-surface-glass p-3 backdrop-blur-xl"
-      style={{ boxShadow: '0 8px 32px rgba(0, 0, 0, 0.45)' }}
+      className="absolute bottom-3 left-1/2 z-30 w-[min(660px,calc(100%-24px))] -translate-x-1/2 rounded-2xl border border-hairline p-3"
+      style={{ background: 'var(--bg-glass)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', boxShadow: 'var(--shadow-pop)' }}
     >
       <div className="flex items-center gap-3">
         <button
           type="button"
           onClick={onToggle}
           aria-label={node.isAudible ? 'Pause mock audio (audio-immunity toggle)' : 'Play mock audio (audio-immunity toggle)'}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full border border-accent/50 bg-accent/15 text-accent transition-colors hover:bg-accent/30"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full border border-[color:var(--border-hover)] bg-[color:var(--glass-soft)] text-[color:var(--ink-primary)] transition-colors hover:border-[color:var(--border-active)]"
         >
           {node.isAudible ? <Pause className="size-4" strokeWidth={1.75} /> : <Play className="ml-0.5 size-4" strokeWidth={1.75} />}
         </button>
         <motion.span
           animate={node.isAudible ? { scale: [1, 1.18, 1] } : { scale: 1 }}
           transition={{ repeat: node.isAudible ? Infinity : 0, duration: 0.9, ease: 'easeInOut' }}
-          className={cn('shrink-0', node.isAudible ? 'text-accent' : 'text-white/35')}
+          className={cn('shrink-0', node.isAudible ? 'text-[color:var(--ink-primary)]' : 'text-[color:var(--ink-muted)]')}
         >
-          <AudioLines className="size-4" strokeWidth={1.75} />
+          <AudioLines className="size-4" strokeWidth={1.75} aria-hidden />
         </motion.span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[13px] text-white/85">{node.title}</span>
-          <span className="block truncate font-mono text-[10px] text-white/40">
-            {ARTISTS[fnv1a32(node.uuid) % ARTISTS.length]} · mock stream · {node.isAudible ? 'IMMUNE — pool skips audible tabs' : 'paused'}
+          <span className="block truncate text-[13px] text-[color:var(--ink-primary)]">{node.title}</span>
+          <span className="block truncate text-[10.5px] text-[color:var(--ink-muted)]">
+            {ARTISTS[fnv1a32(node.uuid) % ARTISTS.length]} · mock stream · {node.isAudible ? 'playing — immune to auto-sleep' : 'paused'}
           </span>
         </span>
-        <span className="shrink-0 font-mono text-[10px] text-white/50">
+        <span className="shrink-0 text-[10.5px] tabular-nums text-[color:var(--ink-secondary)]">
           {formatDurationMs(elapsedMs)} / {formatDurationMs(totalMs)}
         </span>
       </div>
@@ -1403,7 +1417,7 @@ function MediaBar({
         {bars.map((height, index) => (
           <span
             key={index}
-            className={cn('flex-1 rounded-full transition-colors', index < activeBars ? 'bg-accent' : 'bg-white/15')}
+            className={cn('flex-1 rounded-full transition-colors', index < activeBars ? 'bg-[color:var(--accent)]' : 'bg-[color:var(--border-hover)]')}
             style={{ height: `${Math.round(height * 100)}%` }}
           />
         ))}
@@ -1433,47 +1447,47 @@ function StickyRail({
 }) {
   return (
     <aside
-      className="absolute right-3 top-[56px] z-20 hidden w-60 flex-col rounded-2xl border border-hairline bg-surface-glass backdrop-blur-xl lg:flex"
-      style={{ maxHeight: 'calc(100% - 140px)' }}
+      className="absolute right-3 top-[56px] z-20 hidden w-60 flex-col rounded-2xl border border-hairline lg:flex"
+      style={{ background: 'var(--bg-glass)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', boxShadow: 'var(--shadow-card)' }}
     >
       <div className="flex items-center gap-1.5 border-b border-hairline px-3 py-2">
-        <StickyNote className="size-3.5 text-sticky" strokeWidth={1.75} />
-        <span className="font-mono text-[10px] tracking-tight text-sticky">STICKIES · {notes.length}</span>
+        <StickyNote className="size-3.5 text-[color:var(--ink-secondary)]" strokeWidth={1.75} aria-hidden />
+        <span className="text-[11px] text-[color:var(--ink-secondary)]">Notes{notes.length > 0 ? ` · ${notes.length}` : ''}</span>
         <button
           type="button"
           onClick={onAdd}
           title="Quick sticky note (Alt+N)"
           aria-label="Quick sticky note (Alt+N)"
-          className="ml-auto flex size-5 items-center justify-center rounded-md border border-hairline bg-white/[0.05] text-white/70 transition-colors hover:border-sticky/50 hover:text-sticky"
+          className="ml-auto flex size-5 items-center justify-center rounded-md border border-hairline bg-[color:var(--glass-soft)] text-[color:var(--ink-secondary)] transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)]"
         >
-          <Plus className="size-3" strokeWidth={1.75} />
+          <Plus className="size-3" strokeWidth={1.75} aria-hidden />
         </button>
       </div>
-      <div className="flex-1 space-y-2 overflow-y-auto p-2">
+      <div className="flex-1 space-y-2 overflow-y-auto p-2 [scrollbar-color:var(--border-hover)_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[color:var(--border-hover)]">
         {notes.length === 0 ? (
-          <p className="px-1 py-2 text-[11.5px] leading-relaxed text-white/45">
-            No stickies on this page yet. Press <Kbd>Alt+N</Kbd> or hit the + to attach one to this URL.
+          <p className="px-1 py-2 text-[11.5px] leading-relaxed text-[color:var(--ink-muted)]">
+            No notes on this page yet. Press <Kbd>Alt+N</Kbd> or hit the + to attach one to this URL.
           </p>
         ) : (
           notes.map((note) => (
-            <div key={note.id} className="rounded-xl border border-sticky/30 bg-sticky-glass p-2">
+            <div key={note.id} className="rounded-xl border border-hairline bg-[color:var(--glass-soft)] p-2">
               <textarea
                 value={drafts[note.id] ?? note.text}
                 placeholder="Type a note…"
                 rows={3}
                 onChange={(event) => onDraftChange(note.id, event.target.value)}
                 onBlur={() => onCommit(note)}
-                className="w-full resize-none bg-transparent text-[12px] leading-relaxed text-white/85 placeholder:text-white/30 focus:outline-none"
+                className="w-full resize-none bg-transparent text-[12px] leading-relaxed text-[color:var(--ink-primary)] placeholder:text-[color:var(--ink-muted)] focus:outline-none"
               />
               <div className="mt-1 flex items-center justify-between">
-                <span className="font-mono text-[9px] text-white/35">{formatStamp(note.updatedAt)}</span>
+                <span className="text-[9.5px] text-[color:var(--ink-muted)]">{formatStamp(note.updatedAt)}</span>
                 <button
                   type="button"
                   onClick={() => onDelete(note.id)}
                   aria-label="Delete sticky note"
-                  className="flex size-4 items-center justify-center rounded text-white/40 transition-colors hover:text-rose-300"
+                  className="flex size-4 items-center justify-center rounded text-[color:var(--ink-muted)] transition-colors hover:text-[color:var(--ink-primary)]"
                 >
-                  <X className="size-3" strokeWidth={1.75} />
+                  <X className="size-3" strokeWidth={1.75} aria-hidden />
                 </button>
               </div>
             </div>
@@ -1582,14 +1596,15 @@ export function MockWebReader({ node, onNavigate, onBranch, onSubNavigate, class
     setToast({ label: 'sticky note attached to this URL', at: Date.now() })
   }, [quickNoteOnActive])
 
+  /** Matte reading surface; the page's only hue is its muted content accent. */
   const rootStyle = {
     '--page-accent': page.accent,
-    background: page.bg,
+    background: 'var(--bg-card)',
   } as CSSProperties
 
   return (
     <div className={cn('relative flex h-full w-full flex-col overflow-hidden', className)} style={rootStyle}>
-      {/* §5.1 simulated navigation pulse */}
+      {/* §5.1 simulated navigation pulse — neutral ink sweep */}
       <AnimatePresence>
         {node.isLoading ? (
           <motion.div
@@ -1601,7 +1616,7 @@ export function MockWebReader({ node, onNavigate, onBranch, onSubNavigate, class
           >
             <motion.div
               className="h-full w-1/3"
-              style={{ background: 'linear-gradient(90deg, transparent, #34D399, transparent)' }}
+              style={{ background: 'linear-gradient(90deg, transparent, var(--ink-primary), transparent)' }}
               initial={{ x: '-100%' }}
               animate={{ x: '320%' }}
               transition={{ repeat: Infinity, duration: 0.9, ease: 'easeInOut' }}
@@ -1615,13 +1630,14 @@ export function MockWebReader({ node, onNavigate, onBranch, onSubNavigate, class
         {toast ? (
           <motion.div
             key={toast.at}
-            className="absolute left-1/2 top-[56px] z-40 -translate-x-1/2 rounded-lg border border-hairline bg-surface-glass px-3 py-1.5 font-mono text-[11px] text-white/75 backdrop-blur-xl"
+            className="absolute left-1/2 top-[56px] z-40 -translate-x-1/2 rounded-lg border border-hairline px-3 py-1.5 text-[11.5px] text-[color:var(--ink-secondary)]"
+            style={{ background: 'var(--bg-elevated)', boxShadow: 'var(--shadow-card)' }}
             initial={{ opacity: 0, y: -8 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -8 }}
             transition={SPRING}
           >
-            did-navigate-in-page → {toast.label}
+            Navigated in page → {toast.label}
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -1650,8 +1666,8 @@ export function MockWebReader({ node, onNavigate, onBranch, onSubNavigate, class
               <ArticleBody node={node} page={page} handlers={handlers} onSectionClick={onSpaSectionClick} />
             )}
             <footer className="mt-10 border-t border-hairline pb-2 pt-3">
-              <p className="font-mono text-[10px] text-white/30">
-                {domainOf(node.url)} · mock page · {node.urlHash}
+              <p className="text-[10px] text-[color:var(--ink-muted)]">
+                {domainOf(node.url)} · mock page · <span className="font-mono">{node.urlHash}</span>
               </p>
             </footer>
           </motion.article>

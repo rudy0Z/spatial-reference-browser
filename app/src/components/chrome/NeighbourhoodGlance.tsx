@@ -21,10 +21,12 @@
  * scaled + clamped into the small viewport. `physicsFrozen` freezes the
  * mini-graph too (§6 Freeze stops ALL motion).
  *
- * Design language (§2): `bg-surface-glass` + `backdrop-blur-xl`, hairline
- * borders, #34D399 accent for live signal, #A78BFA dashed violet for Ghost
- * Echoes, JetBrains Mono for badges/counts, framer-motion springs
- * (stiffness 380 / damping 30), lucide-react icons.
+ * Design language (Phase 1.5 token grammar): `bg-surface-glass` +
+ * `backdrop-blur-xl`, hairline borders, ink tokens only (the UI owns no
+ * hue), sentence-case sans labels, framer-motion springs (stiffness 380 /
+ * damping 30), lucide-react icons. State grammar matches the pill and the
+ * canvas: filled ink dot = live, hollow = hibernated, frosted wash = Ghost
+ * Echo — never neon, never glow, never uppercase badge spam.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
@@ -73,18 +75,12 @@ const GRAPH_EDGE_INSET = 20
 /** Stable empty result so closed/empty states never churn identities. */
 const EMPTY_NEIGHBOURHOOD: NeighbourhoodResult = { nodes: [], edges: [] }
 
-/** Scoped keyframes + scrollbar styling for this panel only. */
+/** Scoped scrollbar styling for this panel only (theme-aware, no keyframes). */
 const GLANCE_STYLES = `
-@keyframes glance-pulse-opacity {
-  0%, 100% { opacity: 0.9; }
-  50% { opacity: 0.15; }
-}
-.glance-pulse-ring { animation: glance-pulse-opacity 2.4s ease-in-out infinite; }
-.glance-loading-blink { animation: glance-pulse-opacity 0.9s ease-in-out infinite; }
-.glance-scroll { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.14) transparent; }
+.glance-scroll { scrollbar-width: thin; scrollbar-color: var(--border-hover) transparent; }
 .glance-scroll::-webkit-scrollbar { width: 5px; }
 .glance-scroll::-webkit-scrollbar-track { background: transparent; }
-.glance-scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 999px; }
+.glance-scroll::-webkit-scrollbar-thumb { background: var(--border-hover); border-radius: 999px; }
 `
 
 /* ------------------------------------------------------------------ */
@@ -150,87 +146,100 @@ function computeGlanceHomes(
   return homes
 }
 
-/** §2/§4 palette for mini-graph nodes (active node is styled inline). */
+/** Phase 1.5 token palette for mini-graph nodes (active node is styled inline).
+ * Same silent state grammar as the pill and the cards: filled ink = live,
+ * hollow = hibernated, frosted wash = Ghost Echo. */
 function glanceNodeVisual(entry: GlanceEntry, hovered: boolean): {
   radius: number
   fill: string
   stroke: string
   strokeWidth: number
-  dashed: boolean
 } {
   const node = entry.node
   if (entry.isGhost) {
-    // §4 state 3 — spectral violet, dashed glowing border.
-    return { radius: 6.5, fill: 'rgba(167, 139, 250, 0.16)', stroke: '#A78BFA', strokeWidth: hovered ? 2 : 1.25, dashed: true }
+    // §4 state 3 — frosted translucent echo, muted hairline.
+    return {
+      radius: 6.5,
+      fill: 'var(--glass-soft)',
+      stroke: hovered ? 'var(--ink-secondary)' : 'var(--ink-muted)',
+      strokeWidth: hovered ? 2 : 1.25,
+    }
   }
   if (node.nodeType === 'hub') {
     // §7.1 — ephemeral google.com routers render as neutral chips.
-    return { radius: 5, fill: 'rgba(148, 163, 184, 0.2)', stroke: 'rgba(148, 163, 184, 0.65)', strokeWidth: hovered ? 1.75 : 1.1, dashed: false }
+    return {
+      radius: 5,
+      fill: 'var(--glass-soft)',
+      stroke: hovered ? 'var(--border-active)' : 'var(--border-hover)',
+      strokeWidth: hovered ? 1.75 : 1.1,
+    }
   }
   if (node.isLoading) {
-    // §6 pill dot semantics — pulsing = loading.
-    return { radius: 7, fill: 'rgba(52, 211, 153, 0.28)', stroke: '#34D399', strokeWidth: hovered ? 2 : 1.4, dashed: false }
+    // §6 pill dot semantics — solid ink = loading.
+    return {
+      radius: 7,
+      fill: 'var(--ink-primary)',
+      stroke: 'var(--ink-primary)',
+      strokeWidth: hovered ? 2 : 1.4,
+    }
   }
   if (node.ramState === 'hibernated') {
     // §6 pill dot semantics — hollow = hibernated.
     return {
       radius: entry.depth === 1 ? 6 : 4.5,
-      fill: 'rgba(148, 163, 184, 0.1)',
-      stroke: 'rgba(203, 213, 225, 0.45)',
+      fill: 'transparent',
+      stroke: hovered ? 'var(--ink-secondary)' : 'var(--ink-muted)',
       strokeWidth: hovered ? 1.75 : 1.1,
-      dashed: false,
     }
   }
   return {
     radius: entry.depth === 1 ? 7 : 5.5,
-    fill: 'rgba(52, 211, 153, 0.2)',
-    stroke: 'rgba(52, 211, 153, 0.85)',
+    fill: 'var(--accent)',
+    stroke: 'var(--ink-primary)',
     strokeWidth: hovered ? 2 : 1.3,
-    dashed: false,
   }
 }
 
-/** Edge styling by kind (§4.6): ghost tethers dashed violet, spawn brighter. */
+/** Edge styling by kind — one calm static hairline family, ink tones only. */
 function glanceEdgeVisual(edge: GlanceEdge, highlighted: boolean): {
   stroke: string
   width: number
-  dasharray?: string
 } {
   if (edge.kind === 'ghost') {
-    return { stroke: highlighted ? 'rgba(167, 139, 250, 0.85)' : 'rgba(167, 139, 250, 0.45)', width: 1, dasharray: '3 3' }
+    return { stroke: highlighted ? 'var(--ink-secondary)' : 'var(--ink-muted)', width: 1 }
   }
   if (edge.kind === 'spawn') {
     return {
-      stroke: highlighted ? 'rgba(110, 231, 183, 0.7)' : 'rgba(255, 255, 255, 0.18)',
+      stroke: highlighted ? 'var(--ink-primary)' : 'var(--border-hover)',
       width: 1 + Math.min(1.5, edge.weight * 0.15),
     }
   }
   return {
-    stroke: highlighted ? 'rgba(110, 231, 183, 0.6)' : 'rgba(255, 255, 255, 0.1)',
+    stroke: highlighted ? 'var(--ink-primary)' : 'var(--border-subtle)',
     width: 1 + Math.min(1.2, edge.weight * 0.12),
   }
 }
 
-/** §6 dot semantics for the list rows: violet ghost, pulsing loading, hollow hibernated. */
+/** §6 dot semantics for the list rows: frosted ghost, solid ink loading, hollow hibernated. */
 function rowDotStyle(entry: GlanceEntry): CSSProperties {
   const node = entry.node
-  if (entry.isGhost) return { background: 'rgba(167, 139, 250, 0.95)', boxShadow: '0 0 7px rgba(167, 139, 250, 0.6)' }
-  if (node.isLoading) return { background: '#34D399', boxShadow: '0 0 7px rgba(110, 231, 183, 0.7)' }
-  if (node.ramState === 'hibernated') return { background: 'transparent', border: '1px solid rgba(148, 163, 184, 0.55)' }
-  return { background: 'rgba(52, 211, 153, 0.85)' }
+  if (entry.isGhost) return { background: 'var(--glass-soft)', border: '1px solid var(--ink-muted)' }
+  if (node.isLoading) return { background: 'var(--ink-primary)' }
+  if (node.ramState === 'hibernated') return { background: 'transparent', border: '1px solid var(--ink-muted)' }
+  return { background: 'var(--ink-secondary)' }
 }
 
-/** Right-hand mono chip: `GHOST 92%` for echoes, `1·HOP` / `2·HOP` otherwise. */
+/** Right-hand quiet chip: `Ghost 92%` for echoes, `1 hop` / `2 hop` otherwise. */
 function rowChip(entry: GlanceEntry): { label: string; className: string } {
   if (entry.isGhost) {
     return {
-      label: `GHOST ${Math.round((entry.node.ghostMatch ?? 0) * 100)}%`,
-      className: 'border-violet-400/30 bg-violet-400/10 text-violet-300',
+      label: `Ghost ${Math.round((entry.node.ghostMatch ?? 0) * 100)}%`,
+      className: 'border-hairline bg-[color:var(--glass-soft)] text-[color:var(--ink-secondary)]',
     }
   }
   return entry.depth === 1
-    ? { label: '1·HOP', className: 'border-white/10 bg-white/[0.04] text-white/50' }
-    : { label: '2·HOP', className: 'border-white/[0.06] text-white/30' }
+    ? { label: '1 hop', className: 'border-hairline bg-[color:var(--glass-soft)] text-[color:var(--ink-secondary)]' }
+    : { label: '2 hop', className: 'border-hairline text-[color:var(--ink-muted)]' }
 }
 
 /* ------------------------------------------------------------------ */
@@ -365,15 +374,7 @@ function GlanceForceGraph({
 
   return (
     <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="relative block" aria-hidden="true">
-      <defs>
-        <radialGradient id="glance-active-halo">
-          <stop offset="0%" stopColor="rgba(110, 231, 183, 0.26)" />
-          <stop offset="65%" stopColor="rgba(110, 231, 183, 0.06)" />
-          <stop offset="100%" stopColor="rgba(110, 231, 183, 0)" />
-        </radialGradient>
-      </defs>
-
-      {/* Edges — repositioned imperatively each frame. */}
+      {/* Edges — one calm hairline family, repositioned imperatively each frame. */}
       <g style={{ pointerEvents: 'none' }}>
         {edges.map((edge) => {
           const from = homes[edge.source]
@@ -391,16 +392,21 @@ function GlanceForceGraph({
               y2={to.y}
               stroke={visual.stroke}
               strokeWidth={visual.width}
-              strokeDasharray={visual.dasharray}
               strokeLinecap="round"
             />
           )
         })}
       </g>
 
-      {/* Nodes — the active beacon pinned at centre, then BFS hops + ghosts. */}
+      {/* Nodes — the active node pinned at centre, then BFS hops + ghosts. */}
       <g>
-        <circle cx={activeHome.x} cy={activeHome.y} r={26} fill="url(#glance-active-halo)" style={{ pointerEvents: 'none' }} />
+        <circle
+          cx={activeHome.x}
+          cy={activeHome.y}
+          r={26}
+          fill="color-mix(in srgb, var(--ink-primary) 7%, transparent)"
+          style={{ pointerEvents: 'none' }}
+        />
         <g
           ref={registerNode(active.uuid)}
           transform={`translate(${activeHome.x} ${activeHome.y})`}
@@ -409,8 +415,8 @@ function GlanceForceGraph({
           onMouseEnter={() => onHover(active.uuid)}
           onMouseLeave={() => onHover(null)}
         >
-          <circle r={16} fill="none" stroke="rgba(110, 231, 183, 0.45)" strokeWidth={1.2} className="glance-pulse-ring" />
-          <circle r={10} fill="#34D399" stroke="rgba(110, 231, 183, 0.9)" strokeWidth={1.5} />
+          <circle r={16} fill="none" stroke="var(--border-active)" strokeWidth={1.2} />
+          <circle r={10} fill="var(--accent)" stroke="var(--ink-primary)" strokeWidth={1.5} />
           <title>{active.title}</title>
         </g>
         {entries.map((entry) => {
@@ -428,17 +434,8 @@ function GlanceForceGraph({
               onMouseEnter={() => onHover(entry.node.uuid)}
               onMouseLeave={() => onHover(null)}
             >
-              {entry.isGhost ? (
-                <circle r={11.5} fill="none" stroke="rgba(167, 139, 250, 0.35)" strokeWidth={1} strokeDasharray="2 3" />
-              ) : null}
-              <circle
-                r={visual.radius}
-                fill={visual.fill}
-                stroke={visual.stroke}
-                strokeWidth={visual.strokeWidth}
-                strokeDasharray={visual.dashed ? '2.5 2.5' : undefined}
-                className={entry.node.isLoading ? 'glance-loading-blink' : undefined}
-              />
+              {entry.isGhost ? <circle r={11.5} fill="none" stroke="var(--border-hover)" strokeWidth={1} /> : null}
+              <circle r={visual.radius} fill={visual.fill} stroke={visual.stroke} strokeWidth={visual.strokeWidth} />
               {isHovered ? (
                 <text
                   y={visual.radius + 12}
@@ -446,10 +443,10 @@ function GlanceForceGraph({
                   style={{
                     fontSize: 9,
                     fontFamily: 'var(--font-sans)',
-                    letterSpacing: '-0.02em',
-                    fill: 'rgba(241, 245, 249, 0.92)',
+                    letterSpacing: '-0.015em',
+                    fill: 'var(--ink-primary)',
                     paintOrder: 'stroke',
-                    stroke: 'rgba(9, 10, 12, 0.85)',
+                    stroke: 'color-mix(in srgb, var(--bg-canvas) 85%, transparent)',
                     strokeWidth: 3,
                   }}
                 >
@@ -565,7 +562,7 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
           key="neighbourhood-glance"
           aria-label="Neighbourhood glance"
           className={cn(
-            'z-30 flex h-full flex-col overflow-hidden rounded-xl border border-hairline bg-surface-glass shadow-[0_18px_60px_rgba(0,0,0,0.5)] backdrop-blur-xl',
+            'z-30 flex h-full flex-col overflow-hidden rounded-xl border border-hairline bg-surface-glass shadow-[var(--shadow-pop)] backdrop-blur-xl',
             className,
           )}
           style={{ width }}
@@ -581,17 +578,20 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <Radar size={11} className="shrink-0 text-accent" aria-hidden="true" />
-                <span className="font-mono text-[9px] uppercase tracking-[0.22em] text-white/40">
-                  Neighbourhood Glance
+                <span className="text-[10.5px] font-medium tracking-ui text-[color:var(--ink-secondary)]">
+                  Neighbourhood glance
                 </span>
               </div>
-              <p className="mt-1.5 truncate text-[13px] font-semibold leading-snug text-white/90" title={active.title}>
+              <p
+                className="mt-1.5 truncate text-[13px] font-semibold leading-snug text-[color:var(--ink-primary)]"
+                title={active.title}
+              >
                 {active.title}
               </p>
               <div className="mt-1 flex items-center gap-2">
-                <span className="truncate font-mono text-[9.5px] text-white/40">{active.domain}</span>
-                <span className="flex shrink-0 items-center gap-1 font-mono text-[9px] text-accent/90">
-                  <span className="h-1.5 w-1.5 rounded-full bg-accent shadow-[0_0_6px_rgba(110,231,183,0.8)]" />
+                <span className="truncate text-[10px] text-[color:var(--ink-muted)]">{active.domain}</span>
+                <span className="flex shrink-0 items-center gap-1 text-[9.5px] text-[color:var(--ink-secondary)]">
+                  <span className="h-1.5 w-1.5 rounded-full bg-[color:var(--accent)]" />
                   {formatRamMb(active.ramMb)}
                 </span>
               </div>
@@ -600,33 +600,33 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
               type="button"
               aria-label="Close neighbourhood glance"
               onClick={() => setGlanceOpen(false)}
-              className="rounded-md border border-transparent p-1 text-white/40 transition-colors hover:border-hairline hover:bg-white/[0.06] hover:text-white/80"
+              className="rounded-md border border-transparent p-1 text-[color:var(--ink-secondary)] transition-colors hover:border-hairline hover:bg-[color:var(--glass-soft)] hover:text-[color:var(--ink-primary)]"
             >
               <X size={13} aria-hidden="true" />
             </button>
           </header>
 
           {/* Census strip — exactly what §3 allows into the panel. */}
-          <div className="flex shrink-0 items-center gap-3 border-b border-hairline px-4 py-1.5 font-mono text-[8.5px] tracking-[0.14em] text-white/35">
-            <span>{hop1Count} · 1-HOP</span>
-            <span>{hop2Count} · 2-HOP</span>
-            {ghostCount > 0 ? <span className="text-violet-300/80">{ghostCount} · GHOST</span> : null}
-            <span className="ml-auto text-white/25">{entries.length} NODES</span>
+          <div className="flex shrink-0 items-center gap-3 border-b border-hairline px-4 py-1.5 text-[9.5px] text-[color:var(--ink-muted)]">
+            <span>{hop1Count} · 1 hop</span>
+            <span>{hop2Count} · 2 hops</span>
+            {ghostCount > 0 ? <span>{ghostCount} · Ghost</span> : null}
+            <span className="ml-auto">{entries.length} nodes</span>
           </div>
 
           {entries.length === 0 ? (
             <div className="flex min-h-0 flex-1 items-center justify-center border-b border-hairline px-6 text-center">
-              <p className="text-[11px] leading-relaxed text-white/35">No connected neighbours within 2 hops.</p>
+              <p className="text-[11px] leading-relaxed text-[color:var(--ink-muted)]">No connected neighbours within 2 hops.</p>
             </div>
           ) : (
             <>
-              {/* Small live force graph on the void dot-matrix. */}
+              {/* Small live force graph on the canvas dot-matrix. */}
               <div className="relative shrink-0 border-b border-hairline" style={{ height: GLANCE_GRAPH_HEIGHT }}>
                 <div
                   aria-hidden="true"
                   className="absolute inset-0"
                   style={{
-                    backgroundImage: 'radial-gradient(rgba(255, 255, 255, 0.055) 1px, transparent 1px)',
+                    backgroundImage: 'radial-gradient(var(--grid-dot) 1px, transparent 1px)',
                     backgroundSize: '13px 13px',
                     maskImage: 'radial-gradient(ellipse at center, black 55%, transparent 100%)',
                     WebkitMaskImage: 'radial-gradient(ellipse at center, black 55%, transparent 100%)',
@@ -659,27 +659,29 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
                       onMouseEnter={() => setHoveredUuid(uuid)}
                       onMouseLeave={() => setHoveredUuid(null)}
                       className={cn(
-                        'flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/50',
-                        hoveredUuid === uuid ? 'bg-white/[0.07]' : 'hover:bg-white/[0.04]',
+                        'flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[color:var(--border-active)]',
+                        hoveredUuid === uuid
+                          ? 'bg-[color:var(--glass-soft)]'
+                          : 'hover:bg-[color:var(--glass-soft)]',
                       )}
                     >
-                      <span
-                        aria-hidden="true"
-                        className={cn('h-2 w-2 shrink-0 rounded-full', entry.node.isLoading && 'glance-loading-blink')}
-                        style={rowDotStyle(entry)}
-                      />
+                      <span aria-hidden="true" className="h-2 w-2 shrink-0 rounded-full" style={rowDotStyle(entry)} />
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[11.5px] leading-tight text-white/85">{entry.node.title}</span>
+                        <span className="block truncate text-[11.5px] leading-tight text-[color:var(--ink-primary)]">
+                          {entry.node.title}
+                        </span>
                         <span className="mt-0.5 flex items-center gap-1.5">
-                          <span className="truncate font-mono text-[9px] text-white/35">{entry.node.domain}</span>
+                          <span className="truncate text-[9.5px] text-[color:var(--ink-muted)]">{entry.node.domain}</span>
                           {entry.node.nodeType === 'hub' ? (
-                            <span className="shrink-0 rounded bg-white/[0.06] px-1 font-mono text-[8px] text-white/40">HUB</span>
+                            <span className="shrink-0 rounded bg-[color:var(--glass-soft)] px-1 text-[9px] text-[color:var(--ink-muted)]">
+                              Hub
+                            </span>
                           ) : null}
                         </span>
                       </span>
                       <span
                         className={cn(
-                          'shrink-0 rounded border px-1.5 py-0.5 font-mono text-[8.5px] tracking-wide',
+                          'shrink-0 rounded border px-1.5 py-0.5 text-[9px] tracking-ui',
                           chip.className,
                         )}
                       >
@@ -694,9 +696,9 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
 
           {/* Shortcut hint chip (§10 — nothing conflicts silently). */}
           <footer className="flex shrink-0 items-center gap-1.5 border-t border-hairline px-4 py-2">
-            <MousePointerClick size={10} className="shrink-0 text-white/30" aria-hidden="true" />
-            <span className="font-mono text-[8.5px] tracking-[0.14em] text-white/30">CLICK NODE → FOCUS CANVAS</span>
-            <kbd className="ml-auto shrink-0 rounded border border-white/10 bg-white/[0.04] px-1 font-mono text-[8.5px] text-white/35">
+            <MousePointerClick size={10} className="shrink-0 text-[color:var(--ink-muted)]" aria-hidden="true" />
+            <span className="text-[9.5px] text-[color:var(--ink-muted)]">Click a node to focus it on the canvas</span>
+            <kbd className="ml-auto shrink-0 rounded border border-hairline bg-[color:var(--glass-soft)] px-1 font-mono text-[8.5px] text-[color:var(--ink-muted)]">
               ⌘⇧G
             </kbd>
           </footer>

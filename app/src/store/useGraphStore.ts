@@ -7,19 +7,26 @@
  * audible / pinned / recording immunity (§5.2, §5.3, §7.7). Ghost Echo
  * matcher: relevance = 0.55·cosine + 0.30·normalizedCoVisitation +
  * 0.15·recencyDecay, threshold 0.78 (§6). Macro-stack collapse/fan (§4.5).
- * Palette actions incl. /seed-600 → 600 nodes across 6 regions (§5.4).
+ * Palette actions incl. /seed-700 → 700 designer nodes across 7 clusters (§5.4).
  *
  * Persisted: nodes, edges, regions, notes, voice memos (audio as data URLs
  * — §8), coordinates, active node, collapse stacks, seededVersion, viewMode.
  * Runtime-only: palette/glance flags, freeze/override toggles, zoom,
  * recording node, workbench MRU, eviction notice, suppressed ghost hashes.
+ *
+ * Phase 1.5: `/seed-700` replaces the world with 700 designer reference
+ * nodes across 7 clusters; `tidyToMoodboard(regionId)` snaps a region onto
+ * the contact-sheet grid (pure math in `lib/moodboard.ts`'s
+ * `computeMoodboardGrid` — positions only, so every graph edge survives).
  */
 import { create } from 'zustand'
 import { persist, createJSONStorage } from 'zustand/middleware'
+import type { StateStorage } from 'zustand/middleware'
 import { cosineSimilarity, embedText, tokenize } from '../lib/embed'
+import { computeMoodboardGrid } from '../lib/moodboard'
 import {
   buildFirstRunSeed,
-  buildStressSeed600,
+  buildStressSeed700,
   FIRST_RUN_SEED_VERSION,
   STRESS_SEED_VERSION,
 } from '../lib/seed'
@@ -28,6 +35,8 @@ import {
   REGION_COLORS,
   daysSince,
   domainOf,
+  isColdArchive,
+  lodForZoom,
   looksLikeAuthOrPaymentUrl,
   ramMbFor,
   urlHashOf,
@@ -47,6 +56,7 @@ import type {
   Region,
   RegionId,
   SearchResult,
+  SemanticZoomLevel,
   SpatialTabNodeRecord,
   StickyNote,
   SubPageRef,
@@ -107,7 +117,13 @@ export type GraphState = {
   paletteOpen: boolean
   glanceOpen: boolean
   physicsFrozen: boolean
-  semanticZoomOverride: boolean
+  /**
+   * LOD lock: the semantic-zoom tier pinned when the lock was engaged
+   * (null = unlocked). While pinned, wheel zooming does not step tiers;
+   * unlocking resumes natural tier-stepping. A user preference, not an
+   * ephemeral glitch flag — it survives canvas ⇄ reading round trips.
+   */
+  semanticZoomOverride: SemanticZoomLevel | null
   /** Current canvas zoom (0.15x–2.0x) driving semantic-zoom LOD. */
   zoom: number
   /** Voice memo currently recording — global immunity key (§5.3). */
@@ -126,8 +142,16 @@ export type GraphActions = {
   ensureFirstRunSeed(): void
   /** Wipes everything and re-applies the first-run seed. */
   resetToFirstRun(): void
-  /** §5.4 — /seed-600: replaces the graph with 600 nodes across 6 regions. */
-  seed600(): void
+  /** §5.4 — /seed-700: replaces the graph with 700 designer reference nodes across 7 clusters. */
+  seed700(): void
+  /**
+   * Phase 1.5 "Tidy to Moodboard Grid" — snaps a region's nodes onto a crisp
+   * aligned contact-sheet grid while preserving ALL graph edges (edges are
+   * never rewritten; only node coordinates change). Pinned anchors never
+   * move (§6 immobility), ghost-echo nodes are skipped (they must stay
+   * tethered beside their active node).
+   */
+  tidyToMoodboard(regionId: RegionId): void
 
   /* --- navigation & the live pool --- */
   /** Activates a node: marks live, touches recency, records co-visitation, prunes stale ghosts, spawns new ghosts, enforces the pool. */
@@ -207,7 +231,8 @@ export type GraphActions = {
   toggleGlance(): void
   setPhysicsFrozen(frozen: boolean): void
   togglePhysicsFrozen(): void
-  setSemanticZoomOverride(on: boolean): void
+  setSemanticZoomOverride(tier: SemanticZoomLevel | null): void
+  /** Engages the LOD lock on the currently displayed tier / releases it. */
   toggleSemanticZoomOverride(): void
   setZoom(zoom: number): void
   /** Voice recorder reports the node it records on (immunity + pill dot). */
@@ -456,12 +481,75 @@ const initialState: GraphState = {
   paletteOpen: false,
   glanceOpen: false,
   physicsFrozen: false,
-  semanticZoomOverride: false,
+  semanticZoomOverride: null,
   zoom: 1,
   recordingNodeId: null,
   workbenchUuids: [],
   lastEviction: null,
   suppressedGhostHashes: [],
+}
+
+/* ------------------------------------------------------------------ */
+/* Persist storage — trailing-debounce writer                          */
+/* ------------------------------------------------------------------ */
+
+/** The persist key — needed by the debounced writer's flush closure. */
+const PERSIST_KEY = 'spatial-canvas-phase-1'
+
+/** Persist write debounce window (ms). */
+const PERSIST_DEBOUNCE_MS = 250
+
+/**
+ * localStorage-backed zustand storage that coalesces writes. The graph state
+ * (hundreds of nodes with keywords, subPages and excerpts) serializes to
+ * several hundred KB; the wheel-zoom path used to write the store on every
+ * d3-zoom event, stringifying the whole world synchronously per event — a
+ * guaranteed jank storm at 700 nodes. Writes now coalesce on a trailing
+ * timer; `pagehide` flushes the pending payload so a normal tab close never
+ * loses the last change.
+ */
+function createDebouncedLocalStorage(): StateStorage {
+  let timer: number | null = null
+  let pendingPayload: string | null = null
+
+  const flush = () => {
+    if (timer !== null) {
+      window.clearTimeout(timer)
+      timer = null
+    }
+    const payload = pendingPayload
+    pendingPayload = null
+    if (payload === null) return
+    try {
+      localStorage.setItem(PERSIST_KEY, payload)
+    } catch {
+      // Quota/serialization failure — the next successful write wins.
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', flush)
+  }
+
+  return {
+    getItem: (name) => localStorage.getItem(name),
+    setItem: (_name, value) => {
+      pendingPayload = value
+      if (timer !== null) return
+      timer = window.setTimeout(() => {
+        timer = null
+        flush()
+      }, PERSIST_DEBOUNCE_MS)
+    },
+    removeItem: (name) => {
+      pendingPayload = null
+      if (timer !== null) {
+        window.clearTimeout(timer)
+        timer = null
+      }
+      localStorage.removeItem(name)
+    },
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -500,6 +588,9 @@ export const useGraphStore = create<GraphStore>()(
           recordingNodeId: null,
           paletteOpen: false,
           glanceOpen: false,
+          // A seed replaces the whole world — release a stale LOD lock so the
+          // new world is always first seen at its natural seeded zoom tier.
+          semanticZoomOverride: null,
         })
       }
 
@@ -517,8 +608,34 @@ export const useGraphStore = create<GraphStore>()(
           applySeed(buildFirstRunSeed(Date.now()), FIRST_RUN_SEED_VERSION, 'reading', 1)
         },
 
-        seed600: () => {
-          applySeed(buildStressSeed600(Date.now()), STRESS_SEED_VERSION, 'canvas', 0.3)
+        seed700: () => {
+          applySeed(buildStressSeed700(Date.now()), STRESS_SEED_VERSION, 'canvas', 0.3)
+        },
+
+        tidyToMoodboard: (regionId) => {
+          const state = get()
+          if (!state.regions[regionId]) return
+          const members = Object.values(state.nodes).filter(
+            (node) => node.regionId === regionId && node.nodeType !== 'ghost-echo',
+          )
+          if (members.length === 0) return
+          const result = computeMoodboardGrid(
+            members.map((node) => ({ uuid: node.uuid, x: node.x, y: node.y, isPinned: node.isPinned })),
+          )
+          const nextNodes: Record<NodeUuid, SpatialTabNodeRecord> = { ...state.nodes }
+          let moved = 0
+          for (const uuid of result.moved) {
+            const node = nextNodes[uuid]
+            const placement = result.positions[uuid]
+            if (!node || !placement) continue
+            if (node.x === placement.x && node.y === placement.y) continue
+            moved += 1
+            // Coordinates only — `fx`/`fy` stay untouched (free nodes keep
+            // fx=null; pinned anchors never appear in result.moved), and
+            // every edge survives intact.
+            nextNodes[uuid] = { ...node, x: placement.x, y: placement.y }
+          }
+          if (moved > 0) set({ nodes: nextNodes })
         },
 
         /* ---------------- navigation & live pool ---------------- */
@@ -1079,7 +1196,9 @@ export const useGraphStore = create<GraphStore>()(
             paletteOpen: false,
             glanceOpen: false,
             physicsFrozen: false,
-            semanticZoomOverride: false,
+            // `semanticZoomOverride` (the LOD lock) is deliberately NOT
+            // cleared here: it is a user preference, not an ephemeral
+            // glitch flag, and must survive canvas ⇄ reading round trips.
             nodes: Object.fromEntries(
               Object.entries(state.nodes).map(([id, node]) => [id, node.isLoading ? { ...node, isLoading: false } : node]),
             ),
@@ -1096,17 +1215,23 @@ export const useGraphStore = create<GraphStore>()(
         toggleGlance: () => set((state) => ({ glanceOpen: !state.glanceOpen })),
         setPhysicsFrozen: (frozen) => set({ physicsFrozen: frozen }),
         togglePhysicsFrozen: () => set((state) => ({ physicsFrozen: !state.physicsFrozen })),
-        setSemanticZoomOverride: (on) => set({ semanticZoomOverride: on }),
-        toggleSemanticZoomOverride: () => set((state) => ({ semanticZoomOverride: !state.semanticZoomOverride })),
+        setSemanticZoomOverride: (tier) => set({ semanticZoomOverride: tier }),
+        toggleSemanticZoomOverride: () =>
+          set((state) => ({
+            // Engaging the lock pins the tier currently displayed at the
+            // current zoom (never a hard-coded tier); releasing it resumes
+            // natural tier-stepping.
+            semanticZoomOverride: state.semanticZoomOverride ? null : lodForZoom(state.zoom, null),
+          })),
         setZoom: (zoom) => set({ zoom: Math.min(2, Math.max(0.15, zoom)) }),
         setRecordingNode: (uuid) => set({ recordingNodeId: uuid }),
         clearLastEviction: () => set({ lastEviction: null }),
       }
     },
     {
-      name: 'spatial-canvas-phase-1',
+      name: PERSIST_KEY,
       version: 1,
-      storage: createJSONStorage(() => localStorage),
+      storage: createJSONStorage(createDebouncedLocalStorage),
       partialize: (state): PersistedGraphState => ({
         nodes: state.nodes,
         edges: state.edges,
@@ -1382,7 +1507,7 @@ export function selectSearchResults(state: GraphStore, rawQuery: string, limit =
         noteId: null,
         memoId: null,
         title: node.title,
-        snippet: `${node.domain} · ${node.ramState === 'live' ? `LIVE · ${node.ramMb} MB` : 'SLEEP · 0 MB'}${bestText ? ` — ${bestText}` : ''}`,
+        snippet: `${node.domain} · ${node.ramState === 'live' ? 'Live tab' : isColdArchive(node, Date.now()) ? 'Cold archive' : 'Hibernated'}${bestText ? ` — ${bestText}` : ''}`,
         score: best,
       })
     }

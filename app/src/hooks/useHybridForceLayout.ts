@@ -165,7 +165,7 @@ export function useHybridForceLayout(
   /** Sync the simulation with the store-derived node/link inputs. */
   useEffect(() => {
     const map = simNodesRef.current
-    let hasNew = false
+    let createdCount = 0
 
     for (const input of nodes) {
       let sim = map.get(input.uuid)
@@ -187,6 +187,7 @@ export function useHybridForceLayout(
           calmTicks: 0,
         }
         map.set(input.uuid, sim)
+        createdCount += 1
       } else {
         sim.homeX = input.x
         sim.homeY = input.y
@@ -194,6 +195,8 @@ export function useHybridForceLayout(
         sim.pinned = pinned
         sim.fx = pinned ? input.fx : null
         sim.fy = pinned ? input.fy : null
+        // Per-tier collide radius stays live for sims still relaxing.
+        sim.radius = input.radius
         if (input.isNew && !sim.isNew) {
           sim.isNew = true
           sim.x = input.x
@@ -204,7 +207,6 @@ export function useHybridForceLayout(
           sim.isNew = false
         }
       }
-      if (input.isNew) hasNew = true
     }
 
     const present = new Set(nodes.map((node) => node.uuid))
@@ -262,7 +264,14 @@ export function useHybridForceLayout(
 
     writePositions(optionsRef.current.frozen ? 0 : 1)
 
-    if (!optionsRef.current.frozen && hasNew) {
+    // Re-energize ONLY when genuinely new nodes joined the graph. Re-running
+    // on "some input still says unsettled" re-kicked the whole simulation on
+    // every settle commit (each one rebuilds the input arrays), which kept
+    // hundreds of nodes churning and re-rendering — the Phase 1.5 audit's
+    // 700-node freeze amplifier. Settling satellites keep relaxing under the
+    // alpha they already have; the tick handler stops the sim when none are
+    // left unsettled.
+    if (!optionsRef.current.frozen && createdCount > 0) {
       sim.alpha(0.5).restart()
       setIsRunning(true)
     }

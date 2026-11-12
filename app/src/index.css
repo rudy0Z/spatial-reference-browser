@@ -1,49 +1,131 @@
 @import "tailwindcss";
 
 /*
- * SPEC.md §2 — dark-first tactical glass palette
- * ("Apple Design Award winner × Linear × Raycast × Blanc")
- * Exposed as Tailwind v4 theme tokens so they are emitted as CSS custom
- * properties on :root AND usable as utilities (bg-void, border-hairline,
- * text-accent, bg-sticky-glass, font-mono, tracking-ui, …).
+ * PHASE 1.5 — dead-neutral architectural token system
+ * ("Zen × Blanc × Obsidian Minimal" — ZCODE_MASTER_PROMPT.md §Phase 1.5)
+ *
+ * Two layers:
+ *   1. Canonical palette (`:root` + `html[data-theme='paper']`) — the ONLY
+ *      place raw colors live. Dark graphite is the default; Warm Paper is
+ *      the light theme. Everything else resolves through these vars, so a
+ *      theme flip is one attribute on <html>.
+ *   2. Legacy utility bridge (`@theme`) — the utility names the Phase 1
+ *      prototype's components already use (bg-void, border-hairline,
+ *      text-accent, bg-surface-glass, text-sticky, …) re-pointed onto the
+ *      canonical vars. No class needs renaming; values are now neutral and
+ *      flip with the theme automatically.
+ *
+ * Color discipline: reference thumbnails own 100% of the color. The chrome
+ * is matte graphite / warm ivory — zero neon, zero colored glows. Active
+ * state = 1px var(--border-active) hairline + a soft neutral elevation
+ * shadow (var(--shadow-card), overlays use var(--shadow-pop)). Never glow.
+ *
+ *   State grammar:  rest    → 1px var(--border-subtle)
+ *                   hover   → 1px var(--border-hover)
+ *                   active  → 1px var(--border-active) + var(--shadow-card)
+ *
+ * Typography: Inter Variable at -0.015em (--tracking-ui) for all UI copy in
+ * clean sentence case (bundled via @fontsource-variable/inter). JetBrains
+ * Mono (--font-mono) is reserved strictly for URLs and <kbd> hints —
+ * mono badges/timestamps/RAM labels move off mono in the component pass.
  */
+
+/* ------------------------------------------------------------------ */
+/* 1 — Canonical palette (dark default)                                */
+/* ------------------------------------------------------------------ */
+:root {
+  color-scheme: dark;
+
+  /* Surfaces, darkest → most elevated */
+  --bg-canvas: #0b0b0d;                     /* app void, canvas backdrop        */
+  --bg-chrome: #121215;                     /* top bars, rails, panels          */
+  --bg-card: #18181c;                       /* reference cards, list rows       */
+  --bg-elevated: #202026;                   /* palettes, popovers, tooltips     */
+  --bg-glass: rgba(18, 18, 21, 0.78);       /* translucent chrome over content  */
+  --glass-soft: rgba(255, 255, 255, 0.04);  /* quietest wash (sticky glass)     */
+
+  /* Hairlines */
+  --border-subtle: rgba(255, 255, 255, 0.065); /* resting 1px hairline          */
+  --border-hover: rgba(255, 255, 255, 0.14);   /* hover hairline                */
+  --border-active: rgba(255, 255, 255, 0.28);  /* THE active hairline           */
+
+  /* Ink */
+  --ink-primary: #f3f3f5;   /* titles, primary copy       */
+  --ink-secondary: #8e8e96; /* labels, domains, meta      */
+  --ink-muted: #5a5a63;     /* whispers, ghost content    */
+
+  /* Neutral accent — live dots, indicators, selection. UI carries no hue. */
+  --accent: #f3f3f5;
+
+  /* Canvas dot-matrix grid */
+  --grid-dot: rgba(255, 255, 255, 0.055);
+
+  /* Soft neutral elevation — the only "shadow" allowed, never colored */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 4px 14px rgba(0, 0, 0, 0.28);
+  --shadow-pop: 0 2px 6px rgba(0, 0, 0, 0.4), 0 16px 40px rgba(0, 0, 0, 0.45);
+}
+
+/* ------------------------------------------------------------------ */
+/* Warm Paper light theme — crisp warm ivory surfaces, near-black ink  */
+/* ------------------------------------------------------------------ */
+html[data-theme='paper'] {
+  color-scheme: light;
+
+  --bg-canvas: #f4f1ea;
+  --bg-chrome: #ece8df;
+  --bg-card: #faf7f0;
+  --bg-elevated: #fffdf7;
+  --bg-glass: rgba(250, 248, 242, 0.82);
+  --glass-soft: rgba(31, 28, 22, 0.045);
+
+  --border-subtle: rgba(31, 28, 22, 0.09);
+  --border-hover: rgba(31, 28, 22, 0.18);
+  --border-active: rgba(31, 28, 22, 0.32);
+
+  --ink-primary: #201e19;
+  --ink-secondary: #6e6a61;
+  --ink-muted: #9b968b;
+
+  --accent: #201e19;
+
+  --grid-dot: rgba(31, 28, 22, 0.08);
+
+  --shadow-card: 0 1px 2px rgba(46, 40, 30, 0.07), 0 4px 14px rgba(46, 40, 30, 0.07);
+  --shadow-pop: 0 2px 6px rgba(46, 40, 30, 0.09), 0 16px 40px rgba(46, 40, 30, 0.12);
+}
+
+/* ------------------------------------------------------------------ */
+/* 2 — Legacy utility bridge (Phase 1 names → canonical vars)          */
+/*     Names stay valid for the existing components; the neon VALUES   */
+/*     are deleted and replaced with neutral, theme-flipping vars.     */
+/* ------------------------------------------------------------------ */
 @theme {
-  /* Canvas void background */
-  --color-void: #090a0c;
-  /* Radial dot-matrix grid (fading out at low zoom) */
-  --color-grid: #1c1f26;
+  --color-void: var(--bg-canvas);            /* was #090a0c                     */
+  --color-grid: var(--grid-dot);             /* was #1c1f26                     */
+  --color-surface: var(--bg-card);           /* was #12141a                     */
+  --color-surface-glass: var(--bg-glass);    /* was rgba(20, 23, 30, 0.78)      */
+  --color-hairline: var(--border-subtle);    /* was rgba(255, 255, 255, 0.08)   */
 
-  /* Elevated surface / card base (pair with backdrop-blur-xl) */
-  --color-surface: #12141a;
-  --color-surface-glass: rgba(20, 23, 30, 0.78);
+  /* Was the neon active glow — now the active hairline tone. No glow. */
+  --color-glow: var(--border-active);
 
-  /* Hairline borders + active glow */
-  --color-hairline: rgba(255, 255, 255, 0.08);
-  --color-glow: rgba(110, 231, 183, 0.45);
+  /* Was pine neon — now neutral ink; UI owns no hue. */
+  --color-accent: var(--accent);
 
-  /* Primary accent — pine/sage signal (active indicator, live audio wave,
-     connected pulses) */
-  --color-accent: #34d399;
+  /* Was ghost violet — now muted ink. */
+  --color-ghost: var(--ink-muted);
 
-  /* Ghost Echo accent — spectral, dashed glowing borders */
-  --color-ghost: #a78bfa;
+  /* Was sticky amber glass — now the neutral ink steps + quietest wash. */
+  --color-sticky: var(--ink-secondary);
+  --color-sticky-soft: var(--ink-primary);
+  --color-sticky-glass: var(--glass-soft);
 
-  /* Sticky note warmth on muted dark amber glass */
-  --color-sticky: #fde047;
-  --color-sticky-soft: #fef08a;
-  --color-sticky-glass: rgba(250, 204, 21, 0.12);
-
-  /* Typography: Inter for UI (tracking -0.02em), JetBrains Mono for URLs,
-     domains, RAM badges, timestamps, slash commands */
+  /* Typography — Inter Variable for UI at -0.015em; JetBrains Mono only
+     for URLs and <kbd> hints. */
   --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace;
 
-  /* SPEC §2 UI-label tracking */
-  --tracking-ui: -0.02em;
-}
-
-:root {
-  color-scheme: dark;
+  --tracking-ui: -0.015em;
 }
 
 html,
@@ -54,8 +136,8 @@ body,
 
 body {
   margin: 0;
-  background-color: var(--color-void);
-  color: rgb(255 255 255 / 92%);
+  background-color: var(--bg-canvas);
+  color: var(--ink-primary);
   font-family: var(--font-sans);
   letter-spacing: var(--tracking-ui);
   -webkit-font-smoothing: antialiased;

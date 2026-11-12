@@ -1,15 +1,16 @@
 /**
- * app/src/components/chrome/FloatingIslandPill.tsx — SPEC §3 Mode A chrome:
- * the Blanc Floating Island Pill + Raycast-style command palette.
+ * app/src/components/chrome/FloatingIslandPill.tsx — the Blanc floating
+ * island (SPEC §3 Mode A) rebuilt for the Phase 1.5 flagship chrome
+ * (ZCODE_MASTER_PROMPT.md §Phase 1.5.2).
  *
- * RESTING STATE (36px tall, top-center): deterministic favicon mark, clean
- * domain, mono `LIVE · 138 MB` / `SLEEP · 0 MB` RAM badge, up to 6 neighbour
- * dots from `selectPillNeighbours` (§6 semantics: accent = active, pulsing =
- * loading, hollow = hibernated, violet glow = Ghost Echo), plus quick
- * actions — Add Note (Alt+N equivalent) and Toggle Canvas (⌘/Ctrl+Space
- * equivalent). Clicking the pill center opens the palette (⌘/Ctrl+L is
- * wired globally by the app shell per §10 — this component only consumes
- * the `paletteOpen` flag, so the two never double-toggle).
+ * RESTING STATE (36px island, floating exactly in the BrowserTopBar's
+ * reserved centre slot): neutral favicon mark, the domain/title trigger that
+ * opens the command palette (⌘/Ctrl+L wired app-globally), a loading pulse,
+ * the audio-immunity indicator, up to 6 neighbour dots with SILENT state
+ * semantics (§6: filled = live, hollow = asleep, frosted wash = Ghost Echo —
+ * muted tones, never neon), and the Alt+N quick-note +
+ * Canvas-toggle quick actions. ALL RAM/debug badges are stripped: no
+ * `LIVE · 138 MB`, no `SLEEP · 0 MB`, no `AUTH`, no uppercase mono chips.
  *
  * PALETTE: the pill shell morphs into a 680px Raycast-style command bar via
  * a framer-motion shared-layout spring (stiffness 380 / damping 30, §2).
@@ -49,13 +50,10 @@ import {
 import type { LucideIcon } from 'lucide-react'
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
-import { fnv1a32 } from '../../lib/embed'
 import {
-  REGION_COLORS,
   SLASH_COMMANDS,
   SPATIAL_DRAG_MIME,
   domainOf,
-  formatRamMb,
 } from '../../lib/types'
 import type {
   FloatingIslandPillProps,
@@ -97,7 +95,7 @@ function Kbd({ children, className }: { children: ReactNode; className?: string 
   return (
     <kbd
       className={cn(
-        'rounded border border-white/10 bg-white/[0.05] px-1 font-mono text-[9px] leading-[15px] text-white/45',
+        'rounded border border-hairline bg-[color:var(--glass-soft)] px-1 font-mono text-[9px] leading-[15px] text-[color:var(--ink-muted)]',
         className,
       )}
     >
@@ -106,34 +104,37 @@ function Kbd({ children, className }: { children: ReactNode; className?: string 
   )
 }
 
-/** Deterministic favicon tint for the active tab (region color wins if any). */
-function accentColorForDomain(domain: string): string {
-  return REGION_COLORS[fnv1a32(domain) % REGION_COLORS.length] ?? REGION_COLORS[0]
-}
-
-function FaviconMark({ domain, color }: { domain: string; color: string }) {
+/** Neutral favicon mark — the chrome owns no hue (thumbnails own the color). */
+function FaviconMark({ domain }: { domain: string }) {
   const letter = (domain[0] ?? '?').toUpperCase()
   return (
-    <span
-      className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[10px] font-semibold"
-      style={{ backgroundColor: `${color}26`, color, boxShadow: `inset 0 0 0 1px ${color}40` }}
-    >
+    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-hairline bg-[color:var(--glass-soft)] text-[10px] font-semibold text-[color:var(--ink-secondary)]">
       {letter}
     </span>
   )
 }
 
 /* ------------------------------------------------------------------ */
-/* §6 neighbour dots — accent=active, pulsing=loading, hollow=sleeping, */
-/* violet glow=Ghost Echo. First dot is always the active node.        */
+/* §6 neighbour dots — silent state grammar, muted tones, never neon:  */
+/*   filled = live · hollow = asleep · frosted wash = Ghost Echo.      */
+/* First dot is always the active node.                                */
 /* ------------------------------------------------------------------ */
 
 const DOT_CORE: Record<PillNeighborDotState, string> = {
-  active: 'h-2.5 w-2.5 rounded-full bg-accent shadow-[0_0_10px_rgba(110,231,183,0.55)] ring-1 ring-accent/40',
+  active: 'h-2.5 w-2.5 rounded-full bg-[color:var(--accent)]',
   loading: '', // rendered as a pulsing motion.span below
-  live: 'h-2 w-2 rounded-full bg-white/75',
-  hibernated: 'h-2 w-2 rounded-full border border-white/50 bg-transparent',
-  ghost: 'h-2 w-2 rounded-full bg-ghost shadow-[0_0_9px_rgba(167,139,250,0.9)]',
+  live: 'h-2 w-2 rounded-full bg-[color:var(--ink-secondary)]',
+  hibernated: 'h-2 w-2 rounded-full border-[1.5px] border-[color:var(--ink-muted)] bg-transparent',
+  // Frosted ghost — quietest wash inside a muted hairline, zero glow.
+  ghost: 'h-2 w-2 rounded-full border border-[color:var(--ink-muted)] bg-[color:var(--glass-soft)]',
+}
+
+const DOT_LABEL: Record<PillNeighborDotState, string> = {
+  active: 'Active tab',
+  loading: 'Loading…',
+  live: 'Live tab',
+  hibernated: 'Asleep — click to wake',
+  ghost: 'Ghost echo — predicted resurfacing',
 }
 
 function NeighborDot({ dot, onActivate }: { dot: PillNeighborDot; onActivate: (uuid: string) => void }) {
@@ -146,7 +147,7 @@ function NeighborDot({ dot, onActivate }: { dot: PillNeighborDot; onActivate: (u
         className="flex h-4 w-4 items-center justify-center"
       >
         <motion.span
-          className="h-2 w-2 rounded-full bg-accent"
+          className="h-2 w-2 rounded-full bg-[color:var(--accent)]"
           animate={{ scale: [1, 1.5, 1], opacity: [1, 0.4, 1] }}
           transition={{ duration: 1.05, repeat: Infinity, ease: 'easeInOut' }}
         />
@@ -156,7 +157,7 @@ function NeighborDot({ dot, onActivate }: { dot: PillNeighborDot; onActivate: (u
   return (
     <button
       type="button"
-      title={`${dot.title} — ${dot.state === 'active' ? 'active' : dot.state === 'ghost' ? 'ghost echo' : dot.state}`}
+      title={`${dot.title} — ${DOT_LABEL[dot.state]}`}
       onClick={() => onActivate(dot.uuid)}
       className="flex h-4 w-4 items-center justify-center"
     >
@@ -179,13 +180,14 @@ const COMMAND_ICONS: Record<SlashCommandId, LucideIcon> = {
   new: Plus,
   note: StickyNote,
   cluster: Boxes,
-  'seed-600': Rocket,
+  'seed-700': Rocket,
 }
 
-const RESULT_META: Record<SearchResultKind, { icon: LucideIcon; label: string; chip: string }> = {
-  tab: { icon: PanelTop, label: 'TAB', chip: 'border-accent/25 bg-accent/10 text-accent' },
-  note: { icon: StickyNote, label: 'NOTE', chip: 'border-sticky/25 bg-sticky-glass text-sticky' },
-  memo: { icon: AudioLines, label: 'MEMO', chip: 'border-[#22D3EE]/25 bg-[#22D3EE]/10 text-[#22D3EE]' },
+/** Quiet sentence-case result categories — no uppercase mono chips. */
+const RESULT_META: Record<SearchResultKind, { icon: LucideIcon; label: string }> = {
+  tab: { icon: PanelTop, label: 'Tab' },
+  note: { icon: StickyNote, label: 'Note' },
+  memo: { icon: AudioLines, label: 'Memo' },
 }
 
 function PaletteRow({
@@ -196,7 +198,6 @@ function PaletteRow({
   title,
   detail,
   chip,
-  chipClass,
 }: {
   selected: boolean
   onSelect: () => void
@@ -205,7 +206,6 @@ function PaletteRow({
   title: string
   detail: string
   chip: string | null
-  chipClass: string
 }) {
   return (
     <button
@@ -218,29 +218,20 @@ function PaletteRow({
       {selected && (
         <motion.span
           layoutId="floating-island-selection"
-          className="absolute inset-0 rounded-[10px] bg-white/[0.07]"
+          className="absolute inset-0 rounded-[10px] bg-[color:var(--glass-soft)]"
           transition={SPRING}
         />
       )}
-      <span className="relative z-10 flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-white/10 bg-white/[0.05] text-white/70">
+      <span className="relative z-10 flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-hairline bg-[color:var(--glass-soft)] text-[color:var(--ink-secondary)]">
         <Icon size={13} />
       </span>
-      <span className="relative z-10 min-w-0 flex-1 truncate text-[12.5px] text-white/85">{title}</span>
+      <span className="relative z-10 min-w-0 flex-1 truncate text-[12.5px] text-[color:var(--ink-primary)]">{title}</span>
       {detail !== '' && (
-        <span className="relative z-10 hidden max-w-[45%] shrink truncate text-[10.5px] text-white/40 sm:block">
+        <span className="relative z-10 hidden max-w-[45%] shrink truncate text-[10.5px] text-[color:var(--ink-muted)] sm:block">
           {detail}
         </span>
       )}
-      {chip !== null && (
-        <span
-          className={cn(
-            'relative z-10 shrink-0 rounded border px-1 font-mono text-[8.5px] uppercase leading-[14px]',
-            chipClass,
-          )}
-        >
-          {chip}
-        </span>
-      )}
+      {chip !== null && <span className="relative z-10 shrink-0 text-[10px] text-[color:var(--ink-muted)]">{chip}</span>}
     </button>
   )
 }
@@ -309,7 +300,7 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
   const hibernateAll = useGraphStore((s) => s.hibernateAll)
   const createNewTab = useGraphStore((s) => s.createNewTab)
   const createClusterFromActive = useGraphStore((s) => s.createClusterFromActive)
-  const seed600 = useGraphStore((s) => s.seed600)
+  const seed700 = useGraphStore((s) => s.seed700)
 
   const [query, setQuery] = useState('')
   const [selectedIndex, setSelectedIndex] = useState(0)
@@ -368,8 +359,8 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
       case 'cluster':
         createClusterFromActive()
         break
-      case 'seed-600':
-        seed600()
+      case 'seed-700':
+        seed700()
         break
     }
     setPaletteOpen(false)
@@ -417,13 +408,13 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
       animate={{ opacity: 1 }}
       transition={SPRING}
       onKeyDown={handlePaletteKeyDown}
-      style={{ borderRadius: 18 }}
-      className="pointer-events-auto flex w-[680px] max-w-[calc(100vw_-_24px)] flex-col overflow-hidden border border-hairline bg-surface-glass shadow-[0_24px_80px_rgba(0,0,0,0.7)] backdrop-blur-xl"
+      style={{ borderRadius: 18, boxShadow: 'var(--shadow-pop)' }}
+      className="pointer-events-auto flex w-[680px] max-w-[calc(100vw_-_24px)] flex-col overflow-hidden border border-hairline bg-surface-glass backdrop-blur-xl"
       {...dragHandlers}
     >
       {/* search input row */}
       <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-hairline px-3.5">
-        <Search size={15} className="shrink-0 text-white/40" />
+        <Search size={15} className="shrink-0 text-[color:var(--ink-muted)]" />
         <input
           autoFocus
           value={query}
@@ -433,7 +424,7 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
             setSelectedIndex(0)
           }}
           placeholder="Search tabs, notes, voice memos — or type / for commands"
-          className="h-full min-w-0 flex-1 bg-transparent text-[13.5px] text-white/90 outline-none placeholder:text-white/30"
+          className="h-full min-w-0 flex-1 bg-transparent text-[13.5px] text-[color:var(--ink-primary)] outline-none placeholder:text-[color:var(--ink-muted)]"
         />
         <Kbd>esc</Kbd>
       </div>
@@ -441,11 +432,11 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
       {/* results / commands */}
       <div
         ref={listRef}
-        className="max-h-[336px] overflow-y-auto overscroll-contain p-1.5 [scrollbar-color:rgba(255,255,255,0.14)_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-white/10"
+        className="max-h-[336px] overflow-y-auto overscroll-contain p-1.5 [scrollbar-color:var(--border-hover)_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[color:var(--border-hover)]"
       >
         {items.length > 0 && (
-          <div className="px-2.5 pb-1 pt-2 font-mono text-[9px] uppercase tracking-[0.16em] text-white/30">
-            {isCommandsView ? 'Slash commands' : 'Search results'}
+          <div className="px-2.5 pb-1 pt-2 text-[10px] text-[color:var(--ink-muted)]">
+            {isCommandsView ? 'Commands' : 'Results'}
           </div>
         )}
         {items.map((item, index) => {
@@ -462,7 +453,6 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
                 title={item.command.label}
                 detail={item.command.description}
                 chip={null}
-                chipClass=""
               />
             )
           }
@@ -477,21 +467,20 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
               title={item.result.title}
               detail={item.result.snippet}
               chip={meta.label}
-              chipClass={meta.chip}
             />
           )
         })}
         {items.length === 0 && (
-          <div className="flex h-20 items-center justify-center px-4 text-center text-[12px] text-white/35">
+          <div className="flex h-20 items-center justify-center px-4 text-center text-[12px] text-[color:var(--ink-muted)]">
             {slashFilter !== null
-              ? `No command matches “${trimmed}” — try /canvas or /seed-600`
+              ? `No command matches “${trimmed}” — try /canvas or /seed-700`
               : `No matches for “${trimmed}” in tabs, notes or voice memos`}
           </div>
         )}
       </div>
 
-      {/* shortcut hints footer (§10 on-screen chips) */}
-      <div className="flex h-8 shrink-0 items-center gap-3 border-t border-hairline px-3.5 text-[10px] text-white/35">
+      {/* shortcut hints footer (mono reserved for <kbd> hints) */}
+      <div className="flex h-8 shrink-0 items-center gap-3 border-t border-hairline px-3.5 text-[10px] text-[color:var(--ink-muted)]">
         <span className="flex items-center gap-1">
           <Kbd>↑</Kbd>
           <Kbd>↓</Kbd> navigate
@@ -502,7 +491,7 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
         <span className="flex items-center gap-1">
           <Kbd>esc</Kbd> close
         </span>
-        <span className="ml-auto font-mono">
+        <span className="ml-auto tabular-nums">
           {items.length} {isCommandsView ? 'commands' : 'results'}
         </span>
       </div>
@@ -519,7 +508,6 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
   const activeNode = useGraphStore((s) => (s.activeNodeUuid ? (s.nodes[s.activeNodeUuid] ?? null) : null))
   const nodes = useGraphStore((s) => s.nodes)
   const edges = useGraphStore((s) => s.edges)
-  const regions = useGraphStore((s) => s.regions)
   const paletteOpen = useGraphStore((s) => s.paletteOpen)
   const recordingNodeId = useGraphStore((s) => s.recordingNodeId)
 
@@ -530,9 +518,6 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
   const spawnChildNode = useGraphStore((s) => s.spawnChildNode)
   const activateNode = useGraphStore((s) => s.activateNode)
 
-  /* --- derived view model --- */
-  const regionColor = activeNode?.regionId ? (regions[activeNode.regionId]?.color ?? null) : null
-  const faviconColor = regionColor ?? (activeNode ? accentColorForDomain(activeNode.domain) : REGION_COLORS[0])
   const isRecording = recordingNodeId !== null && activeNode?.uuid === recordingNodeId
 
   /** §6 dots — recompute when the graph actually changes (memoized, not per-render). */
@@ -608,8 +593,9 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
         )}
       </AnimatePresence>
 
-      {/* Morphing island shell: resting pill ⇄ command palette (shared layout spring) */}
-      <div className="pointer-events-none absolute inset-x-0 top-3 flex justify-center">
+      {/* Morphing island shell: resting pill ⇄ command palette (shared layout spring).
+          top-1.5 floats the 36px island exactly in the 48px BrowserTopBar's centre. */}
+      <div className="pointer-events-none absolute inset-x-0 top-1.5 flex justify-center">
         <AnimatePresence>
           {paletteOpen ? (
             <CommandPalette key="floating-island-palette" dragHandlers={dragHandlers} />
@@ -621,64 +607,47 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1, scale: isDragOver ? 1.06 : 1 }}
               transition={SPRING}
-              style={{ borderRadius: 18 }}
+              style={{ borderRadius: 18, boxShadow: 'var(--shadow-pop)' }}
               className={cn(
-                'pointer-events-auto flex h-9 max-w-[min(92vw,_560px)] select-none items-center gap-1.5 border bg-surface-glass pl-1.5 pr-1 backdrop-blur-xl',
-                isDragOver
-                  ? 'border-accent/60 shadow-[0_0_26px_rgba(52,211,153,0.35)]'
-                  : 'border-hairline shadow-[0_10px_36px_rgba(0,0,0,0.6)]',
+                'pointer-events-auto flex h-9 max-w-[min(46vw,_560px)] select-none items-center gap-1.5 border bg-surface-glass pl-1.5 pr-1 backdrop-blur-xl',
+                isDragOver ? 'border-[color:var(--border-active)]' : 'border-hairline',
               )}
               {...dragHandlers}
             >
-              {/* favicon */}
+              {/* neutral favicon */}
               {activeNode ? (
                 <span title={`${activeNode.title} — ${activeNode.url}`} className="ml-0.5 flex shrink-0">
-                  <FaviconMark domain={activeNode.domain} color={faviconColor} />
+                  <FaviconMark domain={activeNode.domain} />
                 </span>
               ) : (
-                <span className="ml-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-white/10 bg-white/5 text-white/40">
+                <span className="ml-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-hairline bg-[color:var(--glass-soft)] text-[color:var(--ink-muted)]">
                   <Search size={11} />
                 </span>
               )}
 
-              {/* pill center — opens the palette (⌘/Ctrl+L is wired app-globally, §10) */}
+              {/* pill centre — the domain/title trigger that opens the palette
+                  (⌘/Ctrl+L is wired app-globally, §10) */}
               <button
                 type="button"
                 onClick={() => setPaletteOpen(true)}
                 title="Search & commands (⌘/Ctrl+L)"
-                className="flex h-7 min-w-0 items-center gap-1.5 rounded-full px-1.5 transition-colors hover:bg-white/[0.07]"
+                className="flex h-7 min-w-0 items-center gap-1.5 rounded-full px-1.5 transition-colors hover:bg-[color:var(--glass-soft)]"
               >
-                <Search size={12} className="shrink-0 text-white/45" />
+                <Search size={12} className="shrink-0 text-[color:var(--ink-muted)]" />
                 {activeNode ? (
-                  <span className="max-w-[150px] truncate font-mono text-[11.5px] text-white/85">
+                  <span className="max-w-[180px] truncate text-[12px] text-[color:var(--ink-primary)]">
                     {activeNode.domain}
                   </span>
                 ) : (
-                  <span className="text-[11.5px] text-white/55">Command bar</span>
+                  <span className="text-[12px] text-[color:var(--ink-secondary)]">Search & commands</span>
                 )}
-                <Kbd>⌘L</Kbd>
               </button>
-
-              {/* mono RAM badge — §2 JetBrains Mono, §4.1/4.2 badge copy */}
-              {activeNode && (
-                <span
-                  title={activeNode.ramState === 'live' ? 'Live tab — resident memory' : 'Hibernated — 0 MB'}
-                  className={cn(
-                    'flex h-5 shrink-0 items-center rounded-md border px-1.5 font-mono text-[9.5px]',
-                    activeNode.ramState === 'live'
-                      ? 'border-accent/25 bg-accent/10 text-accent'
-                      : 'border-white/10 bg-white/5 text-white/45',
-                  )}
-                >
-                  {activeNode.ramState === 'live' ? 'LIVE' : 'SLEEP'} · {formatRamMb(activeNode.ramMb)}
-                </span>
-              )}
 
               {/* simulated navigation pulse (§6 "pulsing = loading") */}
               {activeNode?.isLoading && (
                 <motion.span
                   title="Loading…"
-                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-[color:var(--accent)]"
                   animate={{ opacity: [1, 0.3, 1], scale: [1, 0.75, 1] }}
                   transition={{ duration: 0.9, repeat: Infinity, ease: 'easeInOut' }}
                 />
@@ -688,7 +657,7 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
               {activeNode?.isAudible && (
                 <motion.span
                   title="Playing audio — immune to auto-hibernation"
-                  className="shrink-0 text-accent"
+                  className="shrink-0 text-[color:var(--ink-secondary)]"
                   animate={{ opacity: [1, 0.5, 1] }}
                   transition={{ duration: 1.4, repeat: Infinity, ease: 'easeInOut' }}
                 >
@@ -700,24 +669,14 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
               {isRecording && (
                 <motion.span
                   title="Recording voice memo on this tab"
-                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#FB7185]"
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-[color:var(--accent)]"
                   animate={{ opacity: [1, 0.35, 1] }}
                   transition={{ duration: 1, repeat: Infinity, ease: 'easeInOut' }}
                 />
               )}
 
-              {/* §7.2 collapsed auth/payment redirect tag */}
-              {activeNode?.viaAuth && (
-                <span
-                  title="OAuth/payment redirect chain collapsed into this node"
-                  className="shrink-0 rounded border border-white/10 bg-white/5 px-1 font-mono text-[8.5px] leading-[14px] text-white/45"
-                >
-                  AUTH
-                </span>
-              )}
-
-              {/* §6 neighbour dots — max 6, active first */}
-              {dots.length > 0 && <span className="mx-0.5 h-4 w-px shrink-0 bg-white/10" />}
+              {/* §6 neighbour dots — max 6, active first, silent semantics */}
+              {dots.length > 0 && <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-hairline" />}
               <span className="flex shrink-0 items-center gap-1">
                 {dots.map((dot) => (
                   <NeighborDot key={dot.uuid} dot={dot} onActivate={activateNode} />
@@ -725,25 +684,23 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
               </span>
 
               {/* quick actions */}
-              <span className="mx-0.5 h-4 w-px shrink-0 bg-white/10" />
+              <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-hairline" />
               <button
                 type="button"
                 onClick={() => quickNoteOnActive()}
                 disabled={!activeNode}
                 title="Add sticky note (Alt+N)"
-                className="flex h-6 shrink-0 items-center gap-1 rounded-full px-1.5 text-white/60 transition-colors hover:bg-white/[0.07] hover:text-sticky disabled:pointer-events-none disabled:opacity-40"
+                className="flex size-6 shrink-0 items-center justify-center rounded-full text-[color:var(--ink-secondary)] transition-colors hover:bg-[color:var(--glass-soft)] hover:text-[color:var(--ink-primary)] disabled:pointer-events-none disabled:opacity-40"
               >
                 <StickyNote size={12} />
-                <Kbd>⌥N</Kbd>
               </button>
               <button
                 type="button"
                 onClick={() => toggleCanvas()}
                 title="Toggle spatial canvas (⌘/Ctrl+Space or Alt+Space)"
-                className="flex h-6 shrink-0 items-center gap-1 rounded-full border border-white/10 bg-white/[0.04] px-1.5 text-white/70 transition-colors hover:border-accent/40 hover:text-accent"
+                className="flex size-6 shrink-0 items-center justify-center rounded-full text-[color:var(--ink-secondary)] transition-colors hover:bg-[color:var(--glass-soft)] hover:text-[color:var(--ink-primary)]"
               >
                 <LayoutGrid size={12} />
-                <Kbd>⌘␣</Kbd>
               </button>
             </motion.div>
           )}
@@ -755,15 +712,15 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
         {isDragOver && !paletteOpen && activeNode && (
           <motion.div
             key="floating-island-drop-hint"
-            style={{ x: '-50%' }}
-            className="absolute left-1/2 top-[54px] flex items-center gap-1.5 rounded-full border border-accent/40 bg-surface-glass px-3 py-1 text-[11px] text-accent shadow-[0_8px_28px_rgba(0,0,0,0.6)] backdrop-blur-xl"
+            style={{ x: '-50%', boxShadow: 'var(--shadow-pop)' }}
+            className="absolute left-1/2 top-[54px] flex items-center gap-1.5 rounded-full border border-[color:var(--border-active)] bg-surface-glass px-3 py-1 text-[11px] text-[color:var(--ink-primary)] backdrop-blur-xl"
             initial={{ opacity: 0, y: -4 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -4 }}
             transition={SPRING}
           >
             <Plus size={11} />
-            Release to spawn a satellite beside&nbsp;<span className="font-mono">{activeNode.domain}</span>
+            Release to anchor a new tab beside&nbsp;{activeNode.domain}
           </motion.div>
         )}
       </AnimatePresence>
@@ -773,7 +730,7 @@ export function FloatingIslandPill({ className }: FloatingIslandPillProps) {
         <motion.span
           key={`floating-island-spawn-${spawnPulse}`}
           style={{ x: '-50%' }}
-          className="pointer-events-none absolute left-1/2 top-3 h-9 w-9 rounded-full border-2 border-accent"
+          className="pointer-events-none absolute left-1/2 top-1.5 h-9 w-9 rounded-full border-2 border-[color:var(--border-active)]"
           initial={{ opacity: 0.7, scale: 0.7 }}
           animate={{ opacity: 0, scale: 2.1 }}
           transition={SPRING}
