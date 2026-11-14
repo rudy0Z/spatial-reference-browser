@@ -1,0 +1,20 @@
+{
+  "benchmark": "phase-1.5 headless-CDP canvas fps",
+  "date": "2026-11-14T22:27:46.896Z",
+  "url": "http://127.0.0.1:5199/",
+  "browser": "chrome.exe",
+  "nodes": 700,
+  "benchMs": 5000,
+  "wheelEvents": 312,
+  "frames": 578,
+  "avgFps": 115.6,
+  "droppedPct": 0,
+  "p95FrameMs": 15.5,
+  "topFunctions": [],
+  "gates": {
+    "fps": 55,
+    "droppedPct": 2,
+    "droppedDeltaMs": 33
+  },
+  "pass": true
+}

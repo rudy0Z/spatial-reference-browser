@@ -286,8 +286,10 @@ export type SpatialDragPayload = {
 /** MIME type both MockWebReader (drag source) and FloatingIslandPill (drop zone) agree on. */
 export const SPATIAL_DRAG_MIME = 'application/x-spatial-tab-seed'
 
-/** §3 slash commands rendered by the expanded palette. */
-export type SlashCommandId = 'canvas' | 'hibernate-all' | 'new' | 'note' | 'cluster' | 'seed-700'
+/** §3 slash commands rendered by the expanded palette. Per the Fresh-State
+ * Browser Law (master spec §0.2) no test/stress generator is user-facing —
+ * the 700-node fixture lives behind `window.__devStressSeed`. */
+export type SlashCommandId = 'canvas' | 'hibernate-all' | 'new' | 'note' | 'cluster'
 
 export type SlashCommand = {
   id: SlashCommandId
@@ -301,7 +303,6 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { id: 'new', label: '/new', description: 'Spawn a fresh live tab near the active node' },
   { id: 'note', label: '/note', description: 'Quick sticky note on the active node' },
   { id: 'cluster', label: '/cluster', description: 'Wrap the active 1-hop neighbourhood into a region' },
-  { id: 'seed-700', label: '/seed-700', description: '700-node designer seed across 7 clusters' },
 ]
 
 /* ------------------------------------------------------------------ */

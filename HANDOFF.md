@@ -48,16 +48,18 @@
 ### Phase 1 prototype — ✅ FROZEN AT ITS TAG
 The spatial canvas + floating pill MVP (Vite + React 18 + TS strict + `@xyflow/react` + `d3-force` + zustand + framer-motion + Tailwind v4). Verified: 18/18 research claims confirmed; spec review 0 high/medium gaps; 4 visual-pass fixes (xyflow stylesheet import, live-position focus, settle glide, `w-fit`).
 
-### Phase 1.5 — 🟡 BUILT + VERIFIED EXCEPT ONE GATE (untagged; committed as WIP `1668e63`)
-The full Zen × Blanc × Obsidian Minimal redesign exists in the working tree (17 files: token overhaul, `PreviewArt.tsx`, `SpatialTabNode.tsx` rewrite, `moodboard.ts`, `ZenRail.tsx`, `BrowserTopBar.tsx`, `ExtensionsDrawer.tsx`, `ShortcutsSheet.tsx`, seed-700, store actions).
+### Phase 1.5 — ✅ DONE, TAGGED
+The full Zen × Blanc × Obsidian Minimal redesign + the master spec's Phase 1.5 hardening (Fresh-State first run, livePool fix, real fps bench).
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `tsc -b` + `vite build` | ✅ green, round 1 | deterministic (`node`-direct invocations) |
-| Deterministic slop sweep of `app/src` | ✅ clean — 0 violations | grep + reads: no neon hexes, no uppercase badges, no `strokeDasharray` animations |
-| Live screenshot audit (4 rounds, fresh auditor each) | ✅ **ALL anti-slop checklist items pass** | `audits/phase-1.5-clean-design-audit.md` (rounds 1–3 preserved as `…-round1/2/3.md`): Mode A (top bar, rail both states, help modal, warm-paper light) + Mode B at macro/compact/rich on **700 nodes** (`/seed-700` → nodeCount 700 confirmed in DOM); 12 controls exercised, zero dead buttons; zero neon/badges/clipping |
-| FPS at 700 nodes | ⚠️ **UNMEASURABLE in this harness — not an app failure** | The in-app browser's host suspends rAF/BeginFrames: sampler recorded **0 frames in 5.5s on the app tab, a fresh tab, AND an about:blank control tab**; `tab.recording` failed with "empty WebM artifact" (independent proof). Mitigations (SetForegroundWindow, visibility cycles) all no-ops. Real numbers only, none invented → gate honestly FAILS as unmeasurable |
-| Git tag `checkpoint/phase-1.5-clean-design` | ⏸ **deliberately NOT created** | Only fires when every gate passes. Day's work preserved as WIP commit `1668e63` |
+| `tsc -b` + `vite build` | ✅ green | node-direct invocations |
+| Deterministic slop sweep of `app/src` | ✅ clean — 0 violations | workflow-run grep + reads (round 4 audit confirms on-screen) |
+| Live screenshot audit (4 rounds, fresh auditor each) | ✅ **ALL anti-slop checklist items pass** | `audits/phase-1.5-clean-design-audit.md` (rounds 1–3 preserved): Mode A + Mode B at macro/compact/rich on 700 nodes, dark + warm paper, 12 controls exercised, zero dead buttons |
+| FPS at 700 nodes | ✅ **115.6 fps avg, 0% dropped, p95 15.5ms** (gate: ≥55 / <2%) | `audits/fps-bench-latest.json` — production build via `vite preview`, headless Chrome CDP (`app/scripts/bench-fps.mjs`). Fixes on the way there: fragment-cached persist serializer (p95 99.9→50ms), idle-scheduled + cadence-limited localStorage flushes, orbit scaled to ≤150 nodes, **settle-based semantic zoom** (the big one — tier flips were remounting 700 components mid-gesture) |
+| Unit tests | ✅ 13/13 (`node --test`) | `app/tests/livePool.test.mjs` (incl. the partial-eviction regression) + `moodboard.test.mjs` |
+| Fresh-State first run | ✅ | one live New Tab node, zero seeds; `/seed-700` removed from user UI → `window.__devStressSeed` (dev/bench only); persist v2 migration resets old dev state |
+| Git tag `checkpoint/phase-1.5-clean-design` | ✅ | clean tree |
 
 ### What the founder validated along the way
 - **Empty first run is a requirement** (founder, 2026-11-13): the shipping browser starts clean — no seeded tabs. `/seed-700` is a dev/stress fixture, never a default; the real 700 tabs arrive via the Phase 5 importer, born hibernated. *This must be enforced in Phase 3's build (initial state = empty canvas/new-tab with a quiet invitation).*
@@ -122,7 +124,7 @@ The full Zen × Blanc × Obsidian Minimal redesign exists in the working tree (1
 | Phase | Tag | Status | What it delivers | Exit gate |
 |---|---|---|---|---|
 | 0 — repo + prototype checkpoint | `checkpoint/phase-1-prototype` | ✅ done | git monorepo, eol protection, frozen baseline | tag exists, clean tree |
-| 1.5 — anti-slop redesign | `checkpoint/phase-1.5-clean-design` | 🟡 built + verified, **tag pending fps** | matte-graphite redesign, silent grammar, Zen chrome, /seed-700 | **NEXT ACTION:** fps via puppeteer-core + Edge/Chrome headless CDP (≥55fps, <2% dropped at 700 nodes) → commit + tag. Also fold in: flip first-run to empty state before tagging |
+| 1.5 — anti-slop redesign + Fresh-State law | `checkpoint/phase-1.5-clean-design` | ✅ done, tagged `c2228cb` | matte-graphite redesign, silent grammar, Zen chrome, empty first run, livePool fix, real fps bench | 115.6fps / 0% dropped / p95 15.5ms @ 700 nodes — measured (`audits/fps-bench-latest.json`); 13/13 unit tests; visual audit clean |
 | 2 — Rust spatial core | `checkpoint/phase-2-rust-core` | ⬜ not started | `crates/spatial-core`: R-tree, force+grid solver, fuzzy search + ghost scorer; TS wrapper `src/lib/spatialCore.ts` wired into `app/` | `cargo test --release`; <2ms @ 1,000 nodes; 700-node pan ≥55–60fps |
 | 3 — real browser | `checkpoint/phase-3-real-browser` | ⬜ not started | fork `research/blanc-src` → `browser/` (keep clone pristine), rebrand (`brand:check`), strip telemetry/updater/sync/Mac-SHA1 preflight, mount redesigned shell on `blanc-chrome://` via `ipc-trust` gates, Two-Mode Warm Pool (6 live views / WebP-hidden canvas mode), **empty first run**, document-policy fix, real link-branching | real sites (Figma, Are.na, YouTube-audio, GitHub login) load + branch + hibernate with real Task-Manager RAM drop + survive restart; `node --test` pure-module & trust tests |
 | 4 — Chrome extensions | `checkpoint/phase-4-chrome-extensions` | ⬜ not started | `electron-chrome-extensions` v4.10+ + `session.extensions.loadExtension()`; toolbar popover; Settings → Extensions (Load Unpacked + Web Store CRX3 1-click); keep Ghostery/uBO/1Password working. Known constraint: MV3 service-worker backgrounds pending upstream Electron (#44411) — MV2 + best-effort MV3, capability badge for gaps | unpacked extension (MV2 or MV3 content-script) injects into a real page, popup opens, survives restart |

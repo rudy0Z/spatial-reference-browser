@@ -43,7 +43,6 @@ import {
   Moon,
   PanelTop,
   Plus,
-  Rocket,
   Search,
   StickyNote,
 } from 'lucide-react'
@@ -180,7 +179,6 @@ const COMMAND_ICONS: Record<SlashCommandId, LucideIcon> = {
   new: Plus,
   note: StickyNote,
   cluster: Boxes,
-  'seed-700': Rocket,
 }
 
 /** Quiet sentence-case result categories — no uppercase mono chips. */
@@ -300,7 +298,6 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
   const hibernateAll = useGraphStore((s) => s.hibernateAll)
   const createNewTab = useGraphStore((s) => s.createNewTab)
   const createClusterFromActive = useGraphStore((s) => s.createClusterFromActive)
-  const seed700 = useGraphStore((s) => s.seed700)
 
   const [query, setQuery] = useState('')
   const [selectedIndex, setSelectedIndex] = useState(0)
@@ -358,9 +355,6 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
         break
       case 'cluster':
         createClusterFromActive()
-        break
-      case 'seed-700':
-        seed700()
         break
     }
     setPaletteOpen(false)
@@ -473,7 +467,7 @@ function CommandPalette({ dragHandlers }: { dragHandlers: ShellDragHandlers }) {
         {items.length === 0 && (
           <div className="flex h-20 items-center justify-center px-4 text-center text-[12px] text-[color:var(--ink-muted)]">
             {slashFilter !== null
-              ? `No command matches “${trimmed}” — try /canvas or /seed-700`
+              ? `No command matches “${trimmed}” — try /canvas or /note`
               : `No matches for “${trimmed}” in tabs, notes or voice memos`}
           </div>
         )}

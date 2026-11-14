@@ -20,12 +20,13 @@
  * `computeMoodboardGrid` — positions only, so every graph edge survives).
  */
 import { create } from 'zustand'
-import { persist, createJSONStorage } from 'zustand/middleware'
-import type { StateStorage } from 'zustand/middleware'
+import { persist } from 'zustand/middleware'
+import type { PersistStorage, StorageValue } from 'zustand/middleware'
 import { cosineSimilarity, embedText, tokenize } from '../lib/embed'
+import { enforceLivePool, isNodeImmune } from '../lib/livePool'
 import { computeMoodboardGrid } from '../lib/moodboard'
 import {
-  buildFirstRunSeed,
+  buildCleanFirstRunState,
   buildStressSeed700,
   FIRST_RUN_SEED_VERSION,
   STRESS_SEED_VERSION,
@@ -68,9 +69,6 @@ import type {
 /* ------------------------------------------------------------------ */
 /* Tunable constants (exported so builders/tests pin the exact numbers) */
 /* ------------------------------------------------------------------ */
-
-/** §5.2 — strict active pool guardrail. */
-export const LIVE_POOL_LIMIT = 5
 
 /** §6 — ghost suggestions spawn above this relevance. */
 export const GHOST_ECHO_THRESHOLD = 0.78
@@ -288,11 +286,6 @@ export function scoreGhostEcho(
   return { cosine, coVisit, recency, relevance }
 }
 
-/** §5.3 / §7.7 — audible tabs, pinned anchors and the recording node never auto-hibernate. */
-export function isNodeImmune(node: SpatialTabNodeRecord, recordingNodeId: NodeUuid | null): boolean {
-  return node.isAudible || node.isPinned || node.uuid === recordingNodeId
-}
-
 function makeEvictionNotice(node: SpatialTabNodeRecord, now: number): EvictionNotice {
   return { uuid: node.uuid, title: node.title, at: now, reason: 'pool-limit' }
 }
@@ -300,35 +293,6 @@ function makeEvictionNotice(node: SpatialTabNodeRecord, now: number): EvictionNo
 function newUuid(): NodeUuid {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
   return `n-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-}
-
-/**
- * §5.2 — LRU eviction for the strict live pool. Skips the whole sweep while
- * a voice note records (§5.3) and never evicts the active node or an immune
- * tab. Returns the untouched node map when nothing needs evicting.
- */
-function enforceLivePool(
-  nodes: Record<NodeUuid, SpatialTabNodeRecord>,
-  recordingNodeId: NodeUuid | null,
-  activeUuid: NodeUuid | null,
-  _now: number,
-): { nodes: Record<NodeUuid, SpatialTabNodeRecord>; evicted: SpatialTabNodeRecord | null } {
-  const live = Object.values(nodes).filter((node) => node.ramState === 'live')
-  if (live.length <= LIVE_POOL_LIMIT || recordingNodeId) return { nodes, evicted: null }
-  const ordered = [...live].sort((a, b) => a.lastVisitedAt - b.lastVisitedAt)
-  let excess = live.length - LIVE_POOL_LIMIT
-  let evicted: SpatialTabNodeRecord | null = null
-  const next = { ...nodes }
-  for (const candidate of ordered) {
-    if (excess <= 0) break
-    if (candidate.uuid === activeUuid) continue
-    if (isNodeImmune(candidate, recordingNodeId)) continue
-    const hibernated: SpatialTabNodeRecord = { ...candidate, ramState: 'hibernated', ramMb: 0, isLoading: false }
-    next[candidate.uuid] = hibernated
-    if (!evicted) evicted = hibernated
-    excess -= 1
-  }
-  return excess <= 0 ? { nodes: next, evicted } : { nodes, evicted: null }
 }
 
 /** Undirected adjacency: uuid → { neighbours, maxEdgeWeight }. */
@@ -490,7 +454,7 @@ const initialState: GraphState = {
 }
 
 /* ------------------------------------------------------------------ */
-/* Persist storage — trailing-debounce writer                          */
+/* Persist storage — fragment-cached, cadence-limited writer           */
 /* ------------------------------------------------------------------ */
 
 /** The persist key — needed by the debounced writer's flush closure. */
@@ -500,17 +464,66 @@ const PERSIST_KEY = 'spatial-canvas-phase-1'
 const PERSIST_DEBOUNCE_MS = 250
 
 /**
- * localStorage-backed zustand storage that coalesces writes. The graph state
- * (hundreds of nodes with keywords, subPages and excerpts) serializes to
- * several hundred KB; the wheel-zoom path used to write the store on every
- * d3-zoom event, stringifying the whole world synchronously per event — a
- * guaranteed jank storm at 700 nodes. Writes now coalesce on a trailing
- * timer; `pagehide` flushes the pending payload so a normal tab close never
- * loses the last change.
+ * Minimum wall-clock spacing between actual localStorage writes. The graph
+ * serializes to several hundred KB and localStorage.setItem is synchronous —
+ * a write every 250ms during a pan/zoom storm stalls real frames (measured:
+ * p95 frame 50.1ms). Interaction-time writes are spaced to 1s; `pagehide`
+ * always flushes immediately so a normal tab close never loses the last
+ * change.
  */
-function createDebouncedLocalStorage(): StateStorage {
+const PERSIST_MIN_FLUSH_INTERVAL_MS = 1000
+
+/**
+ * Fragment-identity JSON cache. Graph slices are immutable, so a slice's
+ * JSON only changes when its object identity changes; high-frequency writes
+ * that touch nothing persisted (zoom, pan, UI flags) re-assemble the payload
+ * from cached fragments instead of re-stringifying the whole graph.
+ */
+const sliceJsonCache = new Map<string, { source: unknown; json: string }>()
+
+function cachedSliceJson(key: string, source: unknown): string {
+  const hit = sliceJsonCache.get(key)
+  if (hit && hit.source === source) return hit.json
+  const json = JSON.stringify(source)
+  sliceJsonCache.set(key, { source, json })
+  return json
+}
+
+/**
+ * Typed PersistStorage over localStorage with the trailing-debounce writer
+ * above plus the flush-cadence limit. Implemented directly (instead of
+ * `createJSONStorage`) so the fragment cache sits inside the serialization
+ * boundary — zustand hands us the partialized object and we assemble the
+ * payload from cached per-slice fragments.
+ */
+function createDebouncedPersistStorage(): PersistStorage<PersistedGraphState> {
   let timer: number | null = null
   let pendingPayload: string | null = null
+  let lastFlushAt = 0
+
+  const writeToLocalStorage = (payload: string) => {
+    try {
+      localStorage.setItem(PERSIST_KEY, payload)
+    } catch {
+      // Quota/serialization failure — the next successful write wins.
+    }
+    lastFlushAt = Date.now()
+  }
+
+  /**
+   * The localStorage write is synchronous and can cost tens of ms at graph
+   * scale — scheduling it through requestIdleCallback (2s timeout cap,
+   * setTimeout fallback) keeps it out of active animation frames. pagehide
+   * still flushes synchronously.
+   */
+  const scheduleWrite = (payload: string) => {
+    const write = () => writeToLocalStorage(payload)
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(write, { timeout: 2000 })
+    } else {
+      window.setTimeout(write, 0)
+    }
+  }
 
   const flush = () => {
     if (timer !== null) {
@@ -520,11 +533,17 @@ function createDebouncedLocalStorage(): StateStorage {
     const payload = pendingPayload
     pendingPayload = null
     if (payload === null) return
-    try {
-      localStorage.setItem(PERSIST_KEY, payload)
-    } catch {
-      // Quota/serialization failure — the next successful write wins.
+    const sinceLast = Date.now() - lastFlushAt
+    if (sinceLast < PERSIST_MIN_FLUSH_INTERVAL_MS) {
+      // Inside the cadence window: defer past it (trailing — the payload is
+      // always written, just not mid-gesture).
+      timer = window.setTimeout(() => {
+        timer = null
+        scheduleWrite(payload)
+      }, PERSIST_MIN_FLUSH_INTERVAL_MS - sinceLast)
+      return
     }
+    scheduleWrite(payload)
   }
 
   if (typeof window !== 'undefined') {
@@ -532,9 +551,34 @@ function createDebouncedLocalStorage(): StateStorage {
   }
 
   return {
-    getItem: (name) => localStorage.getItem(name),
+    getItem: (name) => {
+      const raw = localStorage.getItem(name)
+      if (raw === null) return null
+      try {
+        return JSON.parse(raw) as StorageValue<PersistedGraphState>
+      } catch {
+        return null
+      }
+    },
+
     setItem: (_name, value) => {
-      pendingPayload = value
+      const persisted = (value.state ?? {}) as PersistedGraphState
+      const version = value.version ?? 0
+      const fragments = [
+        `"version":${JSON.stringify(version)}`,
+        `"state":{`,
+        `"nodes":${cachedSliceJson('nodes', persisted.nodes)}`,
+        `"edges":${cachedSliceJson('edges', persisted.edges)}`,
+        `"regions":${cachedSliceJson('regions', persisted.regions)}`,
+        `"notes":${cachedSliceJson('notes', persisted.notes)}`,
+        `"voiceMemos":${cachedSliceJson('voiceMemos', persisted.voiceMemos)}`,
+        `"collapsedStacks":${cachedSliceJson('collapsedStacks', persisted.collapsedStacks)}`,
+        `"activeNodeUuid":${JSON.stringify(persisted.activeNodeUuid)}`,
+        `"seededVersion":${JSON.stringify(persisted.seededVersion)}`,
+        `"viewMode":${JSON.stringify(persisted.viewMode)}`,
+        `}`,
+      ]
+      pendingPayload = fragments.join('')
       if (timer !== null) return
       timer = window.setTimeout(() => {
         timer = null
@@ -570,7 +614,7 @@ export const useGraphStore = create<GraphStore>()(
         }, LOADING_PULSE_MS)
       }
 
-      const applySeed = (seed: ReturnType<typeof buildFirstRunSeed>, version: number, viewMode: ViewMode, zoom: number) => {
+      const applySeed = (seed: ReturnType<typeof buildCleanFirstRunState>, version: number, viewMode: ViewMode, zoom: number) => {
         set({
           nodes: indexById(seed.nodes),
           edges: indexById(seed.edges),
@@ -601,11 +645,11 @@ export const useGraphStore = create<GraphStore>()(
 
         ensureFirstRunSeed: () => {
           if (get().seededVersion !== null) return
-          applySeed(buildFirstRunSeed(Date.now()), FIRST_RUN_SEED_VERSION, 'reading', 1)
+          applySeed(buildCleanFirstRunState(Date.now()), FIRST_RUN_SEED_VERSION, 'reading', 1)
         },
 
         resetToFirstRun: () => {
-          applySeed(buildFirstRunSeed(Date.now()), FIRST_RUN_SEED_VERSION, 'reading', 1)
+          applySeed(buildCleanFirstRunState(Date.now()), FIRST_RUN_SEED_VERSION, 'reading', 1)
         },
 
         seed700: () => {
@@ -677,7 +721,7 @@ export const useGraphStore = create<GraphStore>()(
           }
 
           const ghosted = materializeGhosts(nextNodes[uuid], nextNodes, nextEdges, state.suppressedGhostHashes, now)
-          const pool = enforceLivePool(ghosted.nodes, state.recordingNodeId, uuid, now)
+          const pool = enforceLivePool(ghosted.nodes, state.recordingNodeId, uuid)
 
           set({
             nodes: pool.nodes,
@@ -772,7 +816,7 @@ export const useGraphStore = create<GraphStore>()(
             ...state.edges,
             [edgeId]: { id: edgeId, source: parentUuid, target: uuid, weight: 1, kind: 'spawn', createdAt: now },
           }
-          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid, now)
+          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid)
           scheduleLoadingPulse(uuid)
           set({
             nodes: pool.nodes,
@@ -822,7 +866,7 @@ export const useGraphStore = create<GraphStore>()(
             fy: null,
           }
           const nextNodes: Record<NodeUuid, SpatialTabNodeRecord> = { ...state.nodes, [uuid]: created }
-          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid, now)
+          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid)
           set({
             nodes: pool.nodes,
             activeNodeUuid: uuid,
@@ -841,7 +885,7 @@ export const useGraphStore = create<GraphStore>()(
             ...state.nodes,
             [uuid]: { ...node, ramState: 'live', ramMb: ramMbFor(uuid), lastVisitedAt: now },
           }
-          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid, now)
+          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid)
           set({
             nodes: pool.nodes,
             lastEviction: pool.evicted ? makeEvictionNotice(pool.evicted, now) : state.lastEviction,
@@ -1230,8 +1274,12 @@ export const useGraphStore = create<GraphStore>()(
     },
     {
       name: PERSIST_KEY,
-      version: 1,
-      storage: createJSONStorage(createDebouncedLocalStorage),
+      // v2 — Fresh-State Browser Law (master spec §0.2): pre-2 persisted
+      // graphs are pre-redesign dev artifacts (the 28-node designer demo).
+      // Reset the seed marker so ensureFirstRunSeed() applies the clean
+      // single-New-Tab first run on next boot.
+      version: 2,
+      storage: createDebouncedPersistStorage(),
       partialize: (state): PersistedGraphState => ({
         nodes: state.nodes,
         edges: state.edges,
@@ -1248,7 +1296,11 @@ export const useGraphStore = create<GraphStore>()(
         state.clearEphemeralFlags()
         state.setHasHydrated(true)
       },
-      migrate: (persisted) => persisted as PersistedGraphState,
+      migrate: () => {
+        // v1 → v2: wipe persisted graph data (dev-era demo state); a null
+        // seededVersion makes ensureFirstRunSeed() rebuild the clean state.
+        return { seededVersion: null } as unknown as PersistedGraphState
+      },
     },
   ),
 )

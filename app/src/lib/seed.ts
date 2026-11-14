@@ -52,7 +52,6 @@ import type {
 export const FIRST_RUN_SEED_VERSION = 1
 /** v3 — designer-world 700-node seed (Phase 1.5). Marker only; nothing branches on the value. */
 export const STRESS_SEED_VERSION = 3
-export const FIRST_RUN_TAB_COUNT = 28
 export const STRESS_NODE_COUNT = 700
 export const STRESS_REGION_COUNT = 7
 
@@ -136,7 +135,7 @@ type SeedNodeSpec = {
   url: string
   title: string
   keywords: string[]
-  regionId: RegionId
+  regionId?: RegionId | null
   dx: number
   dy: number
   ageDays: number
@@ -174,7 +173,7 @@ function materializeNode(spec: SeedNodeSpec, centerX: number, centerY: number, n
     url: spec.url,
     domain: domainOf(spec.url),
     title: spec.title,
-    regionId: spec.regionId,
+    regionId: spec.regionId ?? null,
     nodeType,
     ramState: isGhost || isHub ? 'hibernated' : ramState,
     ramMb: ramState === 'live' && !isGhost && !isHub ? ramMbFor(spec.uuid) : 0,
@@ -354,399 +353,36 @@ function designerUrlFor(domain: string, slug: string, uuid: NodeUuid): string {
 }
 
 /* ------------------------------------------------------------------ */
-/* §9 — First run: 28 curated designer tabs across 4 spatial islands   */
+/* §0.2 Fresh-State Browser Law — the shipping first run is ONE clean   */
+/* New Tab: zero edges, regions, notes or dummy data. The old 28-node   */
+/* designer demo was removed; /seed-700 survives as a dev/benchmark     */
+/* fixture exposed only through window.__devStressSeed.                 */
 /* ------------------------------------------------------------------ */
 
-export function buildFirstRunSeed(now: number): SeedGraph {
-  const regions: Region[] = [
-    { id: 'region-visual-references', name: 'Visual References', color: '#8E8E96', center: { x: -40, y: -840 }, radius: 480, createdAt: now },
-    { id: 'region-typography-foundries', name: 'Typography & Foundries', color: '#B5B0A5', center: { x: 1140, y: 0 }, radius: 480, createdAt: now },
-    { id: 'region-motion-shaders', name: 'Motion & Shaders', color: '#6E6A61', center: { x: 40, y: 860 }, radius: 480, createdAt: now },
-    { id: 'region-studios-projects', name: 'Studios & Projects', color: '#5A5A63', center: { x: -1160, y: 0 }, radius: 480, createdAt: now },
-  ]
+export const NEW_TAB_URL = 'https://new-tab.spatial/local'
+export const NEW_TAB_NODE_UUID: NodeUuid = 'new-tab'
 
-  const activeUuid: NodeUuid = 'seed-arena-type-rhythm'
-
-  const specs: SeedNodeSpec[] = [
-    /* --- Region A: Visual References (6 hibernated + 1 live anchor) -- */
+export function buildCleanFirstRunState(now: number): SeedGraph {
+  const node = materializeNode(
     {
-      uuid: 'seed-arena-type-rhythm',
-      url: 'https://www.are.na/studio-notebook/type-rhythm',
-      title: 'Are.na — Type & Rhythm (channel)',
-      keywords: ['arena', 'channel', 'type', 'rhythm', 'reference', 'moodboard'],
-      regionId: 'region-visual-references',
-      dx: -40, dy: -40, ageDays: 0, createdDaysAgo: 6,
-      ramState: 'live', isPinned: true,
-      previewKind: 'duotone',
-    },
-    {
-      uuid: 'seed-arena-brutalist-web',
-      url: 'https://www.are.na/marie-lou/brutalist-web-graphics',
-      title: 'Are.na — Brutalist Web Graphics (channel)',
-      keywords: ['arena', 'brutalist', 'web', 'graphics', 'channel'],
-      regionId: 'region-visual-references',
-      dx: -260, dy: -150, ageDays: 3, createdDaysAgo: 12,
-      parentUuid: activeUuid,
-      previewKind: 'duotone',
-    },
-    {
-      uuid: 'seed-dribbble-editorial-cards',
-      url: 'https://dribbble.com/shots/24891-editorial-type-cards',
-      title: 'Dribbble — Editorial Type Cards (private shot)',
-      keywords: ['dribbble', 'editorial', 'cards', 'glass', 'private'],
-      regionId: 'region-visual-references',
-      dx: 250, dy: -150, ageDays: 9, createdDaysAgo: 14,
-      noCapture: true,
-      previewKind: 'duotone',
-    },
-    {
-      uuid: 'seed-savee-grain-studies',
-      url: 'https://savee.it/s/generative-grain-studies',
-      title: 'Savee — Generative Grain Studies',
-      keywords: ['savee', 'grain', 'generative', 'texture', 'reference'],
-      regionId: 'region-visual-references',
-      dx: 270, dy: 40, ageDays: 2, createdDaysAgo: 5,
-      parentUuid: 'seed-arena-brutalist-web',
-      previewKind: 'duotone',
-    },
-    {
-      uuid: 'seed-siteinspire-editorial',
-      url: 'https://www.siteinspire.com/websites?categories=editorial',
-      title: 'SiteInspire — Editorial Layouts',
-      keywords: ['siteinspire', 'editorial', 'layouts', 'gallery', 'inspiration'],
-      regionId: 'region-visual-references',
-      dx: -250, dy: 70, ageDays: 23, createdDaysAgo: 34,
-      previewKind: 'duotone',
-    },
-    {
-      uuid: 'seed-cosmos-riso-textures',
-      url: 'https://cosmos.so/search?query=risograph+textures',
-      title: 'Cosmos — Risograph Textures (collection)',
-      keywords: ['cosmos', 'risograph', 'textures', 'print', 'collection'],
-      regionId: 'region-visual-references',
-      dx: -10, dy: 100, ageDays: 40, createdDaysAgo: 52,
-      excerpt:
-        '> Cached snapshot — cosmos.so risograph textures\n\n' +
-        'Three-grain riso passes: underprint at 12% dot gain, mid registration\n' +
-        'offset of 1.5pt, and a final ink-starved flood. Steal the layer order\n' +
-        'for the canvas texture study — never more than two hues per pass.\n\n' +
-        '*(Dead link — cached Readability text.)*',
-      previewKind: 'duotone',
-    },
-
-    /* --- Region B: Typography & Foundries (hub + 6, dup pair) -------- */
-    {
-      // §7.1 ephemeral google.com search-hub router (pinned anchor of region B).
-      uuid: 'seed-hub-google-foundries',
-      url: 'https://www.google.com/search?q=variable+font+foundry+specimens',
-      title: 'Google — variable font foundry specimens',
-      keywords: ['google', 'search', 'hub', 'router', 'foundry'],
-      regionId: 'region-typography-foundries',
-      dx: 0, dy: 0, ageDays: 6, createdDaysAgo: 8,
-      nodeType: 'hub', isPinned: true, ephemeral: true,
-      previewKind: 'wireframe',
-    },
-    {
-      uuid: 'seed-pp-neue-montreal',
-      url: 'https://pangrampangram.com/products/pp-neue-montreal',
-      title: 'PP Neue Montreal — Pangram Pangram',
-      keywords: ['pangram', 'neue', 'montreal', 'specimen', 'grotesque'],
-      regionId: 'region-typography-foundries',
-      dx: 220, dy: -160, ageDays: 5, createdDaysAgo: 9,
-      searchQuery: 'pp neue montreal specimen',
-      parentUuid: 'seed-hub-google-foundries',
-      previewKind: 'type-specimen',
-    },
-    {
-      uuid: 'seed-typewolf-trends',
-      url: 'https://www.typewolf.com/trends',
-      title: 'Typewolf — Trends in Web Typography',
-      keywords: ['typewolf', 'trends', 'pairings', 'web', 'type'],
-      regionId: 'region-typography-foundries',
-      dx: 250, dy: 20, ageDays: 6, createdDaysAgo: 10,
-      searchQuery: 'typewolf variable font trends',
-      parentUuid: 'seed-hub-google-foundries',
-      previewKind: 'type-specimen',
-    },
-    {
-      uuid: 'seed-gfonts-instrument-sans',
-      url: 'https://fonts.google.com/specimen/InstrumentSans',
-      title: 'Google Fonts — Instrument Sans',
-      keywords: ['google', 'fonts', 'instrument', 'sans', 'variable'],
-      regionId: 'region-typography-foundries',
-      dx: 240, dy: 180, ageDays: 3, createdDaysAgo: 7,
-      parentUuid: 'seed-typewolf-trends',
-      previewKind: 'type-specimen',
-    },
-    {
-      uuid: 'seed-klim-soehne',
-      url: 'https://klim.co.nz/retail-fonts/soehne',
-      title: 'Klim — Söhne specimen',
-      keywords: ['klim', 'soehne', 'specimen', 'foundry', 'grotesque'],
-      regionId: 'region-typography-foundries',
-      dx: -230, dy: -140, ageDays: 18, createdDaysAgo: 26,
-      parentUuid: 'seed-typewolf-trends',
-      previewKind: 'type-specimen',
-    },
-    {
-      // §7.6 duplicate: canonicalizeUrl strips `ref`, so both nodes share one
-      // url_hash — sticky notes attached below show on BOTH instances.
-      uuid: 'seed-klim-soehne-mirror',
-      url: 'https://klim.co.nz/retail-fonts/soehne?ref=typewolf',
-      title: 'Klim — Söhne (reader mirror)',
-      keywords: ['klim', 'soehne', 'mirror', 'reader', 'offline'],
-      regionId: 'region-typography-foundries',
-      dx: -250, dy: 30, ageDays: 3, createdDaysAgo: 5,
-      parentUuid: 'seed-klim-soehne',
-      previewKind: 'type-specimen',
-    },
-    {
-      uuid: 'seed-fontsinuse-grotesque',
-      url: 'https://fontsinuse.com/uses/32011/editorial-grotesque-pairing',
-      title: 'Fonts In Use — Editorial grotesque pairing',
-      keywords: ['fontsinuse', 'editorial', 'pairing', 'grotesque', 'case'],
-      regionId: 'region-typography-foundries',
-      dx: 15, dy: 205, ageDays: 12, createdDaysAgo: 18,
-      previewKind: 'type-specimen',
-    },
-
-    /* --- Region C: Motion & Shaders (5 hibernated + 1 live audible) -- */
-    {
-      uuid: 'seed-shadertoy-ink-fluid',
-      url: 'https://www.shadertoy.com/view/XtBGD3',
-      title: 'Shadertoy — Fluid Ink Simulation (audio-reactive)',
-      keywords: ['shadertoy', 'fluid', 'ink', 'shader', 'audio'],
-      regionId: 'region-motion-shaders',
-      dx: 0, dy: -20, ageDays: 0, createdDaysAgo: 2,
-      ramState: 'live', isAudible: true, isPinned: true,
-      previewKind: 'swatch-board',
-    },
-    {
-      uuid: 'seed-compute-toys-water',
-      url: 'https://compute.toys/view/42-water-sim',
-      title: 'Compute.Toys — Water Simulation',
-      keywords: ['compute', 'water', 'simulation', 'wgsl', 'particles'],
-      regionId: 'region-motion-shaders',
-      dx: 240, dy: -150, ageDays: 8, createdDaysAgo: 13,
-      previewKind: 'swatch-board',
-    },
-    {
-      uuid: 'seed-three-tsl-nodes',
-      url: 'https://threejs.org/manual/en/tsl.html',
-      title: 'Three.js — TSL node materials',
-      keywords: ['threejs', 'tsl', 'nodes', 'materials', 'webgl'],
-      regionId: 'region-motion-shaders',
-      dx: -220, dy: -110, ageDays: 4, createdDaysAgo: 7,
-      parentUuid: 'seed-compute-toys-water',
-      previewKind: 'swatch-board',
-    },
-    {
-      uuid: 'seed-heckel-study-of-shaders',
-      url: 'https://maximeheckel.com/posts/the-study-of-shaders-with-react-three-fiber',
-      title: 'Maxime Heckel — The Study of Shaders',
-      keywords: ['shaders', 'r3f', 'noise', 'webgl', 'study'],
-      regionId: 'region-motion-shaders',
-      dx: 210, dy: 130, ageDays: 25, createdDaysAgo: 38,
-      parentUuid: 'seed-shadertoy-ink-fluid',
-      previewKind: 'swatch-board',
-    },
-    {
-      uuid: 'seed-book-of-shaders-noise',
-      url: 'https://thebookofshaders.com/07/',
-      title: 'The Book of Shaders — Chapter 7 (Noise)',
-      keywords: ['glsl', 'noise', 'fbm', 'shaders', 'book'],
-      regionId: 'region-motion-shaders',
-      dx: -210, dy: 150, ageDays: 40, createdDaysAgo: 55,
-      excerpt:
-        '> Cached snapshot — thebookofshaders.com/07\n\n' +
-        'Noise is the shadow of randomness. Gradient noise (Perlin/Simplex)\n' +
-        'beats value noise for ink flow; stack fbm at 4 octaves and warp the\n' +
-        'domain once for turbulence, twice for curl.\n\n' +
-        '*(Dead link — cached Readability text.)*',
-      previewKind: 'swatch-board',
-    },
-    {
-      uuid: 'seed-webglfund-image-processing',
-      url: 'https://webglfundamentals.org/webgl/lessons/en/webgl-image-processing.html',
-      title: 'WebGL Fundamentals — Image Processing',
-      keywords: ['webgl', 'kernels', 'convolution', 'texture', 'fundamentals'],
-      regionId: 'region-motion-shaders',
-      dx: 20, dy: 190, ageDays: 11, createdDaysAgo: 16,
-      previewKind: 'swatch-board',
-    },
-
-    /* --- Region D: Studios & Projects (1 live + 6 hibernated) -------- */
-    {
-      uuid: 'seed-figma-ds-v3',
-      url: 'https://www.figma.com/design/qR8xK2mV3p/design-system-v3',
-      title: 'Figma — Design System v3 · Foundations (SPA trail)',
-      keywords: ['figma', 'design-system', 'foundations', 'tokens', 'components'],
-      regionId: 'region-studios-projects',
-      dx: 0, dy: -30, ageDays: 0, createdDaysAgo: 3,
+      uuid: NEW_TAB_NODE_UUID,
+      url: NEW_TAB_URL,
+      title: 'New Tab',
+      keywords: [],
+      regionId: null,
+      dx: 0,
+      dy: 0,
+      ageDays: 0,
+      createdDaysAgo: 0,
       ramState: 'live',
-      // §7.3 SPA node — in-page pushState trail shown as an expandable filmstrip.
-      subPages: [
-        { title: 'Design System v3 · Cover', url: 'https://www.figma.com/design/qR8xK2mV3p/design-system-v3?node-id=0-1' },
-        { title: 'Design System v3 · Foundations', url: 'https://www.figma.com/design/qR8xK2mV3p/design-system-v3?node-id=12-402' },
-        { title: 'Design System v3 · Components', url: 'https://www.figma.com/design/qR8xK2mV3p/design-system-v3?node-id=31-1180' },
-      ],
-      previewKind: 'wireframe',
-    },
-    {
-      uuid: 'seed-figma-radix-kit',
-      url: 'https://www.figma.com/community/file/1189023415/radix-ui-kit',
-      title: 'Figma Community — Radix UI kit',
-      keywords: ['figma', 'community', 'radix', 'kit', 'components'],
-      regionId: 'region-studios-projects',
-      dx: 235, dy: -140, ageDays: 7, createdDaysAgo: 11,
-      parentUuid: 'seed-figma-ds-v3',
-      previewKind: 'wireframe',
-    },
-    {
-      uuid: 'seed-behance-dumbar-motion',
-      url: 'https://www.behance.net/gallery/184902311/studio-dumbar-motion-identity',
-      title: 'Behance — Studio Dumbar motion identity',
-      keywords: ['behance', 'dumbar', 'motion', 'identity', 'studio'],
-      regionId: 'region-studios-projects',
-      dx: 250, dy: 100, ageDays: 13, createdDaysAgo: 20,
+      isPinned: true,
       previewKind: 'logo-mark',
     },
-    {
-      uuid: 'seed-pentagram-editorial',
-      url: 'https://www.pentagram.com/work/editorial-systems',
-      title: 'Pentagram — Editorial systems',
-      keywords: ['pentagram', 'editorial', 'identity', 'systems', 'studio'],
-      regionId: 'region-studios-projects',
-      dx: -235, dy: -130, ageDays: 28, createdDaysAgo: 44,
-      excerpt:
-        '> Cached snapshot — pentagram.com editorial systems\n\n' +
-        'The grid is the identity: a fixed baseline, three column widths and\n' +
-        'one accent weight carry every page. Logotype never scales past 40%\n' +
-        'of the measure.\n\n*(Dead link — cached Readability text.)*',
-      previewKind: 'logo-mark',
-    },
-    {
-      uuid: 'seed-koto-rebrand-cases',
-      url: 'https://koto.studio/work/global-rebrands',
-      title: 'Koto — Global rebrand case studies',
-      keywords: ['koto', 'rebrand', 'case', 'studio', 'brand'],
-      regionId: 'region-studios-projects',
-      dx: -250, dy: 130, ageDays: 19, createdDaysAgo: 31,
-      previewKind: 'logo-mark',
-    },
-    {
-      // §7.2 — the "Activate on Adobe Fonts" chain (OAuth + sign-in redirect)
-      // collapsed into ONE "via auth" node, reached from the Klim specimen.
-      uuid: 'seed-adobe-fonts-via-auth',
-      url: 'https://fonts.adobe.com/fonts/soehne',
-      title: 'Adobe Fonts — Söhne web activation (via auth)',
-      keywords: ['adobe', 'fonts', 'activation', 'web', 'via-auth'],
-      regionId: 'region-studios-projects',
-      dx: 15, dy: 165, ageDays: 2, createdDaysAgo: 4,
-      viaAuth: true,
-      parentUuid: 'seed-klim-soehne',
-      previewKind: 'type-specimen',
-    },
-    {
-      uuid: 'seed-mdn-backdrop-filter',
-      url: 'https://developer.mozilla.org/en-US/docs/Web/CSS/backdrop-filter',
-      title: 'MDN — backdrop-filter',
-      keywords: ['mdn', 'backdrop-filter', 'css', 'glass', 'blur'],
-      regionId: 'region-studios-projects',
-      dx: -15, dy: 210, ageDays: 21, createdDaysAgo: 33,
-      excerpt:
-        '> Cached snapshot — developer.mozilla.org backdrop-filter\n\n' +
-        '`backdrop-filter: blur(14px) saturate(1.4)` reads best over moving\n' +
-        'content; pair it with a 1px translucent border and keep an opaque\n' +
-        'fallback (`@supports not (backdrop-filter: blur(1px))`).\n\n' +
-        '*(Dead link — cached Readability text.)*',
-      previewKind: 'wireframe',
-    },
-
-    /* --- Ghost Echoes tethered beside the active node (§4.3, §6) ----- */
-    {
-      uuid: 'seed-ghost-swiss-archive',
-      url: 'https://www.are.na/pixel-plateau/swiss-typography-archive',
-      title: 'Are.na — Swiss Typography Archive',
-      keywords: ['arena', 'swiss', 'typography', 'archive', 'ghost'],
-      regionId: 'region-visual-references',
-      dx: 150, dy: 105, ageDays: 1, createdDaysAgo: 1,
-      nodeType: 'ghost-echo',
-      ghostOfUuid: null,
-      ghostTetherUuid: activeUuid,
-      ghostMatch: 0.9,
-      previewKind: 'duotone',
-    },
-    {
-      uuid: 'seed-ghost-typewolf-sotm',
-      url: 'https://www.typewolf.com/site-of-the-month',
-      title: 'Typewolf — Site of the Month',
-      keywords: ['typewolf', 'site-of-the-month', 'type', 'ghost'],
-      regionId: 'region-visual-references',
-      dx: 45, dy: 175, ageDays: 2, createdDaysAgo: 2,
-      nodeType: 'ghost-echo',
-      ghostOfUuid: null,
-      ghostTetherUuid: activeUuid,
-      ghostMatch: 0.83,
-      previewKind: 'type-specimen',
-    },
-  ]
-
-  const nodes = specs.map((spec) => {
-    const region = regions.find((r) => r.id === spec.regionId)
-    if (!region) throw new Error(`seed.ts: unknown region ${spec.regionId} for node ${spec.uuid}`)
-    return materializeNode(spec, region.center.x, region.center.y, now)
-  })
-
-  if (nodes.length !== FIRST_RUN_TAB_COUNT) {
-    throw new Error(`seed.ts: expected ${FIRST_RUN_TAB_COUNT} first-run nodes, built ${nodes.length}`)
-  }
-
-  const edges: GraphEdgeRecord[] = [
-    // Visual References — browsing path through the boards
-    edge(activeUuid, 'seed-arena-brutalist-web', 2, 'visit', now),
-    edge(activeUuid, 'seed-dribbble-editorial-cards', 1, 'visit', now),
-    edge('seed-arena-brutalist-web', 'seed-savee-grain-studies', 1, 'spawn', now),
-    edge('seed-savee-grain-studies', 'seed-cosmos-riso-textures', 1, 'visit', now),
-    edge('seed-dribbble-editorial-cards', 'seed-siteinspire-editorial', 1, 'visit', now),
-    // Typography & Foundries — hub spokes + specimen walk
-    edge('seed-hub-google-foundries', 'seed-pp-neue-montreal', 1, 'visit', now),
-    edge('seed-hub-google-foundries', 'seed-typewolf-trends', 1, 'visit', now),
-    edge('seed-typewolf-trends', 'seed-gfonts-instrument-sans', 1, 'visit', now),
-    edge('seed-typewolf-trends', 'seed-klim-soehne', 2, 'visit', now),
-    edge('seed-klim-soehne', 'seed-klim-soehne-mirror', 1, 'visit', now),
-    edge('seed-klim-soehne-mirror', 'seed-fontsinuse-grotesque', 1, 'visit', now),
-    // Motion & Shaders — from the audio-reactive toy down the reading path
-    edge('seed-shadertoy-ink-fluid', 'seed-compute-toys-water', 2, 'visit', now),
-    edge('seed-compute-toys-water', 'seed-three-tsl-nodes', 1, 'spawn', now),
-    edge('seed-shadertoy-ink-fluid', 'seed-heckel-study-of-shaders', 1, 'visit', now),
-    edge('seed-heckel-study-of-shaders', 'seed-book-of-shaders-noise', 1, 'visit', now),
-    edge('seed-three-tsl-nodes', 'seed-webglfund-image-processing', 1, 'visit', now),
-    // Studios & Projects — active Figma work + studio research
-    edge('seed-figma-ds-v3', 'seed-figma-radix-kit', 1, 'visit', now),
-    edge('seed-pentagram-editorial', 'seed-behance-dumbar-motion', 1, 'visit', now),
-    edge('seed-behance-dumbar-motion', 'seed-koto-rebrand-cases', 1, 'visit', now),
-    edge('seed-klim-soehne', 'seed-adobe-fonts-via-auth', 1, 'visit', now),
-    // Cross-island paths — type channel → specimen; glass cards → MDN doc
-    edge(activeUuid, 'seed-gfonts-instrument-sans', 1, 'visit', now),
-    edge('seed-dribbble-editorial-cards', 'seed-mdn-backdrop-filter', 1, 'visit', now),
-    // Ghost tethers (§4.3, §6)
-    edge(activeUuid, 'seed-ghost-swiss-archive', 0, 'ghost', now),
-    edge(activeUuid, 'seed-ghost-typewolf-sotm', 0, 'ghost', now),
-  ]
-
-  // Notes attach to url_hash (§7.6) — the Klim pair note shows on BOTH duplicates.
-  const dupHash = urlHashOf('https://klim.co.nz/retail-fonts/soehne')
-  const notes: StickyNote[] = [
-    note('seed-note-1', dupHash, 'Söhne is the voice of the whole canvas chrome — track weights 400/500 only; license already covers web + app.', 4, now),
-    note('seed-note-2', urlHashOf('https://www.are.na/studio-notebook/type-rhythm'), 'Refresh this channel before Thursday\'s moodboard review — pull the two kinetic type entries.', 1, now),
-    note('seed-note-3', urlHashOf('https://pangrampangram.com/products/pp-neue-montreal'), 'PP Neue Montreal for marketing pages; Söhne stays product. Check the trial-license expiry.', 3, now),
-    note('seed-note-4', urlHashOf('https://www.shadertoy.com/view/XtBGD3'), 'Audio-reactive ink shader — steal the fbm domain-warp for the canvas background study.', 2, now),
-    note('seed-note-5', urlHashOf('https://www.figma.com/design/qR8xK2mV3p/design-system-v3'), 'v3 foundations: token names match index.css (border-subtle/hover/active). Filmstrip trail shows the page order.', 2, now),
-    note('seed-note-6', urlHashOf('https://developer.mozilla.org/en-US/docs/Web/CSS/backdrop-filter'), 'Glass pills: backdrop-blur + saturate(1.4) reads best over moving content.', 5, now),
-  ]
-
-  return { regions, nodes, edges, notes, memos: [], activeNodeUuid: activeUuid }
+    0,
+    0,
+    now,
+  )
+  return { regions: [], nodes: [node], edges: [], notes: [], memos: [], activeNodeUuid: NEW_TAB_NODE_UUID }
 }
 
 /* ------------------------------------------------------------------ */

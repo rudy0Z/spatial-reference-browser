@@ -119,6 +119,13 @@ const ECHO_TOLERANCE_PX = 6
 /** Max nodes whose position is pushed into React Flow per animation frame. */
 const MAX_POSITION_UPDATES_PER_TICK = 40
 
+/**
+ * Ambient orbit (§6 satellite wobble) runs only up to this node count — at
+ * larger scales the per-frame write-back dominates the frame budget (Phase
+ * 1.5 fps bench) and the canvas holds still instead.
+ */
+const ORBIT_MAX_NODES = 150
+
 /** SPEC §2 motion language — snappy springs, never linear. */
 const SPRING_TRANSITION: Transition = { type: 'spring', stiffness: 380, damping: 30 }
 
@@ -425,20 +432,45 @@ function WorkbenchTetherLayer({ containerRef, chipElsRef, workbench, regions }: 
   const [, setRenderTick] = useState(0)
   const bump = useCallback(() => setRenderTick((tick) => tick + 1), [])
 
+  // Chip/container rects are DOM reads — reading them on every render forced
+  // a synchronous layout per viewport change (measured 13% of the frame
+  // budget in the Phase 1.5 CPU profile). Chip screen positions only change
+  // when the dock moves or its membership changes, so they are cached here
+  // and refreshed on rAF catch-up + resize + workbench change.
+  const rectsRef = useRef<{ container: DOMRect | null; chips: Map<NodeUuid, DOMRect> }>({
+    container: null,
+    chips: new Map(),
+  })
+  const workbenchKey = workbench.map((node) => node.uuid).join('|')
+  const refreshRects = useCallback(() => {
+    const container = containerRef.current
+    if (!container) return
+    rectsRef.current.container = container.getBoundingClientRect()
+    const chips = new Map<NodeUuid, DOMRect>()
+    for (const node of workbench) {
+      const chip = chipElsRef.current.get(node.uuid)
+      const rect = chip?.getBoundingClientRect()
+      if (rect && rect.width > 0) chips.set(node.uuid, rect)
+    }
+    rectsRef.current.chips = chips
+  }, [containerRef, chipElsRef, workbenchKey])
+
   useEffect(() => {
     // First paint catch-up (chip rects exist only after the dock mounts) —
     // deferred to rAF so it isn't a synchronous cascading setState.
-    const frame = requestAnimationFrame(bump)
-    window.addEventListener('resize', bump)
+    const frame = requestAnimationFrame(() => {
+      refreshRects()
+      bump()
+    })
+    window.addEventListener('resize', refreshRects)
     return () => {
       cancelAnimationFrame(frame)
-      window.removeEventListener('resize', bump)
+      window.removeEventListener('resize', refreshRects)
     }
-  }, [bump])
+  }, [bump, refreshRects])
 
-  const container = containerRef.current
-  if (!container) return null
-  const containerRect = container.getBoundingClientRect()
+  const containerRect = rectsRef.current.container
+  if (!containerRect) return null
   // Tethers matter most far out; they fade as you zoom in.
   const tetherOpacity = Math.max(0.07, Math.min(0.22, 0.1 * viewport.zoom + 0.09))
 
@@ -446,9 +478,8 @@ function WorkbenchTetherLayer({ containerRef, chipElsRef, workbench, regions }: 
   for (const node of workbench) {
     const region = node.regionId ? regions.find((candidate) => candidate.id === node.regionId) : undefined
     if (!region) continue
-    const chip = chipElsRef.current.get(node.uuid)
-    const chipRect = chip?.getBoundingClientRect()
-    if (!chipRect || chipRect.width === 0) continue
+    const chipRect = rectsRef.current.chips.get(node.uuid)
+    if (!chipRect) continue
     const regionScreen = flowToScreenPosition(region.center)
     const x1 = chipRect.left + chipRect.width / 2 - containerRect.left
     const y1 = chipRect.top - containerRect.top + 1
@@ -752,15 +783,33 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
   const persistedPosRef = useRef<Map<NodeUuid, { x: number; y: number }>>(new Map())
   const prevViewModeRef = useRef<ViewMode | null>(null)
 
-  const lod = lodForZoom(zoom, semanticZoomOverride)
+  /* §4 semantic zoom — the tier is re-evaluated on GESTURE SETTLE, never
+     mid-gesture: a wheel storm sweeping across a tier boundary used to
+     remount the entire node tree twice per second (measured: ~40% native
+     layout/paint in the Phase 1.5 CPU profile). The viewport transform still
+     rescales content continuously while zooming; only the representation
+     swap waits for the gesture to end. */
+  const [lod, setLod] = useState<SemanticZoomLevel>(() =>
+    lodForZoom(useGraphStore.getState().zoom, semanticZoomOverride),
+  )
   const lodValue = useMemo<CanvasLodValue>(() => ({ lod }), [lod])
+
+  // Lock toggles and programmatic zooms are discrete actions — re-evaluate
+  // the tier immediately (no gesture to settle).
+  useEffect(() => {
+    setLod(lodForZoom(useGraphStore.getState().zoom, semanticZoomOverride))
+  }, [semanticZoomOverride])
 
   /* Macro-tier beacon counter-scale (audit round 2, §1.7): inside the
      0.15–0.35 macro band the 24 px beacons otherwise shrink to sub-pixel
      specks. Inverse-scaling holds a ~constant ~10 px on-screen footprint.
      Applied as a CSS custom property on the canvas root, so all beacons
      rescale through pure CSS inheritance — zero per-node re-renders. */
-  const beaconScale = lod === 'macro' ? Math.min(3, Math.max(1, 0.5 / zoom)) : 1
+  // Quantized to 0.1 steps: a continuous scale would re-render the canvas
+  // root (and repaint every beacon) on each zoom percent crossing — during a
+  // wheel storm that is pure churn for a sub-pixel visual difference.
+  const beaconScale =
+    lod === 'macro' ? Math.round(Math.min(3, Math.max(1, 0.5 / zoom)) * 10) / 10 : 1
 
   /* Store → view-model (contract selectors; getState() is render-time consistent
      because the subscribed slices are the exact inputs these selectors read). */
@@ -926,7 +975,11 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
 
   useHybridForceLayout(layoutNodes, layoutLinks, {
     frozen: physicsFrozen,
-    orbit: true,
+    // Ambient orbit is a small-graph affordance: past this node count the
+    // per-frame wobble write-back costs more than it reads (measured in the
+    // Phase 1.5 fps bench — see audits/), and NN/g stability guidance says
+    // large canvases should hold still. The d3 relaxation still runs.
+    orbit: layoutNodes.length <= ORBIT_MAX_NODES,
     onTick: handleTick,
     onSettle: handleSettle,
   })
@@ -1099,8 +1152,12 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
   /* Gesture end commits the final camera zoom synchronously — no rAF
      dependency, so the HUD percentage and the §4 LOD tier converge with the
      live camera even on hosts that suspend frame scheduling between events
-     (audit round 2, §3.5). */
-  const handleMoveEnd = useCallback<OnMoveEnd>(() => flushPendingZoom(), [flushPendingZoom])
+     (audit round 2, §3.5) — and the semantic-zoom tier re-evaluates HERE,
+     on settle, never mid-gesture (§4 design law). */
+  const handleMoveEnd = useCallback<OnMoveEnd>(() => {
+    flushPendingZoom()
+    setLod(lodForZoom(useGraphStore.getState().zoom, semanticZoomOverride))
+  }, [flushPendingZoom, semanticZoomOverride])
 
   // Cancel a pending coalesced write when the canvas unmounts.
   useEffect(

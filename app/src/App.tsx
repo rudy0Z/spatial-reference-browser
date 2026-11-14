@@ -56,10 +56,22 @@ import ToastStack from './components/chrome/ToastStack'
 import ZenRail, { ZEN_RAIL_WIDTH } from './components/chrome/ZenRail'
 import SpatialCanvas from './components/canvas/SpatialCanvas'
 import MockWebReader from './components/viewport/MockWebReader'
-import { LIVE_POOL_LIMIT, useGraphStore } from './store/useGraphStore'
+import { LIVE_POOL_LIMIT } from './lib/livePool'
+import { useGraphStore } from './store/useGraphStore'
 import type { GraphStore } from './store/useGraphStore'
 import { useToastStore } from './store/useToastStore'
 import type { MockLinkTarget, NodeUuid, SubPageRef } from './lib/types'
+
+/**
+ * Fresh-State Browser Law (master spec §0.2) — the 700-node stress fixture
+ * is a dev/benchmark harness hook, never a user-facing palette command.
+ * `scripts/bench-fps.mjs` drives exactly this global.
+ */
+declare global {
+  interface Window {
+    __devStressSeed?: () => void
+  }
+}
 
 /** §2 motion language — spring physics everywhere, never linear. */
 const CROSSFADE_SPRING = { type: 'spring', stiffness: 380, damping: 30 } as const
@@ -188,6 +200,17 @@ function App() {
     if (!hasHydrated) return
     ensureFirstRunSeed()
   }, [hasHydrated, ensureFirstRunSeed])
+
+  /* --- dev/benchmark-only stress fixture (never in the user palette) --- */
+  useEffect(() => {
+    window.__devStressSeed = () => {
+      useGraphStore.getState().seed700()
+      return Object.keys(useGraphStore.getState().nodes).length
+    }
+    return () => {
+      delete window.__devStressSeed
+    }
+  }, [])
 
   /* --- event bridge (declared after the seed effect: baselines prime post-seed) --- */
   useGraphEventBridge(hasHydrated)
