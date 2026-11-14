@@ -1,0 +1,303 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import process from 'node:process';
+import { launchPackagedOverCdp } from './support/packaged-cdp.mjs';
+
+const stableExecutable = process.env.BLANC_STABLE_EXECUTABLE;
+const candidateExecutable =
+  process.env.BLANC_CANDIDATE_EXECUTABLE ||
+  path.resolve('dist/mac-arm64/Blanc.app/Contents/MacOS/Blanc');
+const stableExpectsQuiet = process.env.BLANC_STABLE_EXPECTS_QUIET === '1';
+
+for (const [label, executable] of [
+  ['BLANC_STABLE_EXECUTABLE', stableExecutable],
+  ['BLANC_CANDIDATE_EXECUTABLE', candidateExecutable],
+]) {
+  if (!executable || !fs.existsSync(executable)) {
+    throw new Error(`${label} does not point to a packaged Blanc executable`);
+  }
+}
+
+const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-stable-migration-'));
+const ecsMigration = process.env.BLANC_ECS_MIGRATION === '1';
+if (ecsMigration) fs.writeFileSync(path.join(userDataDir, 'ecs-candidate-profile.json'), JSON.stringify({ candidate: true }), { flag: 'wx', mode: 0o600 });
+const favoriteUrl = 'https://example.com/favorite';
+const sessionUrls = ['https://example.com/', 'https://www.wikipedia.org/'];
+const workspaceId = 'migration_workspace';
+const workspaceName = 'Migration workspace';
+let app;
+
+const writeJson = (name, value) => fs.writeFileSync(
+  path.join(userDataDir, name),
+  JSON.stringify(value, null, 2)
+);
+
+// Older public Blanc builds predate the privileged blanc-chrome:// scheme and
+// render packaged chrome from file://…/src/renderer/index.html. The migration
+// gate starts with a real public build, then hands the same profile to the
+// candidate, so it recognizes both trusted chrome locations.
+const isChromePage = (page) => {
+  const url = page.url();
+  if (url === 'blanc-chrome://index/') return true;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'file:' && parsed.pathname.endsWith('/src/renderer/index.html');
+  } catch {
+    return false;
+  }
+};
+
+const launch = async (executablePath) => {
+  app = await launchPackagedOverCdp({
+    executablePath,
+    args: [`--user-data-dir=${userDataDir}`],
+    env: { ...process.env, BLANC_TEST: '0',
+      ...(ecsMigration ? { BLANC_ECS_FULL_PROFILE: userDataDir, BLANC_UPDATE_CHANNEL: 'ecs-migration-disabled' } : {}) },
+  });
+};
+
+const waitForRestoredUrls = async () => {
+  const deadline = Date.now() + 15_000;
+  let urls = [];
+  while (Date.now() < deadline) {
+    urls = app.pages().map((candidate) => candidate.url());
+    if (sessionUrls.every((expected) => urls.includes(expected))) return urls;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.fail(`session URLs were not restored; saw ${JSON.stringify(urls)}`);
+};
+
+// Group names keep the case typed since #877, and a candidate capitalizes an
+// all-lowercase saved name once. The group is therefore found ignoring case,
+// and a candidate must show the fixture's "research" as "Research". The public
+// baseline's spelling depends on its version, so it is not pinned.
+const savedGroupName = 'research';
+const recasedGroupName = 'Research';
+
+const waitForQuietRestore = async ({ label, expectQuiet, wakeQuiet, groupName }) => {
+  const deadline = Date.now() + 15_000;
+  let state = null;
+  while (Date.now() < deadline) {
+    const chrome = app.pages().find(isChromePage);
+    if (chrome) {
+      state = await chrome.evaluate(() => window.browserAPI.getAllTabs());
+      if (sessionUrls.every((expected) =>
+        state.tabs.some((tab) => tab.url === expected))) {
+        const group = state.groups.find((entry) => entry.name.toLowerCase() === savedGroupName);
+        assert.ok(group, `${label} should preserve the saved tab group`);
+        if (groupName) assert.equal(group.name, groupName, `${label} should show the saved group as “${groupName}”`);
+        assert.ok(
+          sessionUrls.every((url) => state.tabs.find((tab) => tab.url === url)?.groupId === group.id),
+          `${label} should preserve tab membership in the saved group`,
+        );
+        assert.equal(
+          state.tabs.find((tab) => tab.url === sessionUrls[0])?.pinned,
+          true,
+          `${label} should preserve the pinned tab`,
+        );
+        const quiet = state.tabs.find((tab) => tab.url === sessionUrls[0]);
+        if (expectQuiet) {
+          assert.equal(quiet.asleep, true, `${label} inactive restored tab should begin quiet`);
+        }
+        if (wakeQuiet) {
+          await chrome.evaluate((id) => window.browserAPI.switchTab(id), quiet.id);
+          await waitForRestoredUrls();
+        }
+        return state;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.fail(`${label} tab model did not restore session URLs; saw ${JSON.stringify(state)}`);
+};
+
+try {
+  const now = Date.now();
+  writeJson('settings.json', {
+    searchEngine: 'brave',
+    searchSuggestions: false,
+    adblockEnabled: false,
+    homePage: '',
+    theme: 'dark',
+    appIcon: 'paper',
+    adblockExceptions: ['example.com'],
+    usagePing: false,
+  });
+  writeJson('session.json', {
+    version: 2,
+    activeWindowId: 'primary',
+    windows: [{
+      id: 'primary',
+      profileId: 'default',
+      workspaceId,
+      urls: sessionUrls,
+      activeIndex: 1,
+      groups: [{ id: 'migration-group', name: 'research', collapsed: false }],
+      groupIds: ['migration-group', 'migration-group'],
+      pinned: [true, false],
+      meta: sessionUrls.map((url) => ({ title: url, favicon: null })),
+    }],
+    // The flat rollback mirror remains present so an older public baseline can
+    // open and rewrite the profile without understanding v2-only fields.
+    urls: sessionUrls,
+    activeIndex: 1,
+    groups: [{ id: 'migration-group', name: 'research', collapsed: false }],
+    groupIds: ['migration-group', 'migration-group'],
+    pinned: [true, false],
+  });
+  writeJson('bookmarks.json', {
+    items: [{
+      id: 'migration-favorite',
+      url: favoriteUrl,
+      title: 'Migration favorite',
+      favicon: null,
+      addedAt: now,
+      updatedAt: now,
+      folder: 'press',
+    }],
+    tombstones: [],
+  });
+  writeJson('history.json', {
+    entries: [{
+      url: 'https://example.com/history',
+      title: 'Migration history',
+      visitedAt: now,
+    }],
+  });
+  writeJson('workspaces.json', {
+    version: 1,
+    workspaces: [{
+      id: workspaceId,
+      name: workspaceName,
+      profileId: 'default',
+      createdAt: now,
+      updatedAt: now,
+      urls: sessionUrls,
+      activeIndex: 1,
+      groups: [{ id: 'migration-group', name: 'research', collapsed: false }],
+      groupIds: ['migration-group', 'migration-group'],
+      pinned: [true, false],
+      meta: sessionUrls.map((url) => ({ title: url, favicon: null })),
+    }],
+  });
+
+  // Launch the real public Stable first so the fixture is proven acceptable
+  // to that build, then hand the exact same profile to the candidate. Inspect
+  // its authoritative chrome model rather than requiring every tab to have a
+  // live CDP page. The optional expectation lets a current public baseline
+  // prove quiet restore without blocking older migration investigations. Do
+  // not change selection here: the candidate must receive the exact profile
+  // written by Stable.
+  await launch(stableExecutable);
+  await waitForQuietRestore({
+    label: 'stable',
+    expectQuiet: stableExpectsQuiet,
+    wakeQuiet: false,
+  });
+  await app.close();
+  app = null;
+  const originalWorkspaceBytes = fs.readFileSync(path.join(userDataDir, 'workspaces.json'));
+  const originalRecoveryCopies = new Map(
+    fs.readdirSync(userDataDir)
+      .filter((name) => name.startsWith('workspaces.json.before-repair-'))
+      .map((name) => [name, fs.readFileSync(path.join(userDataDir, name))]),
+  );
+
+  await launch(candidateExecutable);
+  // Current Blanc restores inactive tabs as quiet records, so they have no
+  // CDP page until activated. Assert the privileged chrome's authoritative
+  // tab model first, then activate the quiet record and prove it wakes to the
+  // saved URL instead of weakening the migration check to the one live tab.
+  await waitForQuietRestore({ label: 'candidate', expectQuiet: true, wakeQuiet: true, groupName: recasedGroupName });
+
+  const settings = JSON.parse(
+    fs.readFileSync(path.join(userDataDir, 'settings.json'), 'utf8')
+  );
+  assert.equal(settings.searchEngine, 'brave');
+  assert.equal(settings.searchSuggestions, false);
+  assert.equal(settings.usagePing, false);
+  assert.equal(
+    settings.onboardingVersion,
+    1,
+    'legacy profile should skip first-run without resetting saved choices'
+  );
+
+  const bookmarks = JSON.parse(
+    fs.readFileSync(path.join(userDataDir, 'bookmarks.json'), 'utf8')
+  );
+  assert.ok(bookmarks.items.some((item) => item.url === favoriteUrl));
+
+  const history = JSON.parse(
+    fs.readFileSync(path.join(userDataDir, 'history.json'), 'utf8')
+  );
+  assert.ok(history.entries.some((entry) => entry.title === 'Migration history'));
+
+  const candidateWorkspaceBytes = fs.readFileSync(path.join(userDataDir, 'workspaces.json'));
+  const workspaces = JSON.parse(candidateWorkspaceBytes.toString('utf8'));
+  const migratedWorkspace = workspaces.workspaces.find((entry) => entry.id === workspaceId);
+  assert.ok(migratedWorkspace, 'saved Named Workspace should survive the public-to-candidate handoff');
+  assert.equal(migratedWorkspace.name, workspaceName);
+  // A feature update opens its What's New page once, in the window it
+  // updates (whats-new.js), once that page is live on blanc.day. Here that
+  // window is the saved Space, so the Space may gain exactly that one tab;
+  // every saved tab must still be there, in order.
+  const whatsNewPage = /^https:\/\/blanc\.day\/whats-new\/\d+\.\d+$/;
+  const addedUrls = migratedWorkspace.urls.filter((url) => !sessionUrls.includes(url));
+  assert.ok(addedUrls.length <= 1 && addedUrls.every((url) => whatsNewPage.test(url)), `only the What's New tab may join the Space: ${addedUrls.join(', ')}`);
+  assert.deepEqual(migratedWorkspace.urls.filter((url) => !whatsNewPage.test(url)), sessionUrls);
+  assert.equal(workspaces.version, 2, 'candidate should migrate to the versioned workspace recovery format');
+  const recoveryCopies = fs.readdirSync(userDataDir).filter((name) => name.startsWith('workspaces.json.before-repair-'));
+  for (const [name, bytes] of originalRecoveryCopies) {
+    assert.ok(recoveryCopies.includes(name), 'candidate must retain public-build workspace recovery copies');
+    assert.ok(fs.readFileSync(path.join(userDataDir, name)).equals(bytes), 'candidate must byte-preserve public-build workspace recovery copies');
+  }
+  const newRecoveryCopies = recoveryCopies.filter((name) => !originalRecoveryCopies.has(name));
+  const originalWorkspaceVersion = JSON.parse(originalWorkspaceBytes.toString('utf8')).version;
+  if (newRecoveryCopies.length || originalWorkspaceVersion !== workspaces.version) {
+    assert.ok(
+      newRecoveryCopies.some((name) => fs.readFileSync(path.join(userDataDir, name)).equals(originalWorkspaceBytes)),
+      'candidate repair or migration must preserve the exact public-build workspace file',
+    );
+  }
+  if (process.platform !== 'win32') {
+    for (const name of recoveryCopies) assert.equal(fs.statSync(path.join(userDataDir, name)).mode & 0o777, 0o600);
+  }
+
+  await app.close();
+  app = null;
+  await launch(candidateExecutable);
+  await waitForQuietRestore({ label: 'candidate restart', expectQuiet: false, wakeQuiet: false, groupName: recasedGroupName });
+  let chrome = app.pages().find(isChromePage);
+  const restarted = await chrome.evaluate(() => window.browserAPI.listWorkspaces());
+  assert.equal(restarted.items.find((workspace) => workspace.id === 'migration_workspace')?.active, true, 'the saved binding must survive a packaged restart');
+  await app.close();
+  app = null;
+
+  // A newer-format profile remains byte-preserved through startup, reads,
+  // rejected mutations, and shutdown, even with an old binding in session.json.
+  const futureBytes = Buffer.from(JSON.stringify({ version: 999, workspaces: [{ futureField: 'preserve this exact fixture' }] }, null, 2));
+  fs.writeFileSync(path.join(userDataDir, 'workspaces.json'), futureBytes);
+  await launch(candidateExecutable);
+  await waitForQuietRestore({ label: 'future-format startup', expectQuiet: false, wakeQuiet: false, groupName: recasedGroupName });
+  chrome = app.pages().find(isChromePage);
+  const refused = await chrome.evaluate(async () => ({
+    list: await window.browserAPI.listWorkspaces(),
+    rename: await window.browserAPI.updateWorkspace('migration_workspace', { name: 'Do not rewrite' }),
+    remove: await window.browserAPI.removeWorkspace('migration_workspace'),
+  }));
+  assert.equal(refused.list.status, 'future-format');
+  assert.equal(refused.rename.error, 'future-format');
+  assert.equal(refused.remove.error, 'future-format');
+  await app.close();
+  app = null;
+  assert.ok(fs.readFileSync(path.join(userDataDir, 'workspaces.json')).equals(futureBytes));
+
+  console.log(
+    `packaged-migration-smoke OK: ${path.basename(path.resolve(stableExecutable, '../../..'))} -> candidate; workspace backup, restart binding and future-format refusal verified`
+  );
+} finally {
+  if (app) await app.close();
+  fs.rmSync(userDataDir, { recursive: true, force: true });
+}

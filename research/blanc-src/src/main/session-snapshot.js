@@ -1,0 +1,142 @@
+// Pure session-snapshot helpers shared by persistSession (main.js) and tab
+// sync (tabsync.js). No electron imports — main.js isn't loadable under
+// node --test, so the shared entry-building logic lives here instead
+// (sync-wipe.js is the precedent). See the tab-sync design spec §4.
+
+const MAX_SYNC_TABS = 500;
+const MAX_SYNC_URL = 2048;
+const MAX_SYNC_TITLE = 200;
+
+/** The address worth persisting for a tab: the real destination behind our
+ * error page (so the next launch retries it), else the url as-is. Null for
+ * a tab with no committed url yet. */
+function persistableUrl(url) {
+  if (!url) return null;
+  if (url.startsWith('blanc://error')) {
+    try {
+      return new URL(url).searchParams.get('url') || url;
+    } catch {
+      return url;
+    }
+  }
+  return url;
+}
+
+const MAX_META_TITLE = 200;
+const MAX_META_FAVICON = 8192;
+const { validFavicon } = require('./bookmark-validate');
+const { normalizeTabName, displayTitle } = require('./tab-name');
+const { isInertPageUrl } = require('./document-policy');
+
+/** Session metadata carries only the same fixed-size PNG data accepted by
+ * Favorites; live remote sources never survive a restart. */
+function persistableFavicon(favicon) { return validFavicon(favicon); }
+
+// Lazy to keep pinned-home's reuse of persistableUrl free of an initialization
+// cycle: session-snapshot is the lower-level URL policy module.
+function validPinnedHome(value) {
+  if (typeof value !== 'string') return null;
+  const { pinnedHomeFor } = require('./pinned-home');
+  return pinnedHomeFor(value, { localFile: value.startsWith('file:') });
+}
+
+const validViewedAt = (value) => Number.isFinite(value) && value > 0;
+
+/** session.json's meta entry for one tab (Quiet Tabs spec §10.1): what the
+ * pill and the rail draw for a tab restored quiet, before it has any
+ * webContents. Empty title for a tab sitting on our own error page —
+ * persistableUrl() unwraps that url back to the real destination, and the
+ * title showing there is Blanc's error copy, not the site's. */
+function sessionTabMeta(tab) {
+  // An inert tab's page shows its own title (document-policy.js), so it stays.
+  const onErrorPage = typeof tab?.url === 'string' && tab.url.startsWith('blanc://error')
+    && !isInertPageUrl(tab.url);
+  // A DRM build's inert local-file record keeps the title it was restored
+  // with; the placeholder page's own title is never saved over it.
+  const inertTitle = typeof tab?.inertLocalFileUrl === 'string'
+    && typeof tab?.inertLocalFileTitle === 'string' ? tab.inertLocalFileTitle : null;
+  const title = inertTitle !== null ? inertTitle.slice(0, MAX_META_TITLE)
+    : !onErrorPage && typeof tab?.title === 'string'
+      ? tab.title.slice(0, MAX_META_TITLE)
+      : '';
+  const meta = { title, favicon: persistableFavicon(tab?.favicon) };
+  // F46: only a renamed tab carries the key, so every other entry is written
+  // exactly as before and older builds simply ignore it.
+  const customTitle = normalizeTabName(tab?.customTitle);
+  if (customTitle) meta.customTitle = customTitle;
+  const pinnedHomeUrl = tab?.pinned && !tab?.private
+    ? validPinnedHome(tab.pinnedHomeUrl)
+    : null;
+  if (pinnedHomeUrl) meta.pinnedHomeUrl = pinnedHomeUrl;
+  // F52: the Tab Archive's idle clock, so idle time counts across relaunches.
+  if (validViewedAt(tab?.lastViewedAt)) meta.lastViewedAt = tab.lastViewedAt;
+  return meta;
+}
+
+/** clearSessionMeta's rewrite of one window's meta column (F46). Page titles
+ * and icons are history and go; a name the person typed is theirs, like a
+ * group name, and stays. Null when nothing is worth keeping, so the caller
+ * deletes the column exactly as it always has. */
+function metaAfterHistoryClear(meta) {
+  if (!Array.isArray(meta)) return null;
+  const retained = meta.map((m) => ({
+    customTitle: normalizeTabName(m?.customTitle),
+    pinnedHomeUrl: validPinnedHome(m?.pinnedHomeUrl),
+    // A timestamp, not page content: the Archive's idle clock (F52) stays.
+    lastViewedAt: validViewedAt(m?.lastViewedAt) ? m.lastViewedAt : null,
+  }));
+  if (!retained.some((r) => r.customTitle || r.pinnedHomeUrl || r.lastViewedAt)) return null;
+  return retained.map(({ customTitle, pinnedHomeUrl, lastViewedAt }) => {
+    const entry = { title: '', favicon: null };
+    if (customTitle) entry.customTitle = customTitle;
+    if (pinnedHomeUrl) entry.pinnedHomeUrl = pinnedHomeUrl;
+    if (lastViewedAt) entry.lastViewedAt = lastViewedAt;
+    return entry;
+  });
+}
+
+/** Exactly persistSession's session.json semantics: private tabs excluded,
+ * error urls unwrapped, url-less tabs dropped. Order preserved. */
+function persistableEntries(tabList) {
+  return (tabList ?? [])
+    .filter((t) => t && !t.private)
+    .map((t) => {
+      const url = persistableUrl(t.url);
+      return url ? { id: t.id, url, groupId: t.groupId ?? null, pinned: !!t.pinned } : null;
+    })
+    .filter(Boolean);
+}
+
+/** The synced copy of the session: additionally http(s)-only (file:// paths
+ * don't exist on other machines; blanc:// pages aren't worth a row) and
+ * bounded. Groups reduced to those the surviving tabs reference, in display
+ * order, without device-local presentation state (collapsed). */
+function syncSnapshot(tabList, groups) {
+  const tabs = (tabList ?? [])
+    // A page-opened tab never leaves this device: older Blanc builds would
+    // ignore its document-policy mark and open it unrestricted.
+    .filter((t) => t && !t.private && t.inheritsDocumentPolicy !== true)
+    .map((t) => {
+      const url = persistableUrl(t.url);
+      if (!url || !/^https?:\/\//.test(url) || url.length > MAX_SYNC_URL) return null;
+      return {
+        url,
+        // F46: other devices see what this tab is labelled with here.
+        title: displayTitle(t).slice(0, MAX_SYNC_TITLE),
+        groupId: t.groupId ?? null,
+        pinned: !!t.pinned,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, MAX_SYNC_TABS);
+  const referenced = new Set(tabs.map((t) => t.groupId).filter(Boolean));
+  return {
+    tabs,
+    groups: (groups ?? []).filter((g) => referenced.has(g.id)).map(({ id, name }) => ({ id, name })),
+  };
+}
+
+module.exports = {
+  persistableUrl, persistableEntries, syncSnapshot, sessionTabMeta, metaAfterHistoryClear,
+  MAX_SYNC_TABS, MAX_SYNC_URL, MAX_SYNC_TITLE, MAX_META_TITLE, MAX_META_FAVICON,
+};

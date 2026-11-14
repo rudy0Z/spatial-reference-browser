@@ -1,0 +1,443 @@
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const root = path.resolve(__dirname, '../..');
+const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
+
+test('expanded feature guides retain release limitations beside their benefits', () => {
+  const guide = slug => read(`site/src/components/guides/${slug}.astro`).replace(/\s+/g, " ");
+  const start = guide('start-page');
+  assert.match(start, /eight|Eight/);
+  assert.match(start, /not cloud-synced/);
+  assert.match(start, /choice among the four start-page layouts can sync/);
+  assert.match(start, /own managed tab/);
+  assert.match(start, /Private tabs neither contribute to nor receive/);
+  const reopen = guide('reopen-closed-tabs');
+  for (const limit of [/At most one eligible closed page per window/, /about 30 seconds/, /may reload/, /25 entries per window/, /one hour/, /Private tabs never enter Recently Closed/]) assert.match(reopen, limit);
+  const workspaces = guide('workspaces');
+  assert.match(workspaces, /free for everyone/);
+  assert.match(workspaces, /doesn’t unlock any feature/);
+  assert.doesNotMatch(workspaces, /requires an active Patron|Active Patrons can/);
+  assert.match(workspaces, /profile-scoped and stay on this device unless you share them/);
+  assert.match(workspaces, /Spaces never move tabs between local profiles/);
+  assert.match(guide('profiles'), /Sync is available only to Personal/);
+  assert.match(guide('profiles'), /Files you downloaded remain on disk/);
+  assert.match(guide('glance'), /never written to session restore or sync/);
+  assert.match(guide('glance'), /does not search history, Favorites, remote tabs, or another window/);
+  assert.match(guide('security'), /off by default/);
+  assert.match(guide('security'), /not automatic fill/);
+  assert.match(guide('security'), /trades conversational responsiveness/);
+  for (const source of [start, reopen, workspaces, guide('profiles'), guide('glance')]) {
+    assert.doesNotMatch(source, /Blanc automatically (?:organizes|groups) (?:your )?tabs/i);
+    assert.doesNotMatch(source, /(?:Mahjong|Billboard|Named Workspaces|Blanc Spaces) (?:is|are) cloud-synced/i);
+    assert.doesNotMatch(source, /(?:exactly restores|perfectly recovers) every (?:closed )?tab/i);
+  }
+});
+
+test('app chrome and internal pages have no live Google Fonts dependency', () => {
+  const files = [
+    'src/renderer/index.html',
+    'src/renderer/overlay.html',
+    ...fs.readdirSync(path.join(root, 'src/renderer/pages'))
+      .filter((name) => name.endsWith('.html'))
+      .map((name) => `src/renderer/pages/${name}`),
+  ];
+  for (const file of files) {
+    // Scan HTML source for forbidden recipients, rather than parsing a URL host.
+    for (const host of ['fonts.googleapis.com', 'fonts.gstatic.com']) {
+      assert.equal(read(file).includes(host), false, `${file}: ${host}`);
+    }
+  }
+  for (const font of [
+    'inter-latin.woff2',
+    'jetbrains-mono-latin.woff2',
+  ]) {
+    assert.ok(fs.statSync(path.join(root, 'src/renderer/pages', font)).size > 1_000, font);
+  }
+});
+
+test('privacy copy accounts for suggestions, telemetry, ad measurement, tab/icon sync, and service requests', () => {
+  const privacy = read('site/src/pages/privacy.astro');
+  assert.doesNotMatch(privacy, /exactly three things/i);
+  assert.doesNotMatch(privacy, /nothing else leaves your device/i);
+  assert.match(privacy, /Search suggestions \(optional\)/);
+  assert.match(privacy, /random per-launch session ID/);
+  assert.match(privacy, /open HTTP\(S\) tabs/);
+  assert.match(privacy, /source-rasterized PNG favicons/);
+  assert.match(privacy, /checks GitHub for app updates/);
+  assert.match(privacy, /secure-DNS provider/);
+  assert.match(privacy, /Cloudflare download Worker/);
+  assert.match(privacy, /one aggregate counter for that UTC day and platform target/);
+  assert.match(privacy, /no download cookie, IP address, user agent, or per-user identifier/);
+  assert.match(privacy, /opaque <code>oppref<\/code> reference/);
+  assert.match(privacy, /does not include a name, email, account, visitor IP address, user agent, or user profile/);
+  assert.match(privacy, /OpenAI receives the limited ChatGPT-ad conversion event/);
+});
+
+test('ChatGPT ad attribution respects regional measurement choices and is server-side only', () => {
+  const siteScript = read('site/src/scripts/site.js');
+  const worker = read('cloudflare/ping-worker/src/index.js');
+  const conversion = read('cloudflare/ping-worker/src/dl.js');
+  const workerConfig = read('cloudflare/ping-worker/wrangler.toml');
+
+  assert.match(siteScript, /if \(disabled \|\| !measurementEnabled\(\)\) return/);
+  assert.match(siteScript, /choice === 'granted' \|\| \(choice === null && !measurementOptInRequired\)/);
+  assert.match(siteScript, /measurement-consent-v2/);
+  assert.match(siteScript, /sessionStorage\.setItem\(STORAGE_KEY, pendingOppref\)/);
+  assert.match(siteScript, /url\.searchParams\.set\('oppref', oppref\)/);
+  assert.doesNotMatch(siteScript, /oaiq|cdn\.openai\.com|bzr\.openai\.com/);
+  assert.match(worker, /OPENAI_CONVERSIONS_API_KEY/);
+  assert.match(conversion, /opt_out: true/);
+  assert.doesNotMatch(workerConfig, /OPENAI_CONVERSIONS_API_KEY\s*=\s*["']/);
+});
+
+test('private-tab copy matches the isolated in-memory session', () => {
+  const page = read('site/src/components/guides/private-tabs.astro');
+  assert.doesNotMatch(page, /shared with regular tabs/i);
+  assert.match(page, /separate in-memory browsing session/i);
+  assert.match(page, /files you explicitly save remain on disk/i);
+});
+
+test('marketing fixtures use bundled favicon assets only', () => {
+  const marketingFiles = [
+    ...fs.readdirSync(path.join(root, 'site/src/components/guides'))
+      .filter((name) => name.endsWith('.astro'))
+      .map((name) => `site/src/components/guides/${name}`),
+    'site/src/pages/index.astro',
+  ];
+  for (const file of marketingFiles) {
+    assert.doesNotMatch(read(file), /icons\.duckduckgo\.com/, file);
+  }
+  for (const icon of ['github.com.ico', 'notion.so.ico', 'netflix.com.ico']) {
+    assert.ok(fs.statSync(path.join(root, 'site/public/favicons', icon)).size > 100, icon);
+  }
+});
+
+test('marketing claims are release-gated and article assets avoid semantic-automation claims', () => {
+  const policy = read('docs/marketing-claims.md');
+  const composer = read('marketing/article-assets/ai-clean-browser/compose.py');
+  const claimRecord = read('marketing/article-assets/ai-clean-browser/CLAIMS.md');
+
+  for (const instructions of [read('AGENTS.md'), read('CLAUDE.md')]) {
+    assert.match(instructions, /follow `docs\/marketing-claims\.md`/);
+    assert.match(instructions, /does not understand assignments/);
+  }
+
+  assert.match(policy, /current public release/);
+  assert.match(policy, /current first-party documentation/);
+  assert.match(policy, /Text inside an image is a product claim/);
+
+  assert.doesNotMatch(composer, /understand the assignment/i);
+  assert.doesNotMatch(composer, /blanc sees context/i);
+  assert.match(composer, /user-directed groups and Patron workspaces\. no AI required\./);
+  assert.match(composer, /you name the groups\. blanc keeps them together\./);
+  assert.match(claimRecord, /Checked against the public `v1\.9\.1` tag/);
+});
+
+test('downloads distinguish both Mac architectures without guessing from user agent', () => {
+  const page = read('site/src/pages/download.astro');
+  const script = read('site/src/scripts/site.js');
+  assert.match(page, /data-platform="mac-arm64"/);
+  assert.match(page, /data-platform="mac-x64"/);
+  assert.match(script, /if \(kind === 'mac'\) return null/);
+  assert.doesNotMatch(script, /\|\| dmgs\[0\]/);
+  // Cards hide whenever the release lacks their artifact, and hrefs stay on
+  // the counted /dl redirects - rewriting them to direct asset URLs would
+  // bypass the edge download counter.
+  assert.match(script, /link\.hidden = !pickAsset/);
+  assert.doesNotMatch(script, /link\.href = asset/);
+  assert.match(page, /href="\/dl\/mac-x64"/);
+});
+
+test('grant drafts and metrics labels do not overclaim licensing or installs', () => {
+  const nlnet = read('docs/grants/nlnet-commons-fund.md');
+  const futo = read('docs/grants/futo-pitch.md');
+  const stats = read('scripts/stats.sh');
+  const readme = read('README.md');
+
+  // Licensing reversed on 2026-08-30: Blanc adopted the MIT License, undoing
+  // the 2026-08-20 decision to stay UNLICENSED. Open-source claims in the grant
+  // drafts are now accurate, so this guard flipped: it holds the drafts to the
+  // MIT wording and fails if the retired proprietary framing creeps back.
+  assert.match(nlnet, /MIT License/);
+  assert.doesNotMatch(nlnet, /currently proprietary/);
+  assert.doesNotMatch(nlnet, /source-visible proprietary/i);
+  assert.doesNotMatch(futo, /source-visible proprietary/i);
+  assert.doesNotMatch(futo, /only network call/i);
+  assert.doesNotMatch(futo, /launch ping,\s*off by default/i);
+  assert.match(stats, /artifact-downloads/);
+  assert.doesNotMatch(stats, /tag\\tinstalls/);
+  assert.doesNotMatch(readme, /else\s+builds unsigned/i);
+});
+
+test('public Patron copy states the free Blanc Spaces boundary consistently', () => {
+  const publicCopyFiles = [
+    'README.md',
+    'docs/superpowers/plans/assets/launch-copy.md',
+    'site/src/pages/about.astro',
+    'site/src/data/support-questions.json',
+    'site/src/pages/index.astro',
+    'site/src/pages/media.astro',
+    'site/src/pages/terms.astro',
+  ];
+  const detailedBoundaryFiles = [
+    'README.md',
+    'site/src/pages/about.astro',
+    'site/src/data/support-questions.json',
+    'site/src/pages/index.astro',
+    'site/src/pages/terms.astro',
+  ];
+  const staleClaims = /every browser feature is free|all browser features included|none of them are locked behind payment|nothing is locked behind payment|cosmetic Dock icons today/i;
+  const retiredColorwayClaim = /(?:Patron|supporter)[^.\n]*(?:app-icon|Dock)[^.\n]*(?:colorways|icons?|variants?)|(?:app-icon|Dock)[^.\n]*(?:colorways|icons?|variants?)[^.\n]*(?:Patron|supporter)/i;
+
+  for (const relativePath of publicCopyFiles) {
+    const source = read(relativePath);
+    assert.doesNotMatch(source, staleClaims, `${relativePath} must not overstate the free feature boundary`);
+    assert.match(source, /\b(?:Blanc Spaces|named workspaces?)\b/i, `${relativePath} must name Blanc Spaces`);
+    assert.doesNotMatch(source, retiredColorwayClaim, `${relativePath} must not advertise retired Patron colorways`);
+  }
+
+  for (const relativePath of detailedBoundaryFiles) {
+    const source = read(relativePath);
+    // Since v1.33.0 Blanc Spaces is free and Patron unlocks nothing
+    // (docs/superpowers/specs/2026-10-13-blanc-spaces-redesign-design.md).
+    assert.match(
+      source,
+      /unlocks\s+nothing|(?:does\s+not|doesn’t)\s+unlock\s+any\s+feature/i,
+      `${relativePath} must say Patron unlocks nothing`
+    );
+    assert.doesNotMatch(
+      source,
+      /Creating\s+a\s+space\s+requires|Renaming\s+and\s+removing\s+existing\s+spaces\s+continue/i,
+      `${relativePath} must not describe the retired Patron gate`
+    );
+  }
+
+  // These are current reusable truth sources. Frozen release notes and
+  // superseded design plans are intentionally excluded: they remain accurate
+  // records of what earlier builds offered, not copy for the next release.
+  for (const relativePath of [
+    'docs/blanc-brief.md',
+    'docs/brand-usage.md',
+    'docs/press/fact-sheet.md',
+    'export/app-icons-1024-square/README.md',
+  ]) {
+    assert.doesNotMatch(
+      read(relativePath),
+      retiredColorwayClaim,
+      `${relativePath} must not carry retired Patron app-icon messaging`,
+    );
+  }
+});
+
+test('public supply-chain copy distinguishes inspection from binary authentication', () => {
+  const readme = read('README.md');
+  const faq = read('site/src/data/support-questions.json');
+
+  for (const [relativePath, source] of [['README.md', readme], ['site/src/data/support-questions.json', faq]]) {
+    assert.doesNotMatch(source, /verify (?:that )?the published binary matches|verify the published binary against/i, relativePath);
+    assert.doesNotMatch(source, /provenance attestations for native artifacts|native artifacts carry GitHub provenance/i, relativePath);
+    assert.match(source, /Windows and Linux CI\s+artifacts (?:receive|carry) GitHub provenance attestations/i, relativePath);
+    assert.match(source, /(?:not proof|does not prove|do not make).*published binary|do not make.*local builds reproducible/i, relativePath);
+  }
+});
+
+test('public extension copy includes the shipped macOS 1Password boundary', () => {
+  const publicCopy = [
+    ['README.md', read('README.md')],
+    ['site/src/data/support-questions.json', read('site/src/data/support-questions.json')],
+    ['launch copy', read('docs/superpowers/plans/assets/launch-copy.md')],
+  ];
+
+  for (const [label, source] of publicCopy) {
+    assert.doesNotMatch(source, /password managers can(?:not|'t) integrate/i, label);
+    assert.match(source, /1Password/i, `${label} must name the supported provider`);
+    assert.match(source, /(?:explicit|user-invoked|user asks|user explicitly asks)/i, `${label} must state that fill is user-invoked`);
+    assert.match(source, /not an extension runtime/i, `${label} must preserve the extension boundary`);
+  }
+});
+
+test('official launch artifacts track the release declared by the README', () => {
+  const readme = read('README.md');
+  const plan = read('docs/superpowers/plans/2026-08-20-growth-counter-offensive.md');
+  const copy = read('docs/superpowers/plans/assets/launch-copy.md');
+  const match = readme.match(/\*\*Current release:\*\* v(\d+\.\d+\.\d+)/);
+
+  assert.ok(match, 'README must declare the current release');
+  const version = match[1];
+
+  const launchPaused = /Launch Week paused after v1\.17\.0/.test(copy);
+  if (launchPaused) {
+    assert.match(copy, /This pack is \*\*not\s+publishable\*\*/);
+    assert.match(plan, /Launch Week paused \(2026-09-13\)[\s\S]{0,200}v1\.17\.0/);
+  } else {
+    assert.ok(copy.startsWith(`# Blanc launch copy pack — v${version} final-release refresh`));
+    assert.ok(copy.includes(`| Current public release | v${version} |`));
+    assert.ok(copy.includes(`v${version} tag is the exact source snapshot`));
+  }
+  assert.match(copy, /Blanc is free and open source under the MIT License/);
+  assert.doesNotMatch(copy, /not released under an open-source licen[cs]e/i);
+  assert.match(copy, /BetaList's current[\s\S]{0,200}all submissions[\s\S]{0,80}paid/i);
+  assert.match(plan, /BetaList's[\s\S]{0,200}all\s+submissions are paid/i);
+  assert.doesNotMatch(plan, /submitting Monday costs nothing/i);
+  assert.match(copy, /Product Hunt[\s\S]{0,600}personal account[\s\S]{0,400}one week/i);
+  assert.match(copy, /YouTube[\s\S]{0,400}12 hours/i);
+  assert.match(copy, /r\/windows[\s\S]{0,300}Skip unless already approved/i);
+  assert.match(copy, /r\/macapps[\s\S]{0,800}10 local karma[\s\S]{0,500}Problem\/Comparison\/Pricing/i);
+  assert.match(copy, /r\/linux[\s\S]{0,500}10%[\s\S]{0,400}related story/i);
+  assert.match(plan, /r\/windows:[\s\S]{0,300}skip unless[\s\S]{0,300}green-check flair/i);
+  assert.match(plan, /r\/linux:[\s\S]{0,500}no-more-than-10%[\s\S]{0,300}related story/i);
+  assert.match(copy, /third-party user[\s\S]{0,300}1vj0og9[\s\S]{0,500}does not complete the Reddit launch task/i);
+  assert.match(plan, /1vj0og9[\s\S]{0,500}not a founder launch[\s\S]{0,500}skip r\/browsers/i);
+  assert.match(plan, /old `0de37a1` and `c7e9496` anchors are\s+historical and must not be reused/i);
+  assert.match(plan, /Post-cutoff audit recorded September 10, 2026[\s\S]{0,250}`233c807cde4e27cb15813b3be146749e6e51725b`[\s\S]{0,500}after the noon product cutoff/i);
+  assert.match(plan, /Historical execution status — September 10, 2026[\s\S]{0,1500}owner explicitly accepted v1\.16\.0 and `233c807` as the late final launch\s+release/i);
+  assert.match(plan, /Owner-approved recovery \(2026-09-13\)[\s\S]{0,180}selected public[\s>]+v1\.16\.2/i);
+  assert.match(copy, /Final release lock — ACCEPTED 2026-09-13:[\s\S]{0,200}v1\.16\.2/);
+  assert.match(copy, /youtube\.com\/watch\?v=REA1jQN6tY0/);
+  assert.match(copy, /2026-09-13T21:36:18Z/);
+  assert.match(plan, /screen and system-audio\s+sharing from PR #308[\s\S]{0,300}older screen-sharing PR #302[\s\S]{0,200}outside the launch release/i);
+  assert.match(plan, /Step 0b: Verify the repository landing page is still inside the merge freeze/i);
+  assert.match(plan, /launch-freeze-start[\s\S]{0,500}anchor[\s\S]{0,200}releaseTag[\s\S]{0,100}releaseSha/);
+  assert.match(copy, /launch-freeze-start[\s\S]{0,300}dynamic anchor[\s\S]{0,300}no\s+product\/runtime/i);
+  assert.match(plan, /Monday, September 14, 2026[\s\S]{0,300}Tuesday, September 15, 2026[\s\S]{0,300}Wednesday, September 16, 2026[\s\S]{0,300}Thursday, September 17, 2026/i);
+  assert.match(plan, /Thursday noon ET cutoff/i);
+  assert.match(plan, /launch release by Friday, September 11 at 3:00 p\.m\. ET/i);
+  assert.match(plan, /For every post-v1\.10\.0 version, follow the complete release operator protocol/i);
+  assert.match(plan, /updater handoff starts in the immediately preceding public version/i);
+  assert.match(plan, /jump over an intermediate public\s+version, is not that handoff/i);
+  assert.match(plan, /final selected launch release starts the\s+only soak that can clear Task 11/i);
+  assert.match(plan, /WINDOW_START = '2026-09-21'[\s\S]{0,100}WINDOW_END\s+= '2026-10-04'/);
+  assert.doesNotMatch(plan, /Monday, August 31, 2026|Tuesday, September 1, 2026|Wednesday, September 2, 2026|Thursday, September 3, 2026/);
+  assert.doesNotMatch(copy, /Thursday, September 3, 2026/i);
+  assert.match(plan, /capture-download-baseline\.mjs "\$LAUNCH_RELEASE_TAG"/);
+  assert.doesNotMatch(plan, /capture-download-baseline\.mjs v1\.10\.0/);
+  assert.match(plan, /releaseTag[\s\S]{0,80}packageAssetRequests[\s\S]{0,120}packageAssetRequestsByPlatform/);
+  assert.doesNotMatch(plan, /gh api --paginate repos\/bnfy\/blanc\/releases/);
+  assert.doesNotMatch(plan, /"totalDownloads"/);
+  assert.match(copy, /Thursday, September 17, 2026[\s\S]{0,200}12:01 a\.m\. PST/i);
+  assert.match(plan, /Select \*\*September 17, 2026\*\*[\s\S]{0,300}If Tasks 12 or 13 slipped, move Product Hunt too/i);
+  assert.doesNotMatch(copy, /https:\/\/blancbrowser\.com\/\?ref=reddit/);
+  assert.doesNotMatch(plan, /https:\/\/blancbrowser\.com\/\?ref=reddit/);
+  const productHuntUpload = plan.indexOf('Step 2: Upload the demo video');
+  const productHuntSchedule = plan.indexOf('Step 3: Schedule the Thursday, September 17 launch');
+  assert.ok(productHuntUpload >= 0, 'Product Hunt upload step must exist');
+  assert.ok(productHuntSchedule > productHuntUpload, 'Product Hunt media preview must precede scheduling');
+  if (!launchPaused) {
+    assert.ok(plan.includes(`Blanc v${version} is the current public baseline`));
+  }
+  assert.match(plan, /selected launch release's `soakEndsAt`/i);
+  assert.match(plan, /Complete and record a fresh ≥48-hour soak before Task 11/i);
+  assert.match(plan, /launch release by Friday, September 11 at\s+3:00 p\.m\. ET/i);
+  if (!launchPaused) {
+    assert.ok(plan.includes(`homepage show ${version} — not a Cloudflare preview URL`));
+  }
+});
+
+test('platform specs match the shipped first-run telemetry contract', () => {
+  const matrix = read('spec/parity-matrix.md');
+  const services = read('spec/acceptance/platform-services.feature');
+  const faq = read('site/src/data/support-questions.json');
+  const launchCopy = read('docs/superpowers/plans/assets/launch-copy.md');
+  const telemetryRow = matrix.split('\n').find((line) => line.startsWith('| F21 |')) || '';
+  assert.doesNotMatch(telemetryRow, /Opt-in, off by default/i);
+  assert.doesNotMatch(services, /usage ping is off by default/i);
+  assert.match(matrix, /commit its on\/off choice before any event/i);
+  assert.match(matrix, /first Mahjong move and each rendered start-page layout/i);
+  assert.match(matrix, /Private tabs and browsing\/game content are excluded/i);
+  assert.match(services, /no telemetry install id exists/i);
+  for (const [label, source] of [['FAQ', faq], ['launch copy', launchCopy]]) {
+    assert.match(source, /launch event plus bounded, once-per-app-session/i, label);
+    assert.match(source, /first real Mahjong move and each (?:rendered )?start-page layout(?: that (?:actually )?renders)?/i, label);
+    assert.match(source, /layout events add (?:only )?one fixed layout name/i, label);
+    assert.doesNotMatch(source, /telemetry payload remains exactly six fields/i, label);
+  }
+});
+
+test('published memory figures agree across the site, the fact sheet, and the run behind them', () => {
+  // A performance claim on the site is the easiest kind to let rot: the numbers
+  // live in three places and nothing but this test stops one of them being
+  // edited alone. If a re-run changes the figures, all three change together or
+  // this fails.
+  // Figures are strings so a whole number keeps its published one decimal (4.0).
+  const MEASURED = [['Blanc', '1.5'], ['Brave', '1.7'], ['Zen', '4.7'], ['Chrome', '4.9'], ['Edge', '7.4'], ['Vivaldi', '7.4']];
+  const RESULT = 'bench/memory/results/memory-2026-10-19T03-13-32-296Z.json';
+
+  const chart = read('site/src/components/MemoryChart.astro');
+  const factSheet = read('docs/press/fact-sheet.md');
+
+  for (const [name, gb] of MEASURED) {
+    const figure = gb.replace('.', '\\.');
+    assert.match(chart, new RegExp(`name: '${name}', gb: ${figure}\\b`), `${name} in MemoryChart`);
+    assert.match(factSheet, new RegExp(`\\| ${name} \\| ${figure} GB \\|`), `${name} in fact sheet`);
+  }
+
+  // The claim must be traceable to a committed run, not to a number someone
+  // remembers. Every figure above has to appear in that run's own totals.
+  assert.ok(fs.existsSync(path.join(root, RESULT)), `${RESULT} must be committed`);
+  const report = JSON.parse(read(RESULT));
+  const adheavy = report.results.filter((r) => r.workload === 'adheavy');
+  const medianGiB = (label) => {
+    const row = adheavy.find((r) => r.label === label);
+    assert.ok(row, `${label} missing from the committed run`);
+    const totals = row.repetitions.map((r) => r.totalBytes).sort((a, b) => a - b);
+    const mid = totals.length >> 1;
+    const median = totals.length % 2 ? totals[mid] : (totals[mid - 1] + totals[mid]) / 2;
+    return median / 1024 ** 3;
+  };
+  for (const [name, gb] of MEASURED) {
+    const actual = medianGiB({ Zen: 'Zen Browser', Chrome: 'Google Chrome', Edge: 'Microsoft Edge' }[name] ?? name);
+    assert.ok(
+      Math.abs(actual - Number(gb)) < 0.06, // displayed GiB rounds to 1 dp
+      `${name}: published ${gb} GB but the committed run measured ${actual.toFixed(2)}`
+    );
+  }
+
+  // The homepage's first-launch card quotes Blanc, Chrome and Brave from the
+  // same run, so it joins the check.
+  const homepage = read('site/src/pages/index.astro');
+  for (const [name, gb] of MEASURED.filter(([name]) => ['Blanc', 'Chrome', 'Brave'].includes(name))) {
+    assert.ok(homepage.includes(`${gb} GB`), `${name} on the homepage`);
+  }
+
+  // Both qualifications must travel with the figures wherever they are shown.
+  for (const [file, text] of [['MemoryChart', chart], ['fact sheet', factSheet], ['homepage', homepage]]) {
+    assert.match(text, /blocks by default/i, `${file} must name Brave as the fair peer`);
+    assert.match(text, /5\.2 GB/, `${file} must state the blocking-off figure`);
+    assert.match(text, /no extensions/i, `${file} must disclose the profile conditions`);
+  }
+});
+
+test('quiet-tabs copy promises a reload, and no page claims tabs are never discarded', () => {
+  const page = read('site/src/components/guides/quiet-tabs.astro');
+  const hub = read('site/src/pages/index.astro');
+
+  assert.match(page, /reloads? (?:it|them|the page)/i);
+  // Spec §7: wake is a network re-fetch. "Resume" would be a promise Blanc
+  // cannot keep — except in the truth-note, which says it does NOT resume.
+  assert.match(page, /It does not resume\./);
+  assert.doesNotMatch(page, /\bresumes\b|\bresumed\b|\bresuming\b/i);
+  // "asleep" is the internal field name; public copy says quiet.
+  assert.doesNotMatch(page, /\basleep\b/i);
+  // The honest limits are stated, not omitted.
+  assert.match(page, /Private tabs come back where they were, not how they were/);
+  assert.match(hub, /Quiet Tabs/);
+
+  const marketing = [
+    ...fs.readdirSync(path.join(root, 'site/src/components/guides'))
+      .filter((name) => name.endsWith('.astro'))
+      .map((name) => `site/src/components/guides/${name}`),
+    'site/src/pages/index.astro',
+    'site/src/pages/index.astro',
+    'site/src/pages/download.astro',
+    'site/src/pages/about.astro',
+  ];
+  for (const file of marketing) {
+    const source = read(file);
+    assert.doesNotMatch(source, /never (?:discards?|unloads?|drops?) (?:a |any |your )?tabs?/i, file);
+    assert.doesNotMatch(source, /every tab stays (?:live|loaded|open in memory)/i, file);
+    assert.doesNotMatch(source, /keeps (?:every|all) tabs? (?:live|loaded|in memory)/i, file);
+  }
+});

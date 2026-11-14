@@ -1,0 +1,111 @@
+# Root .gitattributes — Spatial Reference Browser monorepo
+#
+# Derived from research/blanc-src/.gitattributes (Blanc v1.48.0). Every
+# repo-root-anchored path (`/...`) was rewritten to a `**/` glob so the rules
+# protect the Blanc tree wherever it lives: `research/blanc-src/` (the pristine
+# reference clone) today and `browser/` (the Phase 3 fork) tomorrow.
+#
+# WHY THIS IS CRITICAL (blanc-src AGENTS.md, "The pinned blocker files are
+# byte-verified"): a Windows checkout with CRLF conversion breaks the packaged
+# adblocker — it fails closed with "Blocking could not start". The `eol=lf`
+# rules below keep the byte-verified blocker inputs, license pins, generated
+# snapshots and adaptation hashes byte-stable on Windows.
+
+# --- Adblocker: hash-verified EasyList/EasyPrivacy snapshot inputs ---
+**/adblock/sources/*.txt text eol=lf
+**/adblock/sources/pinned.json text eol=lf
+**/adblock/sources/ghostery-resources.json text eol=lf
+**/adblock/generated/*.json text eol=lf
+**/src/main/assets/adblock-engine-seed.json text eol=lf
+
+# --- Reader extraction resources and upstream license/font pins ---
+**/reader-pinned.json text eol=lf
+**/scripts/build-reader.cjs text eol=lf
+**/src/main/reader-*.js text eol=lf
+**/src/renderer/pages/reader* text eol=lf
+**/src/renderer/pages/reader-*.generated.js linguist-generated=true
+**/src/renderer/pages/reader-*-LICENSE.txt -whitespace
+**/src/renderer/pages/reader-dompurify-MPL.txt -whitespace
+**/src/renderer/pages/source-serif-4-OFL.txt text eol=lf
+**/src/renderer/pages/source-serif-4-regular.woff2 -text
+
+# --- Compliance evidence must reproduce byte-for-byte on Windows ---
+**/compliance/*.json text eol=lf
+**/compliance/*.txt text eol=lf
+**/compliance/evidence/*.txt text eol=lf
+
+# --- Capture / display-capture / permissions (reproducible signed preloads) ---
+**/src/main/capture-preload-playout.js text eol=lf
+**/src/main/capture-preload.js text eol=lf
+**/src/main/display-capture-broker-playout.js text eol=lf
+**/src/main/display-capture-broker.js text eol=lf
+**/src/renderer/display-capture-helper-playout.js text eol=lf
+**/src/renderer/display-capture-helper.js text eol=lf
+**/src/main/capture-preload-linux.js text eol=lf
+**/src/main/display-capture-broker-linux.js text eol=lf
+**/src/renderer/display-capture-helper-linux.js text eol=lf
+**/src/main/display-capture-state.js text eol=lf
+**/src/main/display-capture-admission.js text eol=lf
+**/src/main/display-capture-constraints.js text eol=lf
+**/src/main/display-capture-ice.js text eol=lf
+**/src/main/display-capture-picker.js text eol=lf
+**/src/main/display-capture-flags.js text eol=lf
+**/src/main/display-capture-helper-audio.js text eol=lf
+**/src/main/display-capture-helper-preload.js text eol=lf
+**/src/main/display-capture-indicator.js text eol=lf
+**/src/main/capture-state.js text eol=lf
+**/src/main/permission-decisions.js text eol=lf
+**/src/main/permissions.js text eol=lf
+**/src/renderer/display-capture-helper.html text eol=lf
+**/src/main/overlay-view-lifecycle.js text eol=lf
+
+# --- Managed uBlock Origin: verified upstream bytes keep exact whitespace ---
+**/ublock/upstream/** -text
+**/ublock/sources/** -text
+**/ublock/upstream/** -whitespace
+**/ublock/adaptation.patch -whitespace
+
+# Managed host inputs and adaptation hashes must reproduce on Windows.
+**/src/main/ublock-*.js text eol=lf
+**/src/renderer/ublock-popup.css text eol=lf
+**/src/renderer/ublock-popup-icons/* text eol=lf
+**/src/renderer/pages/i18n.js text eol=lf
+**/src/main/ublock-strings.json text eol=lf
+**/ublock/adaptation.* text eol=lf
+**/src/renderer/ublock-dashboard.css text eol=lf
+
+# Reproducible signed session-preload scope wrappers.
+**/src/main/scoped-capture-preload.js text eol=lf
+**/src/main/scoped-capture-preload-linux.js text eol=lf
+**/src/main/scoped-capture-preload-playout.js text eol=lf
+
+# Byte-checked source/host records, including default Windows checkouts.
+**/ublock/*.json text eol=lf
+**/ublock/*.md text eol=lf
+**/ublock/LICENSE.txt text eol=lf
+**/ublock/identity.json text eol=lf
+**/ublock/source-audit.json text eol=lf
+**/ublock/pinned.json text eol=lf
+**/src/main/blocking-resources.js text eol=lf
+
+# Full license texts are byte-checked with the uBO source inputs.
+**/ublock/licenses/*.txt text eol=lf
+
+# browserAPI contract and its byte-checked generated files (browser-api:check).
+**/browser-api/contract.json text eol=lf
+**/browser-api/generated/* text eol=lf
+
+# --- Dark websites: pinned Dark Reader bytes and generated preload ---
+**/dark-reader/upstream/* -text -whitespace
+**/dark-reader/*.txt text eol=lf
+**/dark-reader/*.json text eol=lf
+**/dark-reader/*.js text eol=lf
+**/src/main/dark-websites-preload.js text eol=lf -whitespace
+
+# --- Bangs: Kagi's pinned list, license, pin and generated catalog ---
+**/bangs/sources/* text eol=lf
+**/bangs/*.json text eol=lf
+**/src/renderer/pages/bangs-catalog.js text eol=lf
+**/site/src/data/bangs.json text eol=lf
+**/site/public/licenses/kagi-bangs-MIT.txt text eol=lf
+**/site/public/bang-hosts.json text eol=lf

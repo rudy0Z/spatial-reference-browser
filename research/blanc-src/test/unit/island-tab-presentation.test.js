@@ -1,0 +1,354 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+const source = fs.readFileSync(
+  path.join(__dirname, '../../src/renderer/renderer.js'),
+  'utf8'
+);
+const styles = fs.readFileSync(
+  path.join(__dirname, '../../src/renderer/styles.css'),
+  'utf8'
+);
+
+function extractFunction(name) {
+  const start = source.indexOf(`function ${name}()`);
+  assert.notEqual(start, -1, `${name} not found in renderer.js`);
+  const bodyStart = source.indexOf('{', start);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === '{') depth += 1;
+    if (source[index] === '}') depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`could not extract ${name} from renderer.js`);
+}
+
+const islandTabPresentation = extractFunction('islandTabPresentation');
+
+function visibleDots(tabs, activeTabId, dotBudget = 8, lastSectionTabId = null) {
+  const sandbox = {
+    state: { tabs, activeTabId },
+    // The last non-pinned active tab, which an active standalone pin keeps.
+    lastSectionTabId,
+    DOT_CAP: 8,
+    // fitIslandDots lowers this when a narrow pill cannot hold eight dots.
+    dotBudget,
+    activeTab: () => tabs.find((tab) => tab.id === activeTabId) || null,
+    TabSections: require('../../src/renderer/tab-sections.js'),
+  };
+  vm.runInNewContext(`${islandTabPresentation}\nthis.result = islandTabPresentation();`, sandbox);
+  return {
+    ...sandbox.result,
+    pinned: Array.from(sandbox.result.pinned),
+    section: Array.from(sandbox.result.section),
+    shown: Array.from(sandbox.result.shown),
+  };
+}
+
+test('the reported 14-tab topology shows the standalone pin, active group, and global remainder', () => {
+  const tabs = [
+    { id: 'pin', groupId: null, pinned: true },
+    ...['p1', 'p2'].map((id) => ({ id, groupId: 'projects', pinned: false })),
+    ...['t1', 't2'].map((id) => ({ id, groupId: 'tools', pinned: false })),
+    ...['s1', 's2', 's3', 's4'].map((id) => ({ id, groupId: 'shopping', pinned: false })),
+    ...['l1', 'l2', 'l3', 'l4', 'l5'].map((id) => ({ id, groupId: null, pinned: false })),
+  ];
+  const { pinned, section, shown, hidden } = visibleDots(tabs, 't1');
+
+  assert.deepEqual(pinned.map((tab) => tab.id), ['pin']);
+  assert.deepEqual(section.map((tab) => tab.id), ['t1', 't2']);
+  assert.deepEqual(shown.map((tab) => tab.id), ['pin', 't1', 't2']);
+  assert.equal(hidden, 11);
+});
+
+test('every pin leads the Island in tab order, grouped or not, and its group skips it', () => {
+  const { pinned, section, shown, hidden } = visibleDots([
+    { id: 'loose', groupId: null, pinned: false },
+    { id: 'pinned-a', groupId: null, pinned: true },
+    { id: 'grouped-pin', groupId: 'work', pinned: true },
+    { id: 'grouped-active', groupId: 'work', pinned: false },
+    { id: 'pinned-b', groupId: null, pinned: true },
+  ], 'grouped-active');
+
+  assert.deepEqual(pinned.map((tab) => tab.id), ['pinned-a', 'grouped-pin', 'pinned-b']);
+  assert.deepEqual(section.map((tab) => tab.id), ['grouped-active']);
+  assert.deepEqual(shown.map((tab) => tab.id), [
+    'pinned-a', 'grouped-pin', 'pinned-b', 'grouped-active',
+  ]);
+  assert.equal(hidden, 1);
+});
+
+test('a pin inside a group stays on the Island while another section is active', () => {
+  // The owner's window: the only pin leads Projects, the active tab is loose.
+  const tabs = [
+    { id: 'proj-pin', groupId: 'projects', pinned: true },
+    ...['p1', 'p2'].map((id) => ({ id, groupId: 'projects', pinned: false })),
+    ...['t1', 't2'].map((id) => ({ id, groupId: 'tools', pinned: false })),
+    ...['l1', 'l2'].map((id) => ({ id, groupId: null, pinned: false })),
+  ];
+  const { pinned, section, shown, hidden } = visibleDots(tabs, 'l2');
+
+  assert.deepEqual(pinned.map((tab) => tab.id), ['proj-pin']);
+  assert.deepEqual(section.map((tab) => tab.id), ['l1', 'l2']);
+  assert.deepEqual(shown.map((tab) => tab.id), ['proj-pin', 'l1', 'l2']);
+  assert.equal(hidden, 4);
+});
+
+test('a grouped pin is drawn once when its own group is the active section', () => {
+  const tabs = [
+    { id: 'proj-pin', groupId: 'projects', pinned: true },
+    ...['p1', 'p2'].map((id) => ({ id, groupId: 'projects', pinned: false })),
+    { id: 'l1', groupId: null, pinned: false },
+  ];
+  const { pinned, section, shown, hidden } = visibleDots(tabs, 'p2');
+
+  assert.deepEqual(pinned.map((tab) => tab.id), ['proj-pin']);
+  assert.deepEqual(section.map((tab) => tab.id), ['p1', 'p2']);
+  assert.equal(shown.filter((tab) => tab.id === 'proj-pin').length, 1);
+  assert.equal(hidden, 1);
+});
+
+test('an active grouped pin shows its own group, and is never remembered as a section', () => {
+  const tabs = [
+    { id: 'mail', groupId: null, pinned: true },
+    { id: 'proj-pin', groupId: 'projects', pinned: true },
+    ...['p1', 'p2'].map((id) => ({ id, groupId: 'projects', pinned: false })),
+    ...['l1', 'l2'].map((id) => ({ id, groupId: null, pinned: false })),
+  ];
+  const sandbox = {
+    state: { tabs, activeTabId: 'proj-pin' },
+    lastSectionTabId: 'l2',
+    DOT_CAP: 8,
+    dotBudget: 8,
+    activeTab: () => tabs.find((tab) => tab.id === sandbox.state.activeTabId) || null,
+    TabSections: require('../../src/renderer/tab-sections.js'),
+  };
+  vm.runInNewContext(`${islandTabPresentation}\nthis.result = islandTabPresentation();`, sandbox);
+  assert.deepEqual(Array.from(sandbox.result.pinned, (tab) => tab.id), ['mail', 'proj-pin']);
+  assert.deepEqual(Array.from(sandbox.result.section, (tab) => tab.id), ['p1', 'p2']);
+  assert.equal(sandbox.result.hidden, 2);
+  assert.equal(sandbox.lastSectionTabId, 'l2', 'a pinned tab never becomes the remembered section');
+});
+
+test('an active pin whose group holds only pins keeps the last section', () => {
+  const tabs = [
+    { id: 'pin-a', groupId: 'reading', pinned: true },
+    { id: 'pin-b', groupId: 'reading', pinned: true },
+    ...['t1', 't2'].map((id) => ({ id, groupId: 'tools', pinned: false })),
+    ...['l1', 'l2'].map((id) => ({ id, groupId: null, pinned: false })),
+  ];
+  const { pinned, section, shown } = visibleDots(tabs, 'pin-b', 8, 'l1');
+
+  assert.deepEqual(pinned.map((tab) => tab.id), ['pin-a', 'pin-b']);
+  assert.deepEqual(section.map((tab) => tab.id), ['l1', 'l2']);
+  assert.equal(new Set(shown.map((tab) => tab.id)).size, shown.length, 'no tab is drawn twice');
+});
+
+test('a loose active tab gets the standalone pins and its run, not named groups', () => {
+  const { pinned, section, hidden } = visibleDots([
+    { id: 'pin', groupId: null, pinned: true },
+    { id: 'grouped', groupId: 'work', pinned: false },
+    { id: 'loose-a', groupId: null, pinned: false },
+    { id: 'loose-b', groupId: null, pinned: false },
+  ], 'loose-b');
+
+  assert.deepEqual(pinned.map((tab) => tab.id), ['pin']);
+  assert.deepEqual(section.map((tab) => tab.id), ['loose-a', 'loose-b']);
+  assert.equal(hidden, 1);
+});
+
+test('the dots show only the active run when ungrouped tabs sit between groups', () => {
+  const { section, hidden } = visibleDots([
+    { id: 'loose-a', groupId: null, pinned: false },
+    { id: 'grouped', groupId: 'work', pinned: false },
+    { id: 'loose-b', groupId: null, pinned: false },
+    { id: 'loose-c', groupId: null, pinned: false },
+  ], 'loose-b');
+
+  assert.deepEqual(section.map((tab) => tab.id), ['loose-b', 'loose-c']);
+  assert.equal(hidden, 2);
+});
+
+test('with only pins, an active standalone pin windows the shelf and never duplicates it', () => {
+  const tabs = Array.from({ length: 10 }, (_, index) => ({
+    id: `pin-${index}`,
+    groupId: null,
+    pinned: true,
+  }));
+  const { pinned, section, shown, hidden } = visibleDots(tabs, 'pin-9');
+
+  assert.equal(pinned.length, 8);
+  assert.deepEqual(section, []);
+  assert.equal(shown.filter((tab) => tab.id === 'pin-9').length, 1);
+  assert.equal(shown.at(-1).id, 'pin-9');
+  assert.equal(hidden, 2);
+});
+
+test('an active standalone pin keeps the section the person was last on (#1174)', () => {
+  const tabs = [
+    { id: 'mail', groupId: null, pinned: true },
+    ...['p1', 'p2'].map((id) => ({ id, groupId: 'projects', pinned: false })),
+    ...['t1', 't2', 't3'].map((id) => ({ id, groupId: 'tools', pinned: false })),
+    ...['l1', 'l2'].map((id) => ({ id, groupId: null, pinned: false })),
+  ];
+  const { pinned, section, shown, hidden } = visibleDots(tabs, 'mail', 8, 't2');
+
+  assert.deepEqual(pinned.map((tab) => tab.id), ['mail']);
+  assert.deepEqual(section.map((tab) => tab.id), ['t1', 't2', 't3']);
+  assert.deepEqual(shown.map((tab) => tab.id), ['mail', 't1', 't2', 't3']);
+  assert.equal(hidden, 4);
+});
+
+test('an ordinary active tab is remembered for a later pinned one', () => {
+  const tabs = [
+    { id: 'mail', groupId: null, pinned: true },
+    ...['p1', 'p2'].map((id) => ({ id, groupId: 'projects', pinned: false })),
+    ...['l1', 'l2'].map((id) => ({ id, groupId: null, pinned: false })),
+  ];
+  const sandbox = {
+    state: { tabs, activeTabId: 'l2' },
+    lastSectionTabId: null,
+    DOT_CAP: 8,
+    dotBudget: 8,
+    activeTab: () => tabs.find((tab) => tab.id === sandbox.state.activeTabId) || null,
+    TabSections: require('../../src/renderer/tab-sections.js'),
+  };
+  vm.runInNewContext(`${islandTabPresentation}\nthis.first = islandTabPresentation();`, sandbox);
+  assert.equal(sandbox.lastSectionTabId, 'l2');
+  sandbox.state.activeTabId = 'mail';
+  vm.runInNewContext(`${islandTabPresentation}\nthis.second = islandTabPresentation();`, sandbox);
+  assert.deepEqual(Array.from(sandbox.second.shown, (tab) => tab.id), ['mail', 'l1', 'l2']);
+  assert.equal(sandbox.lastSectionTabId, 'l2', 'a pinned tab never becomes the remembered section');
+});
+
+test('with no known section, or a closed one, a pinned active tab shows the first section', () => {
+  const tabs = [
+    { id: 'mail', groupId: null, pinned: true },
+    ...['p1', 'p2'].map((id) => ({ id, groupId: 'projects', pinned: false })),
+    ...['l1', 'l2'].map((id) => ({ id, groupId: null, pinned: false })),
+  ];
+  for (const remembered of [null, 'closed-tab']) {
+    const { section, hidden } = visibleDots(tabs, 'mail', 8, remembered);
+    assert.deepEqual(section.map((tab) => tab.id), ['p1', 'p2']);
+    assert.equal(hidden, 2);
+  }
+});
+
+test('many pins leave the remembered tab a slot, and a one-dot Island keeps the active pin', () => {
+  const tabs = [
+    ...Array.from({ length: 10 }, (_, index) => ({ id: `pin-${index}`, groupId: null, pinned: true })),
+    ...['w1', 'w2', 'w3'].map((id) => ({ id, groupId: 'work', pinned: false })),
+  ];
+  const full = visibleDots(tabs, 'pin-9', 8, 'w3');
+  assert.equal(full.pinned.length, 7);
+  assert.equal(full.pinned.at(-1).id, 'pin-9');
+  assert.deepEqual(full.section.map((tab) => tab.id), ['w3']);
+  assert.equal(full.hidden, 5);
+
+  const single = visibleDots(tabs, 'pin-9', 1, 'w3');
+  assert.deepEqual(single.shown.map((tab) => tab.id), ['pin-9']);
+  assert.equal(single.hidden, 12);
+});
+
+test('the cap reserves the active tab after standalone pins take priority', () => {
+  const tabs = [
+    ...Array.from({ length: 9 }, (_, index) => ({
+      id: `pin-${index}`,
+      groupId: null,
+      pinned: true,
+    })),
+    ...Array.from({ length: 4 }, (_, index) => ({
+      id: `work-${index}`,
+      groupId: 'work',
+      pinned: false,
+    })),
+  ];
+  const { pinned, section, shown, hidden } = visibleDots(tabs, 'work-3');
+
+  assert.equal(pinned.length, 7);
+  assert.deepEqual(section.map((tab) => tab.id), ['work-3']);
+  assert.equal(shown.length, 8);
+  assert.ok(shown.some((tab) => tab.id === 'work-3'));
+  assert.equal(hidden, 5);
+});
+
+test('the active-section window slides to retain a late active tab', () => {
+  const tabs = Array.from({ length: 10 }, (_, index) => ({
+    id: `work-${index}`,
+    groupId: 'work',
+    pinned: false,
+  }));
+  const { section, shown, hidden } = visibleDots(tabs, 'work-9');
+
+  assert.deepEqual(section.map((tab) => tab.id), [
+    'work-2', 'work-3', 'work-4', 'work-5',
+    'work-6', 'work-7', 'work-8', 'work-9',
+  ]);
+  assert.equal(shown.length, 8);
+  assert.equal(hidden, 2);
+});
+
+test('quiet state changes neither direct dots nor the global remainder', () => {
+  const tabs = [
+    { id: 'pin', groupId: null, pinned: true, asleep: false },
+    { id: 'active', groupId: 'work', pinned: false, asleep: false },
+    { id: 'direct-quiet', groupId: 'work', pinned: false, asleep: true },
+    { id: 'overflow-quiet', groupId: 'play', pinned: false, asleep: true },
+  ];
+  const awake = visibleDots(tabs, 'active');
+  const toggled = visibleDots(tabs.map((tab) => ({ ...tab, asleep: !tab.asleep })), 'active');
+
+  assert.deepEqual(awake.shown.map((tab) => tab.id), ['pin', 'active', 'direct-quiet']);
+  assert.deepEqual(toggled.shown.map((tab) => tab.id), ['pin', 'active', 'direct-quiet']);
+  assert.equal(awake.hidden, 1);
+  assert.equal(toggled.hidden, 1);
+});
+
+test('direct dots expose stable tab ids instead of relying on non-unique titles', () => {
+  assert.match(source, /dot\.dataset\.tabId = t\.id/);
+});
+
+test('pinned and active-section dots use spacing alone as their separator', () => {
+  assert.match(source, /sectionNodes\[0\]\.classList\.add\('dot-section-start'\)/);
+  assert.match(styles, /\.island-dot\.dot-section-start\s*\{\s*margin-left:\s*4px;\s*\}/);
+  assert.doesNotMatch(styles, /\.dot-section-start[^}]*border/s);
+});
+
+test('a pinned tab\'s dot is a rounded square with the same footprint (#1176)', () => {
+  assert.match(source, /\(t\.pinned \? ' pinned' : ''\)/, 'every pinned tab, grouped or not, is marked');
+  const rule = styles.match(/\.island-dot\.pinned\s*\{([^}]*)\}/);
+  assert.ok(rule, '.island-dot.pinned is styled');
+  assert.match(rule[1], /border-radius:\s*1\.5px/);
+  assert.doesNotMatch(rule[1], /width|height|margin|padding/, 'the dot keeps its 6px footprint');
+});
+
+test('overflow copy describes the window-wide remainder, not the active group', () => {
+  // Copy lives in the interface catalog (F44); the English is unchanged.
+  const catalog = JSON.parse(require('node:fs').readFileSync(require('node:path').join(__dirname, '../../copy/messages/en.json'), 'utf8'));
+  assert.match(source, /more\.dataset\.tooltip = blancI18n\.t\('pill\.moreTabs', \{ count: hidden \}\)/);
+  assert.equal(catalog['pill.moreTabs'].message,
+    '{count, plural, one {# more tab — open the list} other {# more tabs — open the list}}');
+  assert.doesNotMatch(catalog['pill.moreTabs'].message, /in this group/);
+});
+
+test('a narrow Island shows fewer dots, keeps the active tab and counts the rest', () => {
+  const tabs = Array.from({ length: 12 }, (_, i) => ({ id: `t${i}`, groupId: null, pinned: false }));
+  const full = visibleDots(tabs, 't9');
+  assert.equal(full.shown.length, 8);
+  assert.equal(full.hidden, 4);
+  const narrow = visibleDots(tabs, 't9', 3);
+  assert.equal(narrow.shown.length, 3);
+  assert.ok(narrow.shown.some((tab) => tab.id === 't9'), 'the active tab lost its dot');
+  assert.equal(narrow.hidden, 9);
+  const single = visibleDots(tabs, 't9', 1);
+  assert.deepEqual(single.shown.map((tab) => tab.id), ['t9']);
+  assert.equal(single.hidden, 11);
+  // A standalone pin never pushes the active tab out at the smallest budget.
+  const pinnedFirst = visibleDots([{ id: 'pin', groupId: null, pinned: true }, ...tabs], 't9', 1);
+  assert.deepEqual(pinnedFirst.shown.map((tab) => tab.id), ['t9']);
+});

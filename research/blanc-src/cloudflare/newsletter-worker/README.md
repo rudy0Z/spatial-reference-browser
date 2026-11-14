@@ -1,0 +1,230 @@
+# blanc-newsletter
+
+Consent-first newsletter enrollment for `blanc.day`. An address is not
+a subscriber until its owner follows a one-time confirmation link delivered by
+Resend. The same flow runs a separate Blanc Mail waitlist, and the Worker
+also delivers short ambassador applications to Blanc's support inbox without
+adding applicants to the newsletter or retaining an application database.
+
+## Data and abuse controls
+
+- `POST /subscribe` accepts only the production site origin (plus the local
+  Astro development origin), validates and normalizes the address, and returns
+  an enumeration-resistant generic response.
+- A pending record contains the address, request time, and opaque confirmation
+  and unsubscribe material. It expires after 24 hours.
+- Resend receives the address only to deliver the confirmation message.
+- `GET /confirm?token=...` creates `sub:<email>` only after possession of the
+  mailbox is demonstrated.
+- Confirmed records contain the address, confirmation time, and an opaque
+  unsubscribe token. `GET /unsubscribe?token=...` deletes the record.
+- A valid address caught by the honeypot enters a separate `hp:` quarantine
+  for at most 30 days. It is exported for manual review of autofill false
+  positives, but never mailed or subscribed without a clean re-submission and
+  mailbox confirmation.
+- Per-IP rate-limit keys expire after two minutes; per-address confirmation
+  cooldown keys use an HMAC of the address and expire after ten minutes.
+- Missing mail or token secrets make enrollment return 503. There is no
+  consent-bypassing fallback.
+
+## Resend sync
+
+Release notes and the win-back automation send from the Resend segment
+**Blanc release notes** (`RESEND_SEGMENT_ID` in `wrangler.toml`).
+`src/resend-sync.js` keeps it and the confirmed list in KV in step:
+
+- **Resend → Worker.** A Resend webhook posts `contact.updated` and
+  `contact.deleted` to `POST /resend-webhook`. A contact that is unsubscribed
+  or deleted in Resend loses its `sub:` record and removal lookup. Only a
+  request with a valid Svix signature (`RESEND_WEBHOOK_SECRET`, at most five
+  minutes old) can remove anyone; without the secret the endpoint returns 503.
+- **Worker → Resend**, only when `RESEND_CONTACTS_API_KEY` is set. Confirming
+  adds the address to the segment, creating the contact if Resend does not
+  have it. The Worker's own unsubscribe link and `DELETE /subscriber` remove it
+  from the segment. A failed call is logged by name, without the address, and
+  never undoes the person's confirmation or unsubscribe.
+
+Resend's `unsubscribed` flag covers the whole Resend account, which other
+brands share, so the Worker never sets or clears it; it changes only segment
+membership. One consequence: an address already unsubscribed in Resend that
+confirms here is removed again by the next webhook, and needs the flag cleared
+in Resend to rejoin. Removing a contact from the segment by hand in Resend does
+not remove it here; unsubscribe or delete it instead. The Blanc Mail waitlist
+is not synced.
+
+Contact calls need a full-access Resend key, so `RESEND_CONTACTS_API_KEY` is
+separate from the send-only `RESEND_API_KEY`, and the Worker runs without it
+(webhook direction only).
+
+Webhook setup: in Resend, add a webhook to
+`https://blanc-newsletter.bnfy-441.workers.dev/resend-webhook` for
+`contact.updated` and `contact.deleted`, then install its signing secret:
+
+```sh
+op run --env-file=../.env.1password -- npx wrangler secret put RESEND_WEBHOOK_SECRET
+```
+
+## Blanc Mail waitlist
+
+- `POST /mail-waitlist` runs the newsletter's double opt-in against its own
+  KV prefixes (`mailwait:`, `mailwait-pending:`, `mailwait-sent:`,
+  `mailwait-hp:`, `mailwait-leave:`) and its own per-IP rate-limit scope. No
+  waitlist prefix begins with a newsletter prefix, so the newsletter export,
+  removal and confirmation paths never see a waitlist record.
+- `GET /mail-waitlist/confirm?token=...` creates `mailwait:<email>`; a
+  newsletter `/confirm` cannot redeem a waitlist token, or the reverse.
+  `GET /mail-waitlist/leave?token=...` deletes the record.
+- The confirmation email states that joining does not subscribe the address to
+  the newsletter and that the address is deleted after the launch
+  announcement. The privacy page's "Blanc Mail waitlist" section and
+  `site/src/components/MailWaitlistForm.astro` describe the same contract;
+  change all three together.
+- The waitlist may be used only for the Blanc Mail launch announcement and any
+  pre-release invitation. Every message must include the member's exact
+  `unsubscribeUrl` from the export. After the launch announcement is sent,
+  purge the whole list (below).
+
+## Signup alerts
+
+- When an address confirms a newsletter subscription or a place on the Blanc
+  Mail waitlist for the first time, the Worker emails `SIGNUP_ALERT_TO` (a
+  `[vars]` entry, `support@blanc.day`) with the address, the confirmation time
+  and that list's new total, in the branded layout.
+- Re-confirming an address already on the list and the Resend sync send no
+  alert. Removing `SIGNUP_ALERT_TO` turns alerts off.
+- A failed alert is logged as `signup-alert-not-sent` and never affects the
+  subscriber's confirmation.
+
+## Ambassador applications
+
+- `POST /ambassador-apply` accepts JSON from the interactive page or a native
+  form-encoded POST fallback. Both carry a name, email address, HTTPS
+  creator-profile URL, short introduction, and hidden honeypot, and both are
+  accepted only from the same allowed site origins as the newsletter form.
+- Valid applications are sent through Resend to the fixed `AMBASSADOR_TO`
+  address. The applicant's address is included in the delivered application
+  and used as its reply-to address.
+- Applications are not written to Workers KV and do not create newsletter
+  subscriptions. Resend and the receiving support mailbox process the message
+  for delivery and review.
+- The endpoint uses a separate Cloudflare rate-limiting binding. A honeypot
+  submission is rejected rather than receiving a false delivery confirmation.
+- Missing mail configuration or failed delivery returns 503; there is no
+  mail-client or silent-storage fallback.
+
+The export includes an unsubscribe URL for every confirmed address and a
+separate `quarantined` review list. Any release-notes sending process must use
+only `subscribers` and include the exact one-click URL in each message.
+
+## Deploy
+
+The Resend sending domain must be verified before deploy. `NEWSLETTER_FROM` in
+`wrangler.toml` must be an address on that domain. `deploy.mjs` retrieves the
+domain from Resend's authenticated `GET /domains/:domain_id` API and refuses to
+run Wrangler unless its status is exactly `verified` and it covers the sender
+host. Do not bypass this gate with a direct `wrangler deploy`.
+
+Required Worker secrets:
+
+- `ADMIN_TOKEN` — protects export and administrative removal;
+- `NEWSLETTER_TOKEN_SECRET` — HMAC key for address cooldowns;
+- `RESEND_API_KEY` — restricted Resend key for confirmation delivery;
+- `RESEND_WEBHOOK_SECRET` — signing secret of the Resend contact webhook
+  (see *Resend sync*);
+- `RESEND_CONTACTS_API_KEY` (optional) — the full-access key that lets
+  confirmations and unsubscribes here update the Resend segment.
+
+The deployment process also requires `RESEND_DEPLOY_API_KEY` (a full-access
+Resend key capable of retrieving domain status) and `RESEND_DOMAIN_ID` in its
+local environment. The full-access deploy key is local preflight authority only:
+never install it as a Worker secret. `RESEND_CONTACTS_API_KEY`, when used, is
+its own full-access key, created for this Worker alone so it can be revoked
+without touching deploys. The Worker keeps the separate restricted
+`RESEND_API_KEY` for confirmation delivery.
+
+`.env.1password` in this directory supplies everything `npm run deploy` needs:
+the Cloudflare token (the same item as `../.env.1password`), the deploy key
+from the 1Password item **Resend Deploy API Key blancbrowser** (vault Dev,
+`credential` field), and the literal ID of the `updates.blancbrowser.com`
+Resend domain, which is not a secret on its own. The shared
+`../.env.1password` holds only the Cloudflare token, so it is enough for
+`wrangler secret put` but not for the deploy gate. Before the first deploy,
+create that 1Password item with a full-access key from Resend's API Keys page.
+
+The 1Password CLI must be connected to the desktop app: in 1Password, open
+Settings → Developer and turn on **Integrate with 1Password CLI**. If `op`
+instead offers to add an account manually, cancel and turn that setting on.
+
+```sh
+cd cloudflare/newsletter-worker
+
+op run --env-file=../.env.1password -- npx wrangler secret put ADMIN_TOKEN
+op run --env-file=../.env.1password -- npx wrangler secret put NEWSLETTER_TOKEN_SECRET
+op run --env-file=../.env.1password -- npx wrangler secret put RESEND_API_KEY
+op run --env-file=.env.1password -- npm run deploy
+```
+
+After deploy, test from `https://blanc.day`, confirm delivery, follow the
+link, export the record, and follow its unsubscribe URL. Also submit a test
+ambassador application and confirm it reaches `AMBASSADOR_TO`. A release must
+not publish the revised newsletter or application/privacy claims until these
+end-to-end checks pass in production.
+
+## Export confirmed subscribers
+
+```sh
+curl -H "Authorization: Bearer $(op read 'op://Dev/Blanc Newsletter Admin/password')" \
+  https://blanc-newsletter.bnfy-441.workers.dev/subscribers
+```
+
+The response separates confirmed recipients from the manual-review quarantine:
+
+```json
+{
+  "count": 1,
+  "subscribers": [{
+    "email": "a@example.com",
+    "ts": "2026-08-12T10:00:00.000Z",
+    "unsubscribeUrl": "https://blanc-newsletter.bnfy-441.workers.dev/unsubscribe?token=..."
+  }],
+  "quarantined": [{
+    "email": "possible-autofill@example.com",
+    "ts": "2026-08-12T10:05:00.000Z"
+  }]
+}
+```
+
+Never send to `quarantined`. A plausible autofill false positive can be
+rescued only by a new clean `/subscribe` request and the normal confirmation
+link; bot entries expire automatically.
+
+## Administrative deletion
+
+```sh
+curl -X DELETE \
+  -H "Authorization: Bearer $(op read 'op://Dev/Blanc Newsletter Admin/password')" \
+  "https://blanc-newsletter.bnfy-441.workers.dev/subscriber?email=a@example.com"
+```
+
+The endpoint returns 204 whether or not the address existed and deletes the
+confirmed record, associated unsubscribe lookup, and quarantine record when
+present.
+
+## Blanc Mail waitlist export, removal and purge
+
+```sh
+ADMIN="Authorization: Bearer $(op read 'op://Dev/Blanc Newsletter Admin/password')"
+# Export: same shape as /subscribers; unsubscribeUrl is the waitlist removal link.
+curl -H "$ADMIN" https://blanc-newsletter.bnfy-441.workers.dev/mail-waitlist/members
+# Remove one address.
+curl -X DELETE -H "$ADMIN" \
+  "https://blanc-newsletter.bnfy-441.workers.dev/mail-waitlist/member?email=a@example.com"
+# After the launch announcement: delete every waitlist record.
+curl -X DELETE -H "$ADMIN" \
+  "https://blanc-newsletter.bnfy-441.workers.dev/mail-waitlist/members?confirm=delete-all"
+```
+
+The purge refuses to run without `confirm=delete-all`, deletes every
+`mailwait*` key (confirmed, removal lookup, quarantine, pending and cooldown),
+leaves newsletter records untouched, and returns `{"deleted": <confirmed
+count>}`.

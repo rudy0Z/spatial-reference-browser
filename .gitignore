@@ -1,0 +1,26 @@
+# Spatial Reference Browser monorepo — root .gitignore
+
+# Dependencies
+**/node_modules/
+
+# Build outputs (Vite, electron-builder, Rust)
+**/dist/
+**/target/
+**/dist-workspace/
+
+# ZCode harness state (workflow drafts/journals, viz contracts) — machine-owned
+.zcode/
+.v2c/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & temp
+*.log
+*.tmp
+
+# Environment / secrets — never commit
+.env
+.env.*

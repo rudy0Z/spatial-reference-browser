@@ -1,0 +1,66 @@
+const { setWorldConstructor } = require('@cucumber/cucumber');
+const ctx = require('./context');
+const { callTestHook } = require('./test-hook-call');
+
+// The World is the per-scenario `this` in steps. It wraps the running Electron
+// app with a generic bridge into the test hook (globalThis.__blanc) plus a few
+// polling helpers for the parts of app state that settle asynchronously
+// (a WebContentsView's URL isn't final until its navigation commits).
+class BlancWorld {
+  /** Invoke a globalThis.__blanc method in the Electron main process. */
+  async call(method, ...args) {
+    return callTestHook(ctx.app, method, args);
+  }
+
+  /** Snapshot of tab/group/active state from the main process. */
+  state() {
+    return this.call('state');
+  }
+
+  /** Poll state() until `predicate(state)` is truthy, or throw on timeout. */
+  async waitForState(predicate, { timeout = 5000, interval = 100 } = {}) {
+    const deadline = Date.now() + timeout;
+    let last;
+    for (;;) {
+      last = await this.state();
+      if (predicate(last)) return last;
+      if (Date.now() > deadline) {
+        throw new Error(`waitForState timed out; last state: ${JSON.stringify(last)}`);
+      }
+      await new Promise((r) => setTimeout(r, interval));
+    }
+  }
+
+  /** Local, offline-loadable URL for a logical page name. */
+  fixtureUrl(name) {
+    return `${ctx.fixturesBase}/site/${encodeURIComponent(name)}`;
+  }
+
+  /** The same fixture, reached through the insecure.test hostname the harness
+   * maps to loopback — a plain-HTTP page whose HOSTNAME is not loopback, so
+   * the connection model reads it as 'http' rather than 'local'. */
+  insecureFixtureUrl(name) {
+    return this.fixtureUrl(name).replace('127.0.0.1', 'insecure.test');
+  }
+
+  /** A real https-committed fixture: TLS on loopback behind the secure.test
+   * mapping, trusted only via the per-run SPKI pin the harness passes at
+   * launch. */
+  secureFixtureUrl(name) {
+    return `${ctx.secureFixturesBase}/site/${encodeURIComponent(name)}`;
+  }
+
+  /** HTTPS served with a separate self-signed key that is deliberately not
+   * present in Chromium's per-run SPKI allowlist. */
+  untrustedFixtureUrl(name) {
+    return `${ctx.untrustedFixturesBase}/site/${encodeURIComponent(name)}`;
+  }
+
+  /** HTTPS on a local-use name with its own key, absent from the SPKI
+   *  allowlist unless the trusted pair is swapped in (F39-2..7). */
+  localFixtureUrl(name, query = '', host = 'nas.home.arpa') {
+    return `https://${host}:${ctx.localFixturesPort}/site/${encodeURIComponent(name)}${query}`;
+  }
+}
+
+setWorldConstructor(BlancWorld);

@@ -1,0 +1,313 @@
+'use strict';
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+async function evidence(page, name, nativeCapture = false) {
+  if (!process.env.BLANC_WORKSPACE_EVIDENCE_DIR) return;
+  await page.evaluate(() => Promise.all(document.getAnimations().filter((animation) => animation.effect?.getTiming().iterations !== Infinity).map((animation) => animation.finished.catch(() => {}))));
+  fs.mkdirSync(process.env.BLANC_WORKSPACE_EVIDENCE_DIR, { recursive: true });
+  const target = path.join(process.env.BLANC_WORKSPACE_EVIDENCE_DIR, `${name}.png`);
+  if (nativeCapture) {
+    // CDP's viewport screenshot clips Electron views using unscaled CSS
+    // coordinates after setZoomFactor. Capture the whole native view instead.
+    const png = await ctx.app.evaluate(async ({ webContents }) => {
+      const view = webContents.getAllWebContents().find((wc) => wc.getURL() === 'blanc-chrome://overlay/');
+      return (await view.capturePage()).toPNG().toString('base64');
+    });
+    fs.writeFileSync(target, Buffer.from(png, 'base64'));
+  } else await page.screenshot({ path: target });
+}
+const { Given, When, Then } = require('@cucumber/cucumber');
+const { overlayPage } = require('../support/overlay');
+const ctx = require('../support/context');
+const { openOverlaySurface, waitForValue } = require('../support/poll');
+
+Given('a named workspace with a live unsaved draft', async function () {
+  this.draftId = await this.call('openTab', this.fixtureUrl('workspace-draft'));
+  await this.waitForState((s) => s.tabs.some((t) => t.id === this.draftId && t.title === 'workspace-draft' && !t.isLoading));
+  await this.call('workspacePageScript', this.draftId, `(() => {
+    const field = document.createElement('textarea'); field.id = 'draft'; field.value = 'unsaved workspace draft'; document.body.append(field);
+    sessionStorage.setItem('workspace-draft', 'keep');
+    window.addEventListener('beforeunload', event => { event.preventDefault(); event.returnValue = ''; });
+    history.pushState({}, '', '#keep-history'); return true;
+  })()`);
+  this.draftIdentity = await this.call('workspacePageIdentity', this.draftId);
+  // Reset also opens a Start Page. All pages, not only the draft, must finish
+  // loading before the next step exercises a Workspace switch.
+  await this.waitForState(state => state.tabs.every(tab => !tab.isLoading));
+  const saved = await this.call('workspaceAction', 'save', 'Draft workspace'); assert.equal(saved.ok, true);
+  this.workspaceA = saved.workspace.id;
+});
+When('I switch to another named workspace and back', async function () {
+  this.workspaceMetricsBefore = await this.call('workspaceAction', 'metrics');
+  this.switchStarted = performance.now();
+  const made = await this.call('workspaceAction', 'create', 'Second workspace'); assert.equal(made.ok, true, JSON.stringify(made)); this.workspaceB = made.workspaceId;
+  await this.waitForState((s) => s.tabs.every((t) => !t.isLoading));
+  const back = await this.call('workspaceAction', 'open', this.workspaceA); assert.equal(back.ok, true, JSON.stringify(back));
+  if (process.env.BLANC_WORKSPACE_EVIDENCE_DIR) {
+    fs.mkdirSync(process.env.BLANC_WORKSPACE_EVIDENCE_DIR, { recursive: true });
+    fs.writeFileSync(path.join(process.env.BLANC_WORKSPACE_EVIDENCE_DIR, 'candidate-measurement.json'), JSON.stringify({ before: this.workspaceMetricsBefore, after: await this.call('workspaceAction', 'metrics'), roundTripIncludingIPCAndLoadMs: performance.now() - this.switchStarted }, null, 2));
+  }
+});
+Then('the original page identity and draft are unchanged', async function () {
+  assert.equal(await this.call('workspacePageIdentity', this.draftId), this.draftIdentity);
+  const values = await this.call('workspacePageScript', this.draftId, `({draft: document.querySelector('#draft').value, storage: sessionStorage.getItem('workspace-draft'), hash: location.hash})`);
+  assert.deepEqual(values, { draft: 'unsaved workspace draft', storage: 'keep', hash: '#keep-history' });
+});
+When('I open a private tab and select the current named workspace', async function () {
+  this.privateId = await this.call('openTab', this.fixtureUrl('workspace-private'), { private: true });
+  this.workspaceResult = await this.call('workspaceAction', 'open', this.workspaceA);
+});
+Then('the workspace action is a no-op and both pages remain open', async function () {
+  assert.equal(this.workspaceResult.action, 'noop'); const state = await this.state();
+  assert.ok(state.tabs.some((t) => t.id === this.draftId)); assert.ok(state.tabs.some((t) => t.private));
+});
+Given('two named workspaces for editing', async function () {
+  this.workspaceA = (await this.call('workspaceAction', 'save', 'First workspace')).workspace.id;
+  this.workspaceB = (await this.call('workspaceAction', 'save', 'Second workspace')).workspace.id;
+});
+When('I rename one workspace to the other workspace name', async function () {
+  await openOverlaySurface(this, 'openPanel', 'panel'); const page = await overlayPage();
+  await page.click('#footerWorkspace');
+  await page.getByRole('button', { name: 'Edit First workspace', exact: true }).click();
+  await page.fill('#workspaceName', 'Second workspace');
+  await page.locator('#workspaceName').evaluate((input) => input.setSelectionRange(2, 6));
+});
+Then('the name and validation error stay visible in the workspace editor', async function () {
+  const page = await overlayPage(); await page.waitForFunction(() => document.getElementById('workspaceEditorError')?.textContent.includes('already in use'));
+  assert.equal(await page.inputValue('#workspaceName'), 'Second workspace'); assert.equal(await page.getAttribute('#workspaceName', 'aria-invalid'), 'true');
+  assert.deepEqual(await page.locator('#workspaceName').evaluate((input) => ({ focused: input === document.activeElement, start: input.selectionStart, end: input.selectionEnd })), { focused: true, start: 2, end: 6 });
+  assert.equal(await page.isVisible('[data-focus-key="new"]'), false);
+  await evidence(page, 'rename-validation');
+});
+When('I try switching with a private page and type a slash query', async function () {
+  const target = await this.call('workspaceAction', 'save', 'Target workspace'); this.targetWorkspace = target.workspace.id;
+  await this.call('openTab', this.fixtureUrl('workspace-private'), { private: true });
+  await this.waitForState((s) => s.tabs.some((t) => t.private && t.title === 'workspace-private' && !t.isLoading));
+  await openOverlaySurface(this, 'openPanel', 'panel'); const page = await overlayPage(); await page.click('#footerWorkspace');
+  await page.getByRole('button', { name: /Draft workspace · Open space/ }).click();
+  await page.waitForSelector('.ws-decision'); await page.fill('#addressInput', '/settings');
+});
+Then('the private switch decision remains visible', async function () {
+  const page = await overlayPage(); assert.equal(await page.isVisible('.ws-decision'), true);
+  assert.ok((await page.textContent('.ws-decision')).includes('private'));
+  // Typing reshaped the panel; the menu still hangs 6px below its bottom edge
+  // and never over it (spec D18).
+  await page.waitForFunction(() => {
+    const panel = document.getElementById('islandPanel').getBoundingClientRect();
+    const menu = document.getElementById('workspaceSwitcher').getBoundingClientRect();
+    return Math.abs(menu.top - (panel.bottom + 6)) <= 1;
+  }, null, { timeout: 3000 }).catch(async () => {
+    const geometry = await page.evaluate(() => ({ panel: document.getElementById('islandPanel').getBoundingClientRect().bottom, menu: document.getElementById('workspaceSwitcher').getBoundingClientRect().top }));
+    assert.fail(`the menu does not follow the panel: ${JSON.stringify(geometry)}`);
+  });
+  await page.locator('#backdrop').click({ position: { x: 4, y: 4 } });
+  assert.equal(await page.isVisible('.ws-decision'), true, 'outside clicks must not bypass the explicit workspace decision');
+  await evidence(page, 'private-decision-search');
+});
+When('I close its ordinary pages leaving only a private page', async function () {
+  await this.call('openTab', this.fixtureUrl('workspace-private'), { private: true });
+  const state = await this.state(); for (const tab of state.tabs.filter((t) => !t.private)) await this.call('closeTab', tab.id);
+  assert.equal((await this.call('workspaceAction', 'flush')).ok, true);
+});
+Then('the saved workspace has no ordinary tabs', async function () {
+  const data = await this.call('workspaceAction', 'list'); assert.equal(data.items.find((w) => w.id === this.workspaceA).tabCount, 0);
+});
+
+When('I quiet a grouped pinned page and switch away', async function () {
+  // This scenario tests ownership of a quiet tab, not the optional
+  // storage-bearing renderer-discard path. Avoid the general fixture's load
+  // counter, which can correctly keep a shared/uncertain renderer awake.
+  this.quietId = await this.call('openTab', this.insecureFixtureUrl('workspace-quiet') + '?nostore=1');
+  await this.waitForState((s) => s.tabs.some((t) => t.id === this.quietId && t.title === 'workspace-quiet' && !t.isLoading));
+  await this.call('pinTab', this.quietId);
+  await this.call('groupTabByName', this.quietId, 'Research');
+  await this.call('activateTab', this.draftId);
+  // Quieting is deliberately best-effort: a cold/throttled CI renderer can
+  // miss its first dirty-probe budget. Retry the ordinary safe operation;
+  // never force destruction or relax the app's eligibility checks.
+  await waitForValue(() => this.call('sleepTab', this.quietId), value => value === true, 'eligible fixture page to become quiet');
+  await this.waitForState(state => state.tabs.every(tab => !tab.isLoading));
+  const made = await this.call('workspaceAction', 'create', 'Away'); assert.equal(made.ok, true, JSON.stringify(made));
+});
+Then('inactive navigation belongs to the original workspace and its quiet tab survives', async function () {
+  await this.call('workspacePageScript', this.draftId, `history.pushState({}, '', '#inactive-navigation'); document.title = 'Inactive workspace'; true`);
+  const popupDenied = await this.call('workspacePageScript', this.draftId, `window.open('about:blank') === null`); assert.equal(popupDenied, true);
+  const authStatus = await this.call('workspacePageScript', this.draftId, `fetch('/workspace-auth').then(response => response.status)`); assert.equal(authStatus, 401);
+  const downloadDenied = ctx.app.evaluate(({ webContents }, id) => new Promise((resolve) => {
+    const wc = webContents.fromId(id);
+    wc.session.once('will-download', (event) => resolve(event.defaultPrevented));
+    wc.downloadURL(new URL('/workspace-download', wc.getURL()).href);
+  }), this.draftIdentity);
+  assert.equal(await downloadDenied, true);
+  await this.waitForState((s) => s.tabs.every((t) => !t.isLoading));
+  const opened = await this.call('workspaceAction', 'open', this.workspaceA); assert.equal(opened.ok, true, JSON.stringify(opened));
+  const state = await this.state(); const quiet = state.tabs.find((t) => t.id === this.quietId);
+  assert.equal(quiet.asleep, true); assert.equal(quiet.pinned, true); assert.ok(quiet.groupId);
+  assert.equal(await this.call('workspacePageIdentity', this.draftId), this.draftIdentity);
+  assert.equal(await this.call('workspacePageScript', this.draftId, 'location.hash'), '#inactive-navigation');
+});
+When('I switch away and delete the inactive workspace', async function () {
+  await this.waitForState(state => state.tabs.every(tab => !tab.isLoading));
+  assert.equal((await this.call('workspaceAction', 'create', 'Away')).ok, true);
+  assert.equal((await this.call('workspaceAction', 'remove', this.workspaceA)).ok, true);
+});
+Then('the deleted workspace draft remains in a visible unsaved window', async function () {
+  const windows = await this.call('windowRuntimes'); const owner = windows.find((w) => w.tabs.some((t) => t.id === this.draftId));
+  assert.equal(owner.attached, true); assert.equal(await this.call('workspacePageIdentity', this.draftId), this.draftIdentity);
+  const data = await this.call('workspaceActionInWindow', owner.id, 'list'); assert.equal(data.items.some((w) => w.active), false); assert.ok(data.deleted.some((w) => w.id === this.workspaceA));
+});
+Given('twenty five named workspaces with long names', async function () {
+  for (let i = 0; i < 25; i++) assert.equal((await this.call('workspaceAction', 'save', `${String(i + 1).padStart(2, '0')} A long research workspace name with expanded descriptions`)).ok, true);
+});
+Then('the workspace list scrolls while creation controls remain visible', async function () {
+  const checkFooter = async (page) => {
+    await page.evaluate(() => document.fonts.ready);
+    await page.waitForFunction(() => !document.querySelector('#islandPanel.morph-start, #islandPanel.morph-run, #islandPanel.retracting'));
+    const geometry = await page.evaluate(() => {
+      const footer = document.getElementById('islandFooter').getBoundingClientRect();
+      // A hidden button (Other devices with no device to show) takes no space.
+      const rects = [...document.querySelectorAll('#islandFooter button')].filter((button) => !button.hidden)
+        .map((button) => ({ id: button.id, rect: button.getBoundingClientRect().toJSON() }));
+      const spaces = document.getElementById('footerWorkspace');
+      return { viewport: { width: innerWidth, height: innerHeight }, footer: footer.toJSON(), rects, spacesText: spaces.textContent.trim(), spacesTitle: spaces.dataset.tooltip };
+    });
+    // The Spaces button is icon-only: a long name lives in its tooltip.
+    assert.equal(geometry.spacesText, '', 'the footer shows no space name');
+    assert.match(geometry.spacesTitle, /A long research workspace name/);
+    assert.ok(geometry.footer.left >= -1 && geometry.footer.right <= geometry.viewport.width + 1, 'footer must stay inside the viewport');
+    assert.ok(geometry.footer.top >= -1 && geometry.footer.bottom <= geometry.viewport.height + 1, 'footer controls must remain visible vertically');
+    const workspace = geometry.rects.find((entry) => entry.id === 'footerWorkspace').rect;
+    const favorites = geometry.rects.find((entry) => entry.id === 'footerFavorites').rect;
+    assert.ok(Math.abs(workspace.width - favorites.width) <= 1, 'the Spaces button is the size of the other footer buttons');
+    for (const { id, rect } of geometry.rects) {
+      assert.ok(rect.left >= geometry.footer.left - 1 && rect.right <= geometry.footer.right + 1, `${id} must fit inside the footer: ${JSON.stringify(geometry)}`);
+      assert.ok(rect.top >= geometry.footer.top - 1 && rect.bottom <= geometry.footer.bottom + 1, `${id} must fit vertically`);
+    }
+    for (let i = 0; i < geometry.rects.length; i++) for (let j = i + 1; j < geometry.rects.length; j++) {
+      const a = geometry.rects[i].rect, b = geometry.rects[j].rect;
+      assert.ok(a.right <= b.left + 1 || b.right <= a.left + 1 || a.bottom <= b.top + 1 || b.bottom <= a.top + 1, 'footer buttons must not overlap');
+    }
+  };
+  await ctx.app.evaluate(({ BrowserWindow }) => { const window = BrowserWindow.getAllWindows().find((w) => w.webContents.getURL() === 'blanc-chrome://index/'); window.setSize(640, 480); });
+  // Measure with the Other devices toggle showing: the longest footer line.
+  // Opening the panel reloads devices from the real (disabled) sync cache, so
+  // the fixture goes in once that refresh has settled.
+  const showDevices = async (overlay) => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await this.call('injectRemoteDevices');
+    await overlay.locator('#footerDevices').waitFor({ state: 'visible' });
+  };
+  await openOverlaySurface(this, 'openPanel', 'panel'); const page = await overlayPage();
+  await showDevices(page);
+  await checkFooter(page); await evidence(page, 'compact-footer-long-name');
+  await page.click('#footerWorkspace');
+  const geometry = await page.evaluate(() => {
+    const list = document.getElementById('workspaceSwitcherList'); const popup = document.getElementById('workspaceSwitcher').getBoundingClientRect();
+    const create = document.querySelector('[data-focus-key="new"]').getBoundingClientRect();
+    list.scrollTop = list.scrollHeight;
+    return { scroll: list.scrollHeight > list.clientHeight, popupTop: popup.top, popupBottom: popup.bottom, createBottom: create.bottom, height: innerHeight, rows: list.querySelectorAll('.ws-row').length };
+  });
+  assert.equal(geometry.rows, 25); assert.equal(geometry.scroll, true); assert.ok(geometry.popupTop >= 0 && geometry.popupBottom <= geometry.height); assert.ok(geometry.createBottom <= geometry.height);
+  await evidence(page, 'long-workspace-list');
+  await this.call('setTabLayout', 'vertical');
+  await openOverlaySurface(this, 'openPanel', 'panel');
+  await showDevices(page);
+  await page.waitForFunction(() => !document.querySelector('#islandPanel.morph-start, #islandPanel.morph-run, #islandPanel.retracting'));
+  await page.click('#footerWorkspace');
+  await ctx.app.evaluate(({ webContents }) => { webContents.getAllWebContents().find((wc) => wc.getURL() === 'blanc-chrome://overlay/').setZoomFactor(1.25); });
+  // Native zoom, the renderer resize event, and popup placement settle
+  // asynchronously. Measure a stable rectangle at the actual target zoom,
+  // not an arbitrary 100ms into that sequence. A stable overflow still fails.
+  let previousScaled;
+  const scaled = await waitForValue(async () => {
+    const bounds = await this.call('overlayBounds');
+    const value = await page.evaluate(() => {
+      const popup = document.getElementById('workspaceSwitcher').getBoundingClientRect();
+      const button = document.querySelector('[data-focus-key="new"]').getBoundingClientRect();
+      return { top: popup.top, bottom: popup.bottom, left: popup.left, right: popup.right, width: innerWidth, height: innerHeight, buttonBottom: button.bottom, buttonHeight: button.height };
+    });
+    return { ...value, nativeWidth: bounds.width, nativeHeight: bounds.height };
+  }, value => {
+    const stable = previousScaled && Object.keys(value).every(key => value[key] === previousScaled[key]);
+    previousScaled = value;
+    return stable && Math.abs(value.width - value.nativeWidth / 1.25) <= 1 && Math.abs(value.height - value.nativeHeight / 1.25) <= 1;
+  }, '125% Workspace popup geometry to settle');
+  assert.ok(scaled.top >= 0 && scaled.bottom <= scaled.height + 1, `zoomed popup must fit vertically: ${JSON.stringify(scaled)}`);
+  assert.ok(scaled.left >= 0 && scaled.right <= scaled.width + 1, `zoomed popup must fit horizontally: ${JSON.stringify(scaled)}`);
+  assert.ok(scaled.buttonBottom <= scaled.height + 1); assert.ok(scaled.buttonHeight >= 24);
+  await evidence(page, 'long-workspace-list-vertical-125percent', true);
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('#workspaceSwitcher', { state: 'hidden' });
+  await checkFooter(page); await evidence(page, 'compact-footer-vertical-125percent', true);
+  // Cover both native shortcut widths on every platform: macOS alone must
+  // not let the longer Windows/Linux labels escape the regression check.
+  // Only New tab shows its shortcut inline; Private carries it in the tooltip.
+  const privatePill = await page.evaluate(() => {
+    const button = document.getElementById('footerNewPrivate');
+    return { kbd: button.querySelectorAll('.footer-kbd').length, title: button.dataset.tooltip };
+  });
+  assert.equal(privatePill.kbd, 0, 'the Private pill shows no inline shortcut');
+  assert.match(privatePill.title, /N\)$/, 'the Private pill names its shortcut in the tooltip');
+  const nativeShortcut = await page.evaluate(() => document.getElementById('footerNewTabKbd').textContent);
+  try {
+    for (const shortcut of ['⌘T', 'ctrl+T']) {
+      await page.evaluate(value => { document.getElementById('footerNewTabKbd').textContent = value; }, shortcut);
+      await checkFooter(page);
+      await evidence(page, shortcut.startsWith('ctrl') ? 'compact-footer-control-labels-125percent' : 'compact-footer-command-labels-125percent', true);
+    }
+  } finally {
+    await page.evaluate(value => { document.getElementById('footerNewTabKbd').textContent = value; }, nativeShortcut);
+  }
+  await ctx.app.evaluate(({ BrowserWindow, webContents }) => { webContents.getAllWebContents().find((wc) => wc.getURL() === 'blanc-chrome://overlay/').setZoomFactor(1); BrowserWindow.getAllWindows().find((w) => w.webContents.getURL() === 'blanc-chrome://index/').setSize(1280, 800); });
+  await this.call('setTabLayout', 'island');
+});
+Given('a private-only secondary window bound to a named workspace', async function () {
+  this.secondary = await this.call('openNewWindow');
+  const ordinary = await this.call('openTabInWindow', this.secondary, this.fixtureUrl('workspace-close'));
+  this.closedWorkspace = (await this.call('workspaceActionInWindow', this.secondary, 'save', 'Close empty')).workspace.id;
+  await this.call('openTabInWindow', this.secondary, this.fixtureUrl('workspace-private'), { private: true });
+  const windows = await this.call('windowRuntimes'); const target = windows.find((w) => w.id === this.secondary);
+  for (const tab of target.tabs.filter((t) => !t.private)) await this.call('closeTabInWindow', this.secondary, tab.id);
+});
+When('I close that window and reopen its workspace', async function () {
+  assert.equal(await this.call('closeWindowRuntime', this.secondary), true);
+  await waitForValue(() => this.call('windowRuntimes'), windows => !windows.some(window => window.id === this.secondary), 'secondary window to finish closing');
+  const opened = await this.call('workspaceAction', 'open', this.closedWorkspace, { newWindow: true }); assert.equal(opened.ok, true, JSON.stringify(opened)); this.reopenedWindow = opened.windowId;
+});
+Then('no removed ordinary page is restored', async function () {
+  const windows = await this.call('windowRuntimes'); const target = windows.find((w) => w.id === this.reopenedWindow);
+  assert.ok(target); assert.equal(target.tabs.length, 1); assert.equal(target.tabs[0].url, 'blanc://newtab/');
+});
+
+When('the incoming workspace session commit fails', async function () {
+  // The reset-created New Tab can still be loading after the draft is ready.
+  // Reach the intended commit-failure path without bypassing that safeguard.
+  await this.waitForState(state => state.tabs.every(tab => !tab.isLoading));
+  const result = await this.call('workspaceAction', 'fail-session-commit', 'Commit fails');
+  assert.equal(result.ok, false); assert.equal(result.error, 'saved-not-opened', JSON.stringify(result)); assert.equal(result.cause, 'storage-failed');
+  const data = await this.call('workspaceAction', 'list');
+  assert.equal(data.items.find((w) => w.active).id, this.workspaceA);
+  assert.equal(data.items.find((w) => w.id === result.workspaceId)?.name, 'Commit fails', 'the durably saved workspace remains discoverable');
+});
+When('I explicitly close a private page while switching and return', async function () {
+  await this.call('openTab', this.fixtureUrl('workspace-private'), { private: true });
+  await this.waitForState((s) => s.tabs.some((t) => t.private && t.title === 'workspace-private' && !t.isLoading));
+  const guard = await this.call('workspaceAction', 'create', 'Private close target'); assert.equal(guard.error, 'unsaved-scratch');
+  const created = await this.call('workspaceAction', 'create', 'Private close target', { decision: guard.decision }); assert.equal(created.ok, true, JSON.stringify(created));
+  await this.waitForState((s) => s.tabs.every((t) => !t.isLoading));
+  assert.equal((await this.call('workspaceAction', 'open', this.workspaceA)).ok, true);
+  const state = await this.state(); assert.equal(state.tabs.some((t) => t.private), false); assert.equal(state.activeTabId, this.draftId);
+});
+When('I save this window as a space named {string} from the switcher', async function (name) {
+  await openOverlaySurface(this, 'openPanel', 'panel'); const page = await overlayPage();
+  await page.click('#footerWorkspace');
+  await page.click('[data-focus-key="new"]');
+  await page.click('[data-focus-key="start:window"]');
+  await page.fill('#workspaceName', name);
+  await page.getByRole('button', { name: 'Create space', exact: true }).click();
+});
+Then('a space named {string} is saved and this window is in it', async function (name) {
+  const data = await waitForValue(() => this.call('workspaceAction', 'list'), (d) => d.items.some((w) => w.name === name), `space ${name}`);
+  assert.equal(data.items.find((w) => w.name === name).active, true);
+});

@@ -1,0 +1,131 @@
+import assert from 'node:assert/strict';
+import { after, before, test } from 'node:test';
+import { chromium, webkit } from 'playwright';
+
+const baseURL = process.env.BLANC_SITE_URL || 'http://127.0.0.1:4322';
+const routes = ['start-page', 'glance', 'workspaces', 'profiles', 'reopen-closed-tabs'];
+const linkTab = process.env.BLANC_SITE_BROWSER === 'webkit' && process.platform === 'darwin' ? 'Alt+Tab' : 'Tab';
+let browser;
+before(async () => { browser = await (process.env.BLANC_SITE_BROWSER === 'webkit' ? webkit : chromium).launch(); });
+after(async () => { await browser?.close(); });
+
+async function contextFor(options = {}) {
+  const context = await browser.newContext({ reducedMotion: 'reduce', ...options });
+  await context.route('**/*', route => new URL(route.request().url()).origin === new URL(baseURL).origin ? route.continue() : route.abort());
+  await context.addInitScript(() => localStorage.setItem('measurement-consent-v2', 'denied'));
+  return context;
+}
+
+test('new feature breadcrumbs stay lowercase and native corners have no black backing', async () => {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, reducedMotion: 'reduce' });
+  await context.route('**/*', route => new URL(route.request().url()).origin === new URL(baseURL).origin ? route.continue() : route.abort());
+  const page = await context.newPage();
+  try {
+    for (const route of routes) {
+      await page.goto(`${baseURL}/features/${route}`);
+      const crumbs = await page.locator('.breadcrumb').innerText();
+      assert.equal(crumbs, crumbs.toLowerCase(), `${route}: lowercase breadcrumbs`);
+      // The Start Page's hero fan (components/StartPageGallery.astro) counts as its native capture.
+      const backgrounds = await page.locator(':is(.released-capture, .design-fan-card) img').evaluateAll(images => images.map(image => getComputedStyle(image).backgroundColor));
+      assert.ok(backgrounds.length, `${route}: native product capture`);
+      assert.ok(backgrounds.every(color => color === 'rgba(0, 0, 0, 0)'), `${route}: transparent corners blend into the frame`);
+    }
+  } finally { await context.close(); }
+});
+
+test('expanded pages load their images and fit 360, 768, and 1440 pixel viewports', { timeout: 120000 }, async () => {
+  const context = await contextFor();
+  const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  try {
+    for (const width of [360, 768, 1440]) {
+      await page.setViewportSize({ width, height: 900 });
+      for (const route of ['/', '/features', '/download', '/faq', '/media', ...routes.map(route => `/features/${route}`)]) {
+        assert.equal((await page.goto(`${baseURL}${route}`)).status(), 200, route);
+        // Captures inside closed Features popovers stay hidden until opened.
+        for (const img of await page.locator('main img[src^="/feature-captures/"]').filter({ visible: true }).all()) {
+          await img.scrollIntoViewIfNeeded();
+          // A lazy image far down the page only starts loading once it nears
+          // the viewport, and Chromium rejects a decode() made just before that
+          // load restarts the request. Wait for the load itself, then decode.
+          await img.evaluate(image => image.complete || new Promise((resolve, reject) => {
+            image.addEventListener('load', resolve, { once: true });
+            image.addEventListener('error', () => reject(new Error(`${image.currentSrc} failed to load`)), { once: true });
+          }));
+          await img.evaluate(image => image.decode());
+          // 1440×900 captures, or 2× captures of the same frame (2880×1800).
+          assert.ok(await img.evaluate(image => image.complete && [1440, 2880].includes(image.naturalWidth)), `${route}: capture loaded`);
+        }
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${width}px ${route}: no horizontal overflow`);
+      }
+    }
+    assert.deepEqual(errors, []);
+  } finally { await context.close(); }
+});
+
+test('new guides have unique metadata, keyboard-reachable captures, and the existing CTA event', async () => {
+  const context = await contextFor({ viewport: { width: 1440, height: 900 } });
+  const page = await context.newPage();
+  const titles = new Set();
+  const descriptions = new Set();
+  try {
+    for (const route of routes) {
+      await page.goto(`${baseURL}/features/${route}`);
+      titles.add(await page.title());
+      descriptions.add(await page.locator('meta[name="description"]').getAttribute('content'));
+      assert.equal(await page.locator('link[rel="canonical"]').getAttribute('href'), `https://blanc.day/features/${route}`);
+      const feature = route === 'workspaces' ? 'named-workspaces' : route;
+      assert.equal(await page.locator('.feature-close [data-track="feature_cta_click"]').getAttribute('data-feature'), feature);
+      await page.locator('.breadcrumb a').last().focus();
+      await page.keyboard.press(linkTab);
+      const capture = page.locator(':is(.released-capture, .design-fan-card:not([aria-hidden])) > a').first();
+      assert.ok(await capture.evaluate(link => document.activeElement === link), `${route}: image link follows breadcrumb in keyboard order`);
+      assert.notEqual(await capture.evaluate(link => getComputedStyle(link).outlineStyle), 'none');
+    }
+    assert.equal(titles.size, 5);
+    assert.equal(descriptions.size, 5);
+  } finally { await context.close(); }
+});
+
+test('feature hub reaches all sixteen guides and Media kit downloads are real PNGs', async () => {
+  const context = await contextFor();
+  const page = await context.newPage();
+  try {
+    await page.goto(`${baseURL}/features`);
+    const hrefs = new Set(await page.locator('a[href^="/features/"]').evaluateAll(links => links.map(link => link.getAttribute('href'))));
+    for (const route of ['island', 'start-page', 'glance', 'ad-blocking', 'private-tabs', 'command-palette', 'mouse-gestures', 'reopen-closed-tabs', 'tab-groups', 'workspaces', 'vertical-tabs', 'quiet-tabs', 'profiles', 'sync', 'security', '1password']) assert.ok(hrefs.has(`/features/${route}`), route);
+    assert.equal(await page.locator('#small-details-title').innerText(), 'Smaller details that matter.');
+    await page.goto(`${baseURL}/media`);
+    // The media kit downloads are native 2x captures of one release, the Blanc
+    // logo in ink and white (each as SVG and a 3000 x 888 PNG), the Sunrise
+    // mark in full color and in black, and the 1024px Blanc Mail app icon in
+    // its light and dark appearances.
+    const downloads = page.locator('.media-kit figcaption a[download]');
+    assert.equal(await downloads.count(), 10);
+    for (const link of await downloads.all()) {
+      const href = await link.getAttribute('href');
+      const response = await context.request.get(new URL(href, baseURL).href);
+      assert.equal(response.status(), 200, href);
+      const bytes = await response.body();
+      if (href.endsWith('.svg')) {
+        assert.match(bytes.toString('utf8', 0, 200), /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/, href);
+        continue;
+      }
+      assert.equal(bytes.subarray(1, 4).toString(), 'PNG', href);
+      const size = [bytes.readUInt32BE(16), bytes.readUInt32BE(20)].join('x');
+      assert.ok(['2560x1600', '3000x888', '4096x4096', '1024x1024'].includes(size), `${href}: ${size}`);
+    }
+    // After the checksums, the kit links the current fact sheet ahead of the
+    // dated 1.0 announcement.
+    const kitLinks = await page.locator('.media-kit-links a').evaluateAll(links => links.map(link => [link.textContent, link.getAttribute('href')]));
+    assert.deepEqual(kitLinks.slice(1), [
+      ['Read the press fact sheet', 'https://github.com/bnfy/blanc/blob/main/docs/press/fact-sheet.md'],
+      ['Read the 1.0 announcement', 'https://github.com/bnfy/blanc/blob/main/docs/press/press-release.md'],
+    ]);
+    const downloaded = page.waitForEvent('download');
+    const firstHref = await downloads.first().getAttribute('href');
+    await downloads.first().click();
+    assert.equal((await downloaded).suggestedFilename(), firstHref.split('/').pop(), 'the download keeps the capture\'s own (versioned) file name');
+  } finally { await context.close(); }
+});

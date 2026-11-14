@@ -1,0 +1,696 @@
+#!/usr/bin/env bash
+# Draft-first, fail-closed release pipeline.
+#
+# Required invariants:
+# - one immutable source tag/commit for every platform;
+# - notarized macOS and signed Windows artifacts only;
+# - every selected platform asset staged in one draft;
+# - exact names + SHA-256 checksums verified before publication;
+# - no rebuild between staged verification and publication.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [ "${BLANC_UBLOCK_INTERNAL_BUILD:-0}" = "1" ]; then
+  echo "Internal uBlock validation packages cannot enter the release pipeline." >&2
+  exit 1
+fi
+
+REPO="bnfy/blanc"
+VERSION=$(node -p "require('./package.json').version")
+TAG="v$VERSION"
+MODE="${BLANC_RELEASE_MODE:-}"
+PLATFORM_CSV="${BLANC_RELEASE_PLATFORMS:-}"
+MAC_ARCH_CSV="${BLANC_MAC_ARCHES:-}"
+MIGRATION_BASE_VERSION="${BLANC_MIGRATION_BASE_VERSION:-1.48.0}"
+COSIGN_REDIRECT_PORT="${BLANC_COSIGN_REDIRECT_PORT:-49197}"
+RELEASE_OPERATOR="${BLANC_RELEASE_OPERATOR:-terminal}"
+NOTES_FILE="docs/press/release-notes/$TAG.md"
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  case "$RELEASE_OPERATOR" in
+    terminal)
+      if [ "${TERM_PROGRAM:-}" != "Apple_Terminal" ] || [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "Terminal mode requires an interactive Terminal.app window." >&2
+        echo "For an approved Codex/Claude run, use BLANC_RELEASE_OPERATOR=agent in an interactive unsandboxed PTY." >&2
+        exit 1
+      fi
+      ;;
+    agent)
+      if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "Agent mode requires an interactive PTY; background and non-interactive releases are forbidden." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "BLANC_RELEASE_OPERATOR must be terminal or agent." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+case "$COSIGN_REDIRECT_PORT" in
+  ''|*[!0-9]*)
+    echo "BLANC_COSIGN_REDIRECT_PORT must be a numeric loopback port." >&2
+    exit 1
+    ;;
+esac
+if [ "$COSIGN_REDIRECT_PORT" -lt 1024 ] || [ "$COSIGN_REDIRECT_PORT" -gt 65535 ]; then
+  echo "BLANC_COSIGN_REDIRECT_PORT must be between 1024 and 65535." >&2
+  exit 1
+fi
+if ! node -e '
+  const net = require("node:net");
+  const server = net.createServer();
+  server.once("error", () => process.exit(1));
+  server.listen(Number(process.argv[1]), "127.0.0.1", () => server.close());
+' "$COSIGN_REDIRECT_PORT"; then
+  echo "Sigstore callback port $COSIGN_REDIRECT_PORT is already in use." >&2
+  echo "Set BLANC_COSIGN_REDIRECT_PORT to another free port before starting." >&2
+  exit 1
+fi
+
+case "$MODE" in
+  candidate)
+    [[ "$VERSION" == *-* ]] || {
+      echo "Candidate mode requires a prerelease package version (for example 1.0.0-rc.1)." >&2
+      exit 1
+    }
+    ;;
+  stable)
+    [[ "$VERSION" != *-* ]] || {
+      echo "Stable mode refuses a prerelease package version: $VERSION" >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "BLANC_RELEASE_MODE must be explicitly set to candidate or stable." >&2
+    exit 1
+    ;;
+esac
+
+[ -n "$PLATFORM_CSV" ] || {
+  echo "BLANC_RELEASE_PLATFORMS must explicitly list mac and any verified native targets." >&2
+  exit 1
+}
+[ -n "$MAC_ARCH_CSV" ] || {
+  echo "BLANC_MAC_ARCHES must explicitly list the verified mac architecture(s): arm64 and/or x64." >&2
+  exit 1
+}
+
+IFS=',' read -r -a PLATFORMS <<< "$PLATFORM_CSV"
+HAS_MAC=false
+HAS_WINDOWS=false
+HAS_LINUX=false
+for platform in "${PLATFORMS[@]}"; do
+  case "$platform" in
+    mac) HAS_MAC=true ;;
+    windows) HAS_WINDOWS=true ;;
+    linux) HAS_LINUX=true ;;
+    *)
+      echo "Unknown release platform '$platform'; use mac,windows,linux." >&2
+      exit 1
+      ;;
+  esac
+done
+$HAS_MAC || {
+  echo "The local release path requires mac in BLANC_RELEASE_PLATFORMS." >&2
+  exit 1
+}
+
+IFS=',' read -r -a MAC_ARCHES <<< "$MAC_ARCH_CSV"
+HAS_MAC_ARM64=false
+HAS_MAC_X64=false
+for arch in "${MAC_ARCHES[@]}"; do
+  case "$arch" in
+    arm64) HAS_MAC_ARM64=true ;;
+    x64) HAS_MAC_X64=true ;;
+    *)
+      echo "Unknown mac architecture '$arch'; use arm64,x64." >&2
+      exit 1
+      ;;
+  esac
+done
+($HAS_MAC_ARM64 || $HAS_MAC_X64) || {
+  echo "At least one mac architecture must be selected." >&2
+  exit 1
+}
+# Intel Macs are a supported platform: every release ships arm64 and x64 so
+# Intel installs keep receiving updates. Dropping one needs a recorded reason.
+MAC_ARCH_WAIVER="${BLANC_MAC_ARCH_WAIVER:-}"
+if ! { $HAS_MAC_ARM64 && $HAS_MAC_X64; } && [ -z "$MAC_ARCH_WAIVER" ]; then
+  echo "BLANC_MAC_ARCHES must be arm64,x64: Apple Silicon and Intel are both supported." >&2
+  echo "To ship a single architecture, set BLANC_MAC_ARCH_WAIVER to the reason and record it in the release incident." >&2
+  exit 1
+fi
+[ -z "$MAC_ARCH_WAIVER" ] || echo "==> Mac architecture waiver: $MAC_ARCH_WAIVER"
+
+# Empty arrays below use ${A[@]+"${A[@]}"}: macOS bash 3.2 aborts on an
+# empty "${A[@]}" under set -u.
+# Runtime: official Electron or castLabs' Electron for Content Security
+# (Widevine DRM). ECS builds every platform from the pinned, hashed archives
+# in build/ecs-runtime.json, VMP-signs them through the existing EVS account,
+# and enables uBO only through its reviewed ECS runtime record. There is no
+# default: since 1.43.0 public releases are ECS, and a 1.44.0 build that
+# silently defaulted to official Electron would have dropped Widevine for
+# every updater.
+RELEASE_RUNTIME="${BLANC_RELEASE_RUNTIME:-}"
+case "$RELEASE_RUNTIME" in
+  official) ;;
+  ecs)
+    for var in BLANC_EVS_PYTHON EVS_CONFIG_FILE EVS_CACHE_FILE; do
+      [ -n "${!var:-}" ] || {
+        echo "An ECS release requires $var for the existing EVS account (VMP signing)." >&2
+        exit 1
+      }
+    done
+    [ -x "$BLANC_EVS_PYTHON" ] && [ -f "$EVS_CONFIG_FILE" ] && [ -f "$EVS_CACHE_FILE" ] || {
+      echo "The EVS client or account files named by BLANC_EVS_PYTHON/EVS_CONFIG_FILE/EVS_CACHE_FILE are missing." >&2
+      exit 1
+    }
+    node -e '
+      const matrix = require("./src/main/ublock-platforms.json");
+      const pin = require("./build/ecs-runtime.json");
+      const evidence = String(matrix.ecsEvidence ?? "");
+      if (matrix.ecsRuntime !== pin.version || /^PENDING/.test(evidence) || !evidence.includes(pin.version)) process.exit(1);
+    ' || {
+      echo "An ECS release requires the reviewed uBO runtime record, with passed evidence naming $(node -p 'require("./build/ecs-runtime.json").version'), in src/main/ublock-platforms.json." >&2
+      exit 1
+    }
+    # Checked before any tag or draft exists: the native workflow must accept
+    # the ECS runtime, or the dispatch would fail after publication began.
+    node -e '
+      const yaml = require("js-yaml");
+      const workflow = yaml.load(require("fs").readFileSync(".github/workflows/release-windows-linux.yml", "utf8"));
+      const inputs = workflow?.on?.workflow_dispatch?.inputs;
+      if (!Array.isArray(inputs?.runtime?.options) || !inputs.runtime.options.includes("ecs") || !inputs.source_sha) process.exit(1);
+    ' || {
+      echo "The native release workflow does not accept runtime=ecs; an ECS release cannot dispatch Windows/Linux builds." >&2
+      exit 1
+    }
+    # Windows ECS needs EVS signing in the public release job, a separate
+    # owner decision; the workflow refuses it, so refuse before any tag.
+    if $HAS_WINDOWS && ! node -e '
+      const yaml = require("js-yaml");
+      const workflow = yaml.load(require("fs").readFileSync(".github/workflows/release-windows-linux.yml", "utf8"));
+      if (!String(workflow?.jobs?.windows?.environment ?? "").includes("ecs-signing")) process.exit(1);
+    '; then
+      echo "A Windows ECS release needs the separately approved EVS signing access in the release workflow." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "BLANC_RELEASE_RUNTIME must be explicitly set to ecs or official." >&2
+    exit 1
+    ;;
+esac
+ECS_FUSE_ARGS=()
+[ "$RELEASE_RUNTIME" = ecs ] && ECS_FUSE_ARGS=(--ecs)
+# Official releases dispatch exactly as before: no runtime input is sent.
+DISPATCH_RUNTIME_ARGS=()
+# The native ECS jobs build only if their checkout resolves to this exact
+# commit; LOCAL_HEAD is checked against origin/main before anything is tagged.
+[ "$RELEASE_RUNTIME" = ecs ] && DISPATCH_RUNTIME_ARGS=(-f runtime=ecs -f source_sha="$(git rev-parse HEAD)")
+
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  arm64)
+    $HAS_MAC_ARM64 || {
+      echo "The native release host is arm64, but arm64 is not selected for package smoke." >&2
+      exit 1
+    }
+    NATIVE_MAC_ARCH="arm64"
+    NATIVE_MAC_DIR="mac-arm64"
+    MIGRATION_MAC_SUFFIX="-arm64-mac"
+    ;;
+  x86_64)
+    $HAS_MAC_X64 || {
+      echo "The native release host is x64, but x64 is not selected for package smoke." >&2
+      exit 1
+    }
+    NATIVE_MAC_ARCH="x64"
+    NATIVE_MAC_DIR="mac"
+    MIGRATION_MAC_SUFFIX="-mac"
+    ;;
+  *)
+    echo "Unsupported native Mac release host architecture: $HOST_ARCH" >&2
+    exit 1
+    ;;
+esac
+[ -f "$NOTES_FILE" ] || {
+  echo "Checked-in release notes are required: $NOTES_FILE" >&2
+  exit 1
+}
+
+command -v gh >/dev/null || { echo "gh CLI not found." >&2; exit 1; }
+command -v op >/dev/null || {
+  echo "1Password CLI is required; refusing an unnotarized release build." >&2
+  exit 1
+}
+command -v cosign >/dev/null || {
+  echo "cosign is required to sign the release manifest independently of GitHub." >&2
+  exit 1
+}
+[ -n "${BLANC_COSIGN_IDENTITY:-}" ] || {
+  echo "BLANC_COSIGN_IDENTITY must be the exact OIDC identity authorized to sign releases." >&2
+  exit 1
+}
+[ -n "${BLANC_COSIGN_OIDC_ISSUER:-}" ] || {
+  echo "BLANC_COSIGN_OIDC_ISSUER must name the release signer's OIDC issuer." >&2
+  exit 1
+}
+gh auth status >/dev/null 2>&1 || {
+  echo "gh CLI authentication is unavailable in this operator environment." >&2
+  if [ "$RELEASE_OPERATOR" = "agent" ]; then
+    echo "Confirm the complete release is running outside the agent sandbox before changing GitHub credentials." >&2
+  else
+    echo "Confirm the cached Terminal session with: gh auth status" >&2
+  fi
+  exit 1
+}
+
+echo "==> Authenticating 1Password CLI through the desktop app"
+if [ "$RELEASE_OPERATOR" = "agent" ]; then
+  echo "    This command must run outside the agent sandbox. Approve only the expected Codex/Claude identity."
+else
+  echo "    Approve only a Terminal.app authorization."
+fi
+if ! OP_BIOMETRIC_UNLOCK_ENABLED=true op signin; then
+  echo "1Password desktop authentication failed. Cancel any manual-account prompt; do not add an account." >&2
+  exit 1
+fi
+
+echo "==> Preparing Blanc $VERSION ($TAG), mode=$MODE, runtime=$RELEASE_RUNTIME, platforms=$PLATFORM_CSV, mac=$MAC_ARCH_CSV"
+
+# Released and staged versions are immutable. A failed draft remains evidence
+# of that attempt; fix forward with a new rc.N/version rather than overwriting.
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null ||
+   git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 ||
+   gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+  echo "Tag or release $TAG already exists. Bump package.json; never overwrite release assets." >&2
+  exit 1
+fi
+
+# A feature release's What's New page must already be live: Blanc asks for it
+# once per launch after the update, and people update within a minute of
+# publication. Checked now so nothing builds without it, and again before
+# Sigstore in case the site changed during the run.
+node scripts/check-whats-new-page.mjs --version "$VERSION"
+
+RELEASE_SOURCES=(
+  src
+  build
+  test
+  scripts
+  site
+  spec
+  settings-schema
+  tokens
+  copy
+  adblock
+  ublock
+  compliance
+  docs/press
+  docs/grants
+  README.md
+  SECURITY.md
+  package.json
+  package-lock.json
+  .github/workflows
+  "$NOTES_FILE"
+)
+if ! git diff --cached --quiet HEAD -- "${RELEASE_SOURCES[@]}" ||
+   ! git diff --quiet -- "${RELEASE_SOURCES[@]}" ||
+   [ -n "$(git ls-files --others --exclude-standard -- "${RELEASE_SOURCES[@]}")" ]; then
+  echo "Release sources are dirty. Commit every release input before staging." >&2
+  exit 1
+fi
+
+git fetch origin --quiet
+LOCAL_HEAD="$(git rev-parse HEAD)"
+if [ "$LOCAL_HEAD" != "$(git rev-parse origin/main)" ]; then
+  echo "HEAD is not origin/main. Push the exact release commit first." >&2
+  exit 1
+fi
+
+# Keep the Mac and its display awake for the rest of the release: the press
+# gate's acceptance run and the packaged checks drive real windows for about 40
+# minutes, and a sleeping display fails focus-dependent scenarios (October 2026).
+if command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -dimsu -w $$ &
+fi
+
+# Resume after a flake. A packaged check that fails, then passes when rerun
+# alone against the same build, is not a reason to rebuild and re-notarize.
+# BLANC_RELEASE_RESUME_FROM=<step> (with BLANC_RELEASE_RESUME_REASON) skips the
+# press gate, signing preflight and build, and every packaged check before
+# <step>, reusing dist/. Only checks between the build and the tag push can be
+# resumed; every preflight above still runs. The build stamp written after a
+# successful build must match this commit, version and Mac architectures, and
+# every stamped file in dist/ must still match its recorded SHA-256.
+RESUME_STEPS=(fuses blocker-payloads compliance first-run regressions workspaces favicons-primary favicons-additional migration ecs-acceptance)
+RESUME_FROM="${BLANC_RELEASE_RESUME_FROM:-}"
+BUILD_STAMP="dist/.release-build-stamp"
+BUILD_STAMP_HEADER="commit=$LOCAL_HEAD version=$VERSION mac=$MAC_ARCH_CSV runtime=$RELEASE_RUNTIME"
+step_index() {
+  local i
+  for i in "${!RESUME_STEPS[@]}"; do
+    [ "${RESUME_STEPS[$i]}" = "$1" ] && { echo "$i"; return 0; }
+  done
+  return 1
+}
+# should_run <step>: false only while resuming and <step> precedes the resume point.
+should_run() {
+  [ -z "$RESUME_FROM" ] && return 0
+  [ "$(step_index "$1")" -ge "$(step_index "$RESUME_FROM")" ]
+}
+if [ -n "$RESUME_FROM" ]; then
+  step_index "$RESUME_FROM" >/dev/null || {
+    echo "BLANC_RELEASE_RESUME_FROM must be one of: ${RESUME_STEPS[*]}" >&2
+    exit 1
+  }
+  [ -n "${BLANC_RELEASE_RESUME_REASON:-}" ] || {
+    echo "Set BLANC_RELEASE_RESUME_REASON to the flake and its passing rerun; it belongs in the release incident." >&2
+    exit 1
+  }
+  [ -s "$BUILD_STAMP" ] || { echo "No build stamp in dist/. Resume needs a completed build of this commit." >&2; exit 1; }
+  [ "$(head -n 1 "$BUILD_STAMP")" = "$BUILD_STAMP_HEADER" ] || {
+    echo "The build in dist/ is not this commit, version and architecture set. Run the full release." >&2
+    exit 1
+  }
+  tail -n +2 "$BUILD_STAMP" | shasum -a 256 -c --quiet - || {
+    echo "dist/ changed after the build. Run the full release." >&2
+    exit 1
+  }
+  echo "==> Resuming at '$RESUME_FROM' on the verified build of $LOCAL_HEAD"
+  echo "    Reason: $BLANC_RELEASE_RESUME_REASON"
+else
+  echo "==> Installing locked dependencies and running the press verification gate"
+  npm run ublock:distribution
+  npm ci
+  npm ci --prefix site
+  # The gate (scripts/release-gate.mjs) reuses every stage and acceptance
+  # scenario that already passed on this exact commit and installed tree
+  # (npm run release:prepare, or an earlier attempt), reruns only what is
+  # owed, and prints the evidence block the release incident quotes.
+  # An owner waiver skips the press gate alone: every preflight, the build and
+  # every packaged check still run. Its reason names the commit and runs whose
+  # evidence replaces the gate, and belongs in the release incident.
+  if [ -n "${BLANC_RELEASE_PRESS_WAIVER:-}" ]; then
+    echo "==> Press verification gate waived by the owner"
+    echo "    Waiver: $BLANC_RELEASE_PRESS_WAIVER"
+  else
+    npm run release:verify:press
+  fi
+
+  echo "==> Preflighting the macOS identity and provisioning profile"
+  node scripts/preflight-mac-signing.mjs
+
+  echo "==> Cleaning and building notarized macOS artifacts"
+  echo "    1Password desktop-app integration is forced for this command."
+  echo "    Cancel any manual-account prompt; the desktop authorization is the only valid path."
+  rm -rf dist
+  MAC_BUILD_ARGS=()
+  $HAS_MAC_ARM64 && MAC_BUILD_ARGS+=(--arm64)
+  $HAS_MAC_X64 && MAC_BUILD_ARGS+=(--x64)
+  if [ "$RELEASE_RUNTIME" = ecs ]; then
+    # One build for both architectures so latest-mac.yml lists both. EVS
+    # signs before Apple signing and verifies after it (ecs-production-packaging).
+    MAC_BUILD=(env BLANC_ECS_RELEASE_PIPELINE=1 node scripts/build-ecs-production.cjs --release --mac "${MAC_BUILD_ARGS[@]}")
+  else
+    MAC_BUILD=(npx electron-builder --mac "${MAC_BUILD_ARGS[@]}" --publish never)
+  fi
+  if ! OP_BIOMETRIC_UNLOCK_ENABLED=true \
+    op run --env-file=.env.1password --no-masking -- \
+    "${MAC_BUILD[@]}"; then
+    echo "Signed/notarized macOS build failed. Nothing has been published." >&2
+    exit 1
+  fi
+  if [ "$RELEASE_RUNTIME" = ecs ]; then
+    echo "==> Verifying ECS release identity, archive pin, uBO record and fuse wire"
+    $HAS_MAC_ARM64 && node scripts/verify-ecs-production-package.cjs --release "dist/mac-arm64/Blanc.app"
+    $HAS_MAC_X64 && node scripts/verify-ecs-production-package.cjs --release "dist/mac/Blanc.app"
+  fi
+  # Stamp the build so a later resume can prove it reuses exactly these bytes:
+  # every top-level artifact plus each packaged app's executable and app.asar.
+  {
+    echo "$BUILD_STAMP_HEADER"
+    find dist -maxdepth 1 -type f ! -name .release-build-stamp -print0 | sort -z | xargs -0 shasum -a 256
+    for app in dist/mac-arm64/Blanc.app dist/mac/Blanc.app; do
+      if [ -d "$app" ]; then shasum -a 256 "$app/Contents/MacOS/Blanc" "$app/Contents/Resources/app.asar"; fi
+    done
+  } > "$BUILD_STAMP"
+fi
+
+# ECS: every packaged check from here on (including after a resume) launches
+# with updates disabled, so no fixture can follow the public update feed.
+if [ "$RELEASE_RUNTIME" = ecs ]; then export BLANC_UPDATE_CHANNEL=ecs-qualification-disabled; fi
+
+if should_run fuses; then
+  echo "==> Verifying hardened Electron fuses in packaged binaries"
+  $HAS_MAC_ARM64 && node scripts/verify-electron-fuses.mjs ${ECS_FUSE_ARGS[@]+"${ECS_FUSE_ARGS[@]}"} \
+    "dist/mac-arm64/Blanc.app/Contents/MacOS/Blanc"
+  $HAS_MAC_X64 && node scripts/verify-electron-fuses.mjs ${ECS_FUSE_ARGS[@]+"${ECS_FUSE_ARGS[@]}"} \
+    "dist/mac/Blanc.app/Contents/MacOS/Blanc"
+fi
+
+if should_run blocker-payloads; then
+  echo "==> Verifying byte-identical blocker payloads in packaged apps"
+  $HAS_MAC_ARM64 && node scripts/verify-packaged-adblock.js \
+    "dist/mac-arm64/Blanc.app/Contents/Resources/app.asar"
+  $HAS_MAC_X64 && node scripts/verify-packaged-adblock.js \
+    "dist/mac/Blanc.app/Contents/Resources/app.asar"
+fi
+
+if should_run compliance; then
+  echo "==> Verifying packaged compliance payloads"
+  $HAS_MAC_ARM64 && node scripts/verify-packaged-compliance.js \
+    "dist/mac-arm64/Blanc.app/Contents/Resources"
+  $HAS_MAC_X64 && node scripts/verify-packaged-compliance.js \
+    "dist/mac/Blanc.app/Contents/Resources"
+fi
+
+MAC_ASSETS=("dist/latest-mac.yml")
+if $HAS_MAC_ARM64; then
+  MAC_ASSETS+=(
+    "dist/Blanc-$VERSION-arm64-mac.zip"
+    "dist/Blanc-$VERSION-arm64-mac.zip.blockmap"
+    "dist/Blanc-$VERSION-arm64.dmg"
+    "dist/Blanc-$VERSION-arm64.dmg.blockmap"
+  )
+fi
+if $HAS_MAC_X64; then
+  MAC_ASSETS+=(
+    "dist/Blanc-$VERSION-mac.zip"
+    "dist/Blanc-$VERSION-mac.zip.blockmap"
+    "dist/Blanc-$VERSION.dmg"
+    "dist/Blanc-$VERSION.dmg.blockmap"
+  )
+fi
+for asset in "${MAC_ASSETS[@]}"; do
+  [ -s "$asset" ] || { echo "Expected macOS artifact missing: $asset" >&2; exit 1; }
+done
+
+if should_run first-run; then
+  echo "==> Smoke-testing the signed packaged first-run experience"
+  BLANC_PACKAGED_EXECUTABLE="$PWD/dist/$NATIVE_MAC_DIR/Blanc.app/Contents/MacOS/Blanc" \
+    npm run test:packaged:first-run
+fi
+
+if should_run regressions; then
+  echo "==> Smoke-testing packaged release regressions"
+  BLANC_PACKAGED_EXECUTABLE="$PWD/dist/$NATIVE_MAC_DIR/Blanc.app/Contents/MacOS/Blanc" \
+    npm run test:packaged:regressions
+fi
+
+if should_run workspaces; then
+  echo "==> Verifying packaged Workspace quit/restart recovery"
+  # The smoke checks the reported Electron version; an ECS package reports
+  # its pinned ECS version, read from the package root.
+  WORKSPACE_ENV=()
+  [ "$RELEASE_RUNTIME" = ecs ] && WORKSPACE_ENV=("BLANC_ECS_PACKAGE_ROOT=$PWD/dist/$NATIVE_MAC_DIR/Blanc.app")
+  env ${WORKSPACE_ENV[@]+"${WORKSPACE_ENV[@]}"} \
+    BLANC_PACKAGED_EXECUTABLE="$PWD/dist/$NATIVE_MAC_DIR/Blanc.app/Contents/MacOS/Blanc" \
+    npm run test:packaged:workspaces
+fi
+
+if should_run favicons-primary; then
+  echo "==> Checking live favicon compatibility — primary 26-site matrix"
+  BLANC_FAVICON_MATRIX=primary \
+    BLANC_PACKAGED_EXECUTABLE="$PWD/dist/$NATIVE_MAC_DIR/Blanc.app/Contents/MacOS/Blanc" \
+    npm run test:packaged:favicons-live
+fi
+
+if should_run favicons-additional; then
+  echo "==> Checking live favicon compatibility — additional 25-site matrix"
+  BLANC_FAVICON_MATRIX=additional \
+    BLANC_PACKAGED_EXECUTABLE="$PWD/dist/$NATIVE_MAC_DIR/Blanc.app/Contents/MacOS/Blanc" \
+    npm run test:packaged:favicons-live
+fi
+
+if should_run migration; then
+  echo "==> Verifying migration from public Stable v$MIGRATION_BASE_VERSION"
+  MIGRATION_DIR="$(mktemp -d)"
+  cleanup_migration() { rm -rf "$MIGRATION_DIR"; }
+  trap cleanup_migration EXIT
+  curl --fail --silent --show-error --location \
+    "https://github.com/$REPO/releases/download/v$MIGRATION_BASE_VERSION/Blanc-$MIGRATION_BASE_VERSION$MIGRATION_MAC_SUFFIX.zip" \
+    --output "$MIGRATION_DIR/stable.zip"
+  ditto -x -k "$MIGRATION_DIR/stable.zip" "$MIGRATION_DIR/stable"
+  BLANC_STABLE_EXECUTABLE="$MIGRATION_DIR/stable/Blanc.app/Contents/MacOS/Blanc" \
+    BLANC_CANDIDATE_EXECUTABLE="$PWD/dist/$NATIVE_MAC_DIR/Blanc.app/Contents/MacOS/Blanc" \
+    npm run test:packaged:migration
+  rm -rf "$MIGRATION_DIR"
+  trap - EXIT
+fi
+
+if should_run ecs-acceptance; then
+  if [ "$RELEASE_RUNTIME" = ecs ]; then
+    # The public package enables uBO through its reviewed ECS record and must
+    # play protected media; check both on the exact signed app before tagging.
+    # The uBO suite ends with a real native Quit, which its wrapper sends.
+    echo "==> Public ECS acceptance: uBO provider and restarts, file isolation, protected playback"
+    ECS_APP="$PWD/dist/$NATIVE_MAC_DIR/Blanc.app"
+    # A resumed attempt keeps every earlier report: move it aside, then write
+    # this attempt's reports fresh (the uBO suite refuses to overwrite).
+    ECS_ATTEMPT="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    if [ -d output/ecs-production ]; then
+      # mktemp allocates a unique archive even for attempts in the same second.
+      ECS_ARCHIVE="$(mktemp -d "output/ecs-production-before-$ECS_ATTEMPT.XXXXXX")"
+      mv output/ecs-production "$ECS_ARCHIVE/"
+    fi
+    mkdir -p output/ecs-production
+    BLANC_UPDATE_CHANNEL=ecs-qualification-disabled \
+      BLANC_PACKAGED_EXECUTABLE="$ECS_APP/Contents/MacOS/Blanc" \
+      BLANC_UBLOCK_EVIDENCE="$PWD/output/ecs-production/ublock-installed-mac-$ECS_ATTEMPT.json" \
+      node test/desktop/support/installed-mac-native-quit.mjs
+    BLANC_UPDATE_CHANNEL=ecs-qualification-disabled \
+      BLANC_PACKAGED_EXECUTABLE="$ECS_APP/Contents/MacOS/Blanc" \
+      node test/desktop/ecs-production-smoke.mjs
+    node test/desktop/ecs-local-html-smoke.cjs "$ECS_APP" "output/ecs-production/local-html-mac-$ECS_ATTEMPT.json"
+    BLANC_UPDATE_CHANNEL=ecs-qualification-disabled \
+      BLANC_PACKAGED_EXECUTABLE="$ECS_APP/Contents/MacOS/Blanc" \
+      node test/desktop/ecs-production-drm-smoke.mjs
+  fi
+fi
+
+# A draft release's requested tag is not exposed as a Git ref. Publish the
+# immutable source tag first so native workflow runners can check out the
+# exact commit while every release asset remains private in the draft.
+echo "==> Publishing immutable source tag for native builders"
+git tag "$TAG" "$LOCAL_HEAD"
+git push origin "refs/tags/$TAG"
+
+CREATE_ARGS=(
+  release create "$TAG"
+  "${MAC_ASSETS[@]}"
+  --repo "$REPO"
+  --title "$VERSION"
+  --target "$LOCAL_HEAD"
+  --notes-file "$NOTES_FILE"
+  --draft
+)
+if [ "$MODE" = "candidate" ]; then CREATE_ARGS+=(--prerelease); fi
+
+echo "==> Creating authenticated draft release"
+gh "${CREATE_ARGS[@]}"
+DRAFT_CREATED=true
+VERIFY_DIR="$(mktemp -d)"
+cleanup() { rm -rf "$VERIFY_DIR"; }
+trap cleanup EXIT
+
+WORKFLOW_PLATFORM=""
+if $HAS_WINDOWS && $HAS_LINUX; then
+  WORKFLOW_PLATFORM="all"
+elif $HAS_WINDOWS; then
+  WORKFLOW_PLATFORM="windows"
+elif $HAS_LINUX; then
+  WORKFLOW_PLATFORM="linux"
+fi
+
+if [ -n "$WORKFLOW_PLATFORM" ]; then
+  echo "==> Dispatching native $WORKFLOW_PLATFORM build(s) against $TAG"
+  DISPATCHED_AT=$(date -u +%s)
+  EXPECTED_RUN_TITLE="Release $TAG ($WORKFLOW_PLATFORM)"
+  gh workflow run release-windows-linux.yml \
+    --repo "$REPO" \
+    -f mode=release \
+    -f tag="$TAG" \
+    ${DISPATCH_RUNTIME_ARGS[@]+"${DISPATCH_RUNTIME_ARGS[@]}"} \
+    -f platform="$WORKFLOW_PLATFORM"
+
+  RUN_ID=""
+  for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    RUN_ID=$(gh run list \
+      --repo "$REPO" \
+      --workflow=release-windows-linux.yml \
+      --event workflow_dispatch \
+      --limit 10 \
+      --json databaseId,createdAt,displayTitle \
+      --jq "map(select(.displayTitle == \"$EXPECTED_RUN_TITLE\" and (.createdAt | fromdateiso8601) >= ($DISPATCHED_AT - 5))) | first | .databaseId // empty")
+    [ -n "$RUN_ID" ] && break
+    sleep 2
+  done
+  [ -n "$RUN_ID" ] || {
+    echo "Workflow dispatch did not register. Draft remains unpublished." >&2
+    exit 1
+  }
+
+  echo "==> Waiting for native build run $RUN_ID"
+  gh run watch "$RUN_ID" --repo "$REPO" --exit-status || {
+    echo "Native build failed. Draft remains unpublished." >&2
+    exit 1
+  }
+fi
+
+echo "==> Downloading the authenticated draft asset set"
+gh release download "$TAG" --repo "$REPO" --dir "$VERIFY_DIR"
+node scripts/verify-release-manifest.mjs \
+  --dir "$VERIFY_DIR" \
+  --version "$VERSION" \
+  --platforms "$PLATFORM_CSV" \
+  --mac-arches "$MAC_ARCH_CSV"
+cp "dist/$NATIVE_MAC_DIR/Blanc.app/Contents/Resources/runtime-sbom.cdx.json" "$VERIFY_DIR/Blanc-$VERSION.cdx.json"
+node scripts/create-checksums.mjs "$VERIFY_DIR"
+node scripts/check-whats-new-page.mjs --version "$VERSION"
+echo "==> Signing the complete checksum manifest through Sigstore"
+echo "    Safari will open for the GitHub approval; complete the fresh page immediately."
+PATH="$PWD/scripts/release-bin:$PATH" cosign sign-blob --yes \
+  --oidc-redirect-url "http://127.0.0.1:$COSIGN_REDIRECT_PORT/auth/callback" \
+  --bundle "$VERIFY_DIR/SHA256SUMS.sigstore.json" \
+  "$VERIFY_DIR/SHA256SUMS"
+cosign verify-blob \
+  --bundle "$VERIFY_DIR/SHA256SUMS.sigstore.json" \
+  --certificate-identity "$BLANC_COSIGN_IDENTITY" \
+  --certificate-oidc-issuer "$BLANC_COSIGN_OIDC_ISSUER" \
+  "$VERIFY_DIR/SHA256SUMS"
+node scripts/verify-release-manifest.mjs \
+  --dir "$VERIFY_DIR" \
+  --version "$VERSION" \
+  --platforms "$PLATFORM_CSV" \
+  --mac-arches "$MAC_ARCH_CSV"
+gh release upload "$TAG" \
+  "$VERIFY_DIR/SHA256SUMS" \
+  "$VERIFY_DIR/SHA256SUMS.sigstore.json" \
+  "$VERIFY_DIR/Blanc-$VERSION.cdx.json" \
+  --repo "$REPO"
+
+echo "==> Publishing the already-verified draft"
+if [ "$MODE" = "candidate" ]; then
+  gh release edit "$TAG" --repo "$REPO" --draft=false --prerelease
+else
+  gh release edit "$TAG" --repo "$REPO" --draft=false --prerelease=false --latest
+fi
+
+echo "==> Logged-out download smoke"
+while IFS= read -r url; do
+  [ -n "$url" ] || continue
+  curl --fail --silent --show-error --location --head "$url" >/dev/null
+done < <(gh api "repos/$REPO/releases/tags/$TAG" --jq '.assets[].browser_download_url')
+
+if npm run site:changelog; then
+  echo "==> Changelog refreshed. Verify the staged site, then promote it before outreach."
+else
+  echo "==> Warning: changelog refresh failed after publication; fix forward before outreach." >&2
+fi
+
+echo "==> Published and smoke-checked: https://github.com/$REPO/releases/tag/$TAG"

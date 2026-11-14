@@ -1,0 +1,20 @@
+// The single home of internal-page names. KNOWN_PAGES is every hostname
+// blanc:// serves (pages.js 404s anything else); UTILITY_PAGES is the
+// subset that belongs in the utility sheet (design:
+// docs/superpowers/specs/2026-07-22-utility-sheet-design.md §4) — every
+// route into a tab checks it. The rest (newtab, error, mahjong)
+// open as ordinary tab pages.
+const KNOWN_PAGES = new Set(['newtab', 'bookmarks', 'history', 'downloads', 'settings', 'error', 'shortcuts', 'mahjong', 'tab-import', 'tab-handoff']);
+const UTILITY_PAGES = new Set(['bookmarks', 'history', 'downloads', 'settings', 'shortcuts', 'tab-import', 'tab-handoff']);
+
+/** Exact-host blanc:// match: true only for utility sheet pages. */
+function isUtilityUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'blanc:' && UTILITY_PAGES.has(u.host);
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { KNOWN_PAGES, UTILITY_PAGES, isUtilityUrl };

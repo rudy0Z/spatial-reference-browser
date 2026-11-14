@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Engine Decision, Anti-Slop Design Direction &amp; Zcode Handover</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+      color: var(--color-text-primary, #111827);
+      background: var(--color-background-primary, transparent);
+      line-height: 1.5;
+      font-size: 14px;
+    }
+
+    .page {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+      max-width: 1040px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--color-border-primary, rgba(128,128,128,0.22));
+    }
+
+    .eyebrow {
+      font-family: var(--font-mono, monospace);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--color-text-secondary, #6b7280);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 21px;
+      line-height: 1.25;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 15.5px;
+      line-height: 1.3;
+      font-weight: 620;
+      letter-spacing: -0.01em;
+    }
+
+    p {
+      margin: 0;
+      color: var(--color-text-secondary, #4b5563);
+    }
+
+    .lead {
+      color: var(--color-text-primary, #111827);
+      font-size: 14px;
+    }
+
+    .section-block {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    code {
+      font-family: var(--font-mono, monospace);
+      font-size: 11.5px;
+      padding: 1px 5px;
+      border-radius: var(--border-radius-sm, 4px);
+      background: var(--color-background-tertiary, rgba(128,128,128,0.14));
+      color: var(--color-text-primary, #111827);
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-family: var(--font-mono, monospace);
+      font-size: 11px;
+      font-weight: 550;
+      white-space: nowrap;
+    }
+
+    .pill-success {
+      background: var(--color-background-success, rgba(16,185,129,0.14));
+      color: var(--color-text-success, #059669);
+    }
+
+    .pill-warn {
+      background: var(--color-background-warning, rgba(245,158,11,0.15));
+      color: var(--color-text-warning, #d97706);
+    }
+
+    .pill-danger {
+      background: var(--color-background-danger, rgba(239,68,68,0.15));
+      color: var(--color-text-danger, #dc2626);
+    }
+
+    .pill-info {
+      background: var(--color-background-info, rgba(59,130,246,0.14));
+      color: var(--color-text-info, #2563eb);
+    }
+
+    /* Visual Before vs After Card Critique */
+    .compare-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      gap: 14px;
+    }
+
+    .compare-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
+      border-radius: var(--border-radius-lg, 10px);
+      background: var(--color-background-secondary, rgba(128,128,128,0.06));
+      border: 1px solid var(--color-border-primary, rgba(128,128,128,0.2));
+      min-width: 0;
+    }
+
+    .compare-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .canvas-stage {
+      padding: 18px;
+      border-radius: 10px;
+      background: #0b0b0d;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 235px;
+      border: 1px solid rgba(255,255,255,0.07);
+    }
+
+    /* Slop card specimen (what app/ currently renders) */
+    .specimen-slop {
+      width: 248px;
+      border-radius: 16px;
+      border: 1px solid rgba(52, 211, 153, 0.7);
+      box-shadow: 0 0 24px rgba(52, 211, 153, 0.25);
+      background: #12141a;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      color: #f1f5f9;
+    }
+
+    .slop-thumb {
+      height: 92px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #10b981 0%, #6366f1 55%, #ec4899 100%);
+      display: flex;
+      align-items: flex-end;
+      padding: 6px;
+      font-family: monospace;
+      font-size: 9px;
+      color: rgba(255,255,255,0.85);
+    }
+
+    .slop-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .slop-badge {
+      font-family: monospace;
+      font-size: 8.5px;
+      padding: 2px 5px;
+      border-radius: 4px;
+      border: 1px solid rgba(52,211,153,0.45);
+      background: rgba(52,211,153,0.12);
+      color: #34d399;
+    }
+
+    .slop-badge.purple {
+      border-color: rgba(167,139,250,0.5);
+      background: rgba(167,139,250,0.14);
+      color: #c4b5fd;
+    }
+
+    .slop-badge.muted {
+      border-color: rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.05);
+      color: #94a3b8;
+    }
+
+    /* Clean Zen x Blanc specimen */
+    .specimen-clean {
+      width: 248px;
+      border-radius: 11px;
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      background: #17171a;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.5);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      color: #f3f3f5;
+    }
+
+    .clean-thumb {
+      height: 132px;
+      background: #1f1f24;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      position: relative;
+    }
+
+    .clean-editorial-grid {
+      display: grid;
+      grid-template-columns: 1.3fr 1fr;
+      gap: 6px;
+      height: 100%;
+    }
+
+    .clean-art-a {
+      border-radius: 5px;
+      background: #d6d3cd;
+      padding: 8px;
+      color: #18181b;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      display: flex;
+      align-items: flex-end;
+    }
+
+    .clean-art-b {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .clean-art-b span {
+      flex: 1;
+      border-radius: 5px;
+      background: #2b2b31;
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+
+    .clean-footer {
+      padding: 9px 11px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .clean-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: #e4e4e7;
+      flex-shrink: 0;
+    }
+
+    .clean-meta {
+      min-width: 0;
+      flex: 1;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .clean-title {
+      font-size: 12px;
+      font-weight: 520;
+      color: #f3f3f5;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .clean-domain {
+      font-size: 10.5px;
+      color: #7c7c85;
+      flex-shrink: 0;
+    }
+
+    .bullet-list {
+      margin: 0;
+      padding-left: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 12.5px;
+      color: var(--color-text-secondary, #4b5563);
+    }
+
+    /* Engine comparison table */
+    .table-wrap {
+      overflow-x: auto;
+      border-radius: var(--border-radius-md, 8px);
+      border: 1px solid var(--color-border-primary, rgba(128,128,128,0.2));
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      min-width: 660px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--color-border-secondary, rgba(128,128,128,0.14));
+      vertical-align: top;
+    }
+
+    th {
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--color-text-secondary, #6b7280);
+      background: var(--color-background-secondary, rgba(128,128,128,0.06));
+      font-weight: 600;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    .recommended-row {
+      background: var(--color-background-success, rgba(16,185,129,0.07));
+    }
+
+    /* Phase Loop Strip */
+    .loop-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+      gap: 10px;
+    }
+
+    .loop-card {
+      padding: 12px;
+      border-radius: var(--border-radius-md, 8px);
+      background: var(--color-background-secondary, rgba(128,128,128,0.06));
+      border: 1px solid var(--color-border-primary, rgba(128,128,128,0.2));
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .loop-tag {
+      font-family: var(--font-mono, monospace);
+      font-size: 11px;
+      color: var(--color-text-info, #2563eb);
+      font-weight: 600;
+    }
+
+    .loop-title {
+      font-size: 13px;
+      font-weight: 620;
+      color: var(--color-text-primary, #111827);
+    }
+
+    .loop-desc {
+      font-size: 12px;
+      color: var(--color-text-secondary, #4b5563);
+    }
+
+    /* Prompt Copy Box */
+    .prompt-box {
+      padding: 14px;
+      border-radius: var(--border-radius-lg, 10px);
+      background: var(--color-background-secondary, rgba(128,128,128,0.07));
+      border: 1px solid var(--color-border-primary, rgba(128,128,128,0.24));
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .prompt-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .copy-btn {
+      appearance: none;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 8px 14px;
+      border-radius: var(--border-radius-md, 8px);
+      border: 1px solid var(--color-text-info, #2563eb);
+      background: var(--color-background-info, rgba(59,130,246,0.15));
+      color: var(--color-text-info, #2563eb);
+      cursor: pointer;
+    }
+
+    .copy-btn:hover {
+      opacity: 0.9;
+    }
+
+    .quick-cmd {
+      font-family: var(--font-mono, monospace);
+      font-size: 12px;
+      padding: 10px 12px;
+      border-radius: var(--border-radius-md, 8px);
+      background: var(--color-background-tertiary, rgba(128,128,128,0.14));
+      color: var(--color-text-primary, #111827);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      user-select: all;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <span class="eyebrow">Architecture + Anti-Slop Design + Zcode AI Master Plan</span>
+      <h1>Turning Your 700-Tab Concept Into a Zen / Blanc-Grade Browser</h1>
+      <p class="lead">
+        Good news from checking your machine: <strong>Rust (<code>cargo 1.95.0</code>), Git (<code>2.53</code>), and Node (<code>v24.14</code>) are all already installed</strong>. Below is the exact truth on Rust + Chrome Extensions, why the current UI looks like AI slop, and the ready-to-run Master Prompt saved to <code>ZCODE_MASTER_PROMPT.md</code>.
+      </p>
+    </header>
+
+    <!-- 1. Engine + Rust + Extensions Matrix -->
+    <section class="section-block">
+      <h2>1. Engine Choice: How to Get Rust Speed + Real Websites + Chrome Extensions</h2>
+      <p>
+        A "100% pure Rust browser engine" (Servo or Tauri) <strong>cannot run Chrome extensions or Figma reliably today</strong>—while a raw C++ Chromium fork takes 150 GB of disk and 5-hour builds per edit. The winning move used by pro tools is <strong>Chromium 156 (via Blanc) for web rendering + compiled Rust for the 700-node spatial/search core + <code>electron-chrome-extensions</code></strong>:
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Base Option</th>
+              <th>Web &amp; Figma Fidelity</th>
+              <th>Chrome Extensions</th>
+              <th>700-Tab Graph Speed</th>
+              <th>Verdict for Zcode AI</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="recommended-row">
+              <td><strong>Blanc (Electron 45 / Chromium 156) + Rust Spatial Core + <code>electron-chrome-extensions</code></strong></td>
+              <td><span class="pill pill-success">100% Chrome Parity</span></td>
+              <td><span class="pill pill-success">~75–80% Works</span><br/>CSS Peeper, Font Ninja, ColorPick, Clippers, Stylus, DevTools + built-in uBlock Origin &amp; 1Password.</td>
+              <td><span class="pill pill-success">Rust Powered</span><br/>R-Tree culling, force/grid layout &amp; search in <code>&lt;1.5ms</code>; sleeping tabs = <code>0 MB</code>.</td>
+              <td><strong>LOCKED WINNER</strong> — Fast 5-sec AI verify loops, real Chromium, real Rust hot-path.</td>
+            </tr>
+            <tr>
+              <td><strong>Tauri v2 / Wry (Rust Shell + OS WebView2)</strong></td>
+              <td><span class="pill pill-warn">Good, quirky popups</span></td>
+              <td><span class="pill pill-danger">0% — Impossible</span><br/>OS WebViews have no Chrome extension runtime.</td>
+              <td><span class="pill pill-danger">No Tab Discard API</span><br/>Cannot cleanly hibernate/restore 700 tab processes.</td>
+              <td><strong>Disqualified</strong> — Fails your Chrome extension &amp; hibernation requirements.</td>
+            </tr>
+            <tr>
+              <td><strong>Servo (Pure Rust Browser Engine)</strong></td>
+              <td><span class="pill pill-danger">Breaks Figma/OAuth</span></td>
+              <td><span class="pill pill-danger">0% — None</span></td>
+              <td>Fast layout, unusable web compatibility.</td>
+              <td><strong>Disqualified</strong> — Experimental engine; cannot be used daily.</td>
+            </tr>
+            <tr>
+              <td><strong>Raw C++ Chromium Fork (Brave / Stedding) or Zen (Firefox Surfer)</strong></td>
+              <td><span class="pill pill-success">100% Native</span></td>
+              <td><span class="pill pill-success">100% Web Store</span> (or Firefox XPI)</td>
+              <td>Native C++, high build complexity.</td>
+              <td><strong>Too Heavy Now</strong> — 30–150 GB disk &amp; multi-hour compiles kill AI iteration loops.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 2. Anti-Slop Visual Comparison -->
+    <section class="section-block">
+      <h2>2. Visual Direction Locked Into the Prompt: Killing the "AI Slop"</h2>
+      <p>
+        When you have <strong>600–700 visual references</strong> open, the browser's job is to disappear like a gallery wall. Here is the exact transformation Phase 1.5 enforces before Electron wiring begins:
+      </p>
+      <div class="compare-grid">
+        <div class="compare-panel">
+          <div class="compare-header">
+            <strong>Current <code>app/</code> (Why It Feels Like AI Slop)</strong>
+            <span class="pill pill-danger">Banned in Phase 1.5</span>
+          </div>
+          <div class="canvas-stage">
+            <div class="specimen-slop">
+              <div class="slop-thumb">Procedural rainbow gradient stub</div>
+              <div style="font-size:12px;font-weight:600;">Swiss Grid Systems — Editorial</div>
+              <div class="slop-badges">
+                <span class="slop-badge">LIVE · 138 MB</span>
+                <span class="slop-badge muted">UNREGIONED</span>
+                <span class="slop-badge purple">GHOST · 92%</span>
+                <span class="slop-badge muted">COLD · 19d</span>
+                <span class="slop-badge">ANCHOR</span>
+                <span class="slop-badge">WB</span>
+              </div>
+            </div>
+          </div>
+          <ul class="bullet-list">
+            <li>Neon <code>#34D399</code> &amp; <code>#A78BFA</code> borders clash with your design references.</li>
+            <li>6–8 uppercase monospace debug badges scream on every single card.</li>
+            <li>Animated marching-ant lines create visual noise across 600 tabs.</li>
+          </ul>
+        </div>
+
+        <div class="compare-panel">
+          <div class="compare-header">
+            <strong>Target UI (Zen × Blanc × Obsidian Minimal)</strong>
+            <span class="pill pill-success">Enforced Standard</span>
+          </div>
+          <div class="canvas-stage">
+            <div class="specimen-clean">
+              <div class="clean-thumb">
+                <div class="clean-editorial-grid">
+                  <div class="clean-art-a">Aa — Neue Montreal</div>
+                  <div class="clean-art-b"><span></span><span></span></div>
+                </div>
+              </div>
+              <div class="clean-footer">
+                <span class="clean-dot" title="Awake in warm pool"></span>
+                <div class="clean-meta">
+                  <span class="clean-title">Pangram Pangram Foundry</span>
+                  <span class="clean-domain">pangrampangram.com</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <ul class="bullet-list">
+            <li><strong>Dead-neutral matte graphite (<code>#0B0B0D</code> / <code>#17171A</code>):</strong> Reference screenshots own 100% of the color.</li>
+            <li><strong>Silent state grammar:</strong> 1 tiny dot = awake; quiet frame = <code>0 MB</code> asleep; soft fade = old reference. Zero <code>UNREGIONED</code> or <code>SLEEP</code> pills.</li>
+            <li><strong>Moodboard Grid Snap + Obsidian 1-hop hover:</strong> Calm <code>1px</code> hairlines + 1-click contact-sheet alignment for reference clusters.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. Closed-Loop Checkpoint Plan -->
+    <section class="section-block">
+      <h2>3. The 7 Closed-Loop Checkpoints Zcode AI Will Execute</h2>
+      <div class="loop-grid">
+        <div class="loop-card">
+          <span class="loop-tag">checkpoint/phase-1-prototype</span>
+          <span class="loop-title">Phase 0 · Freeze Phase 1</span>
+          <span class="loop-desc">Init Git + LF <code>.gitattributes</code> + preserve current <code>app/</code> untouched on its own tag &amp; archive branch.</span>
+        </div>
+        <div class="loop-card">
+          <span class="loop-tag">checkpoint/phase-1.5-clean-design</span>
+          <span class="loop-title">Phase 1.5 · Zero-Slop Redesign</span>
+          <span class="loop-desc">Zen/Blanc browser bar &amp; rail, silent reference cards, Moodboard Grid tidy, 700 designer reference seed + screenshot audit.</span>
+        </div>
+        <div class="loop-card">
+          <span class="loop-tag">checkpoint/phase-2-rust-core</span>
+          <span class="loop-title">Phase 2 · Rust Spatial Core</span>
+          <span class="loop-desc">Build <code>crates/spatial-core</code> (<code>cargo 1.95</code>): R-Tree culling, force/grid solver, and <code>&lt;1.5ms</code> search across 1,000+ tabs.</span>
+        </div>
+        <div class="loop-card">
+          <span class="loop-tag">checkpoint/phase-3-real-browser</span>
+          <span class="loop-title">Phase 3 · Blanc Chromium Engine</span>
+          <span class="loop-desc">Fork <code>blanc-src</code> → <code>browser/</code>, strip telemetry, wire 6-tab warm pool + crisp <code>capturePage()</code> WebP cards + <code>0 MB</code> sleep.</span>
+        </div>
+        <div class="loop-card">
+          <span class="loop-tag">checkpoint/phase-4-chrome-extensions</span>
+          <span class="loop-title">Phase 4 · Chrome Extensions</span>
+          <span class="loop-desc"><code>electron-chrome-extensions</code> + 1-click Chrome Web Store CRX3 unpacker + clean extension popup drawer.</span>
+        </div>
+        <div class="loop-card">
+          <span class="loop-tag">checkpoint/phase-5-700-tab-vault</span>
+          <span class="loop-title">Phase 5 · Rescue Your 700 Tabs</span>
+          <span class="loop-desc">SQLite WAL + rolling backups + local MiniLM AI + 0-RAM bulk importer from Chrome/Arc/Bookmarks.</span>
+        </div>
+        <div class="loop-card">
+          <span class="loop-tag">checkpoint/phase-6-release-candidate</span>
+          <span class="loop-title">Phase 6 · Packaged Windows App</span>
+          <span class="loop-desc">Global <code>Ctrl+Z</code>, marquee multi-select, domain filters, and standalone <code>electron-builder --dir</code> desktop <code>.exe</code>.</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. Handover Action Box -->
+    <section class="prompt-box">
+      <div class="prompt-bar">
+        <div>
+          <h2>4. Ready-to-Send Handover for Zcode AI</h2>
+          <p>The complete 230-line specification is saved in your workspace root at <code>D:\Fivem\new brosser\ZCODE_MASTER_PROMPT.md</code> and in the <a href="../zcode-master-prompt/index.md">Zcode Master Prompt artifact</a>.</p>
+        </div>
+        <button type="button" class="copy-btn" id="copy-trigger">Copy Zcode Launch Prompt</button>
+      </div>
+      <div class="quick-cmd" id="launch-snippet">Read ZCODE_MASTER_PROMPT.md in the workspace root in full and execute it strictly phase by phase (Phase 0 -> Phase 1.5 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5 -> Phase 6). Preserve the current Phase 1 app/ as git tag checkpoint/phase-1-prototype first, enforce the Zen x Blanc x Obsidian Minimal anti-slop design overhaul in Phase 1.5 with real screenshot audits before touching Electron, build the Rust spatial-core in Phase 2, fork research/blanc-src into browser/ with the Two-Mode Warm-Pool architecture in Phase 3, add Chromium extension support in Phase 4, build the 700-tab zero-RAM importer + SQLite vault in Phase 5, and ship the unpacked desktop release build in Phase 6. Do not skip any build, runtime, visual anti-slop, or git-tag checkpoint gate between phases.</div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      const btn = document.getElementById('copy-trigger');
+      const snippet = document.getElementById('launch-snippet');
+      if (!btn || !snippet) return;
+      btn.addEventListener('click', function () {
+        const text = snippet.textContent || '';
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            btn.textContent = 'Copied to Clipboard';
+            setTimeout(function () { btn.textContent = 'Copy Zcode Launch Prompt'; }, 2000);
+          }).catch(function () {
+            btn.textContent = 'Select text below to copy';
+          });
+        } else {
+          btn.textContent = 'Select text below to copy';
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

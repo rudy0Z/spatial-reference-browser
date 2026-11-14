@@ -1,0 +1,217 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const fs = require('node:fs');
+const {
+  CHROME_PARTITION,
+  CHROME_INDEX_URL,
+  CHROME_OVERLAY_URL,
+  CHROME_FILL_STATUS_URL,
+  CHROME_TOOLTIP_URL,
+  CHROME_SPLIT_TAB_URL,
+  CHROME_DISPLAY_CAPTURE_HELPER_URL,
+  chromeResourcePath,
+} = require('../../src/main/chrome-protocol');
+
+const renderer = path.resolve(__dirname, '../../src/renderer');
+const { captureRuntimeForPlatform } = require('../../src/main/capture-platform');
+
+test('chrome protocol exposes only the reviewed resources for each host', () => {
+  assert.equal(CHROME_PARTITION, 'blanc-chrome');
+  assert.equal(CHROME_INDEX_URL, 'blanc-chrome://index/');
+  assert.equal(CHROME_OVERLAY_URL, 'blanc-chrome://overlay/');
+  assert.equal(chromeResourcePath(CHROME_INDEX_URL), path.join(renderer, 'index.html'));
+  assert.equal(
+    chromeResourcePath('blanc-chrome://index/vertical-tabs.js'),
+    path.join(renderer, 'vertical-tabs.js'),
+  );
+  assert.equal(
+    chromeResourcePath('blanc-chrome://overlay/overlay.js'),
+    path.join(renderer, 'overlay.js'),
+  );
+  assert.equal(
+    chromeResourcePath('blanc-chrome://overlay/pages/inter-latin.woff2'),
+    path.join(renderer, 'pages/inter-latin.woff2'),
+  );
+  assert.equal(
+    chromeResourcePath('blanc-chrome://overlay/pages/sunrise-favicon-mark.png'),
+    path.join(renderer, 'pages/sunrise-favicon-mark.png'),
+  );
+});
+
+test('only the rail and island documents can load the shared tab sections', () => {
+  const asset = path.join(renderer, 'tab-sections.js');
+  assert.equal(chromeResourcePath('blanc-chrome://index/tab-sections.js'), asset);
+  assert.equal(chromeResourcePath('blanc-chrome://overlay/tab-sections.js'), asset);
+  for (const url of [
+    'blanc-chrome://permission/tab-sections.js',
+    'blanc-chrome://fill-status/tab-sections.js',
+    'blanc-chrome://display-capture-helper/tab-sections.js',
+  ]) assert.equal(chromeResourcePath(url), null, url);
+});
+
+test('only the rail and island documents can load the shared tab-drag controller', () => {
+  const asset = path.join(renderer, 'tab-drag.js');
+  assert.equal(chromeResourcePath('blanc-chrome://index/tab-drag.js'), asset);
+  assert.equal(chromeResourcePath('blanc-chrome://overlay/tab-drag.js'), asset);
+  for (const url of [
+    'blanc-chrome://permission/tab-drag.js',
+    'blanc-chrome://fill-status/tab-drag.js',
+    'blanc-chrome://display-capture-helper/tab-drag.js',
+    'blanc-chrome://overlay/tab-drag.js?v=1',
+  ]) assert.equal(chromeResourcePath(url), null, url);
+});
+
+test('only the strip and overlay documents can load the space identity module', () => {
+  const asset = path.join(renderer, 'space-identity.js');
+  assert.equal(chromeResourcePath('blanc-chrome://index/space-identity.js'), asset);
+  assert.equal(chromeResourcePath('blanc-chrome://overlay/space-identity.js'), asset);
+  for (const url of [
+    'blanc-chrome://permission/space-identity.js',
+    'blanc-chrome://fill-status/space-identity.js',
+    'blanc-chrome://display-capture-helper/space-identity.js',
+    'blanc-chrome://overlay/space-identity.js?v=1',
+  ]) assert.equal(chromeResourcePath(url), null, url);
+});
+
+test('only the overlay can load the bang module and catalog', () => {
+  for (const file of ['bangs.js', 'bangs-catalog.js']) {
+    assert.equal(chromeResourcePath(`blanc-chrome://overlay/pages/${file}`), path.join(renderer, 'pages', file));
+    for (const url of [
+      `blanc-chrome://index/pages/${file}`,
+      `blanc-chrome://permission/pages/${file}`,
+      `blanc-chrome://fill-status/pages/${file}`,
+      `blanc-chrome://overlay/pages/${file}?v=1`,
+    ]) assert.equal(chromeResourcePath(url), null, url);
+  }
+});
+
+test('only the overlay can load the Spaces colour picker', () => {
+  assert.equal(chromeResourcePath('blanc-chrome://overlay/space-picker.js'), path.join(renderer, 'space-picker.js'));
+  for (const url of [
+    'blanc-chrome://index/space-picker.js',
+    'blanc-chrome://permission/space-picker.js',
+    'blanc-chrome://fill-status/space-picker.js',
+    'blanc-chrome://overlay/space-picker.js#x',
+  ]) assert.equal(chromeResourcePath(url), null, url);
+});
+
+test('only the overlay can load the hover-opened panel leave policy', () => {
+  assert.equal(chromeResourcePath('blanc-chrome://overlay/hover-panel-leave.js'), path.join(renderer, 'hover-panel-leave.js'));
+  for (const url of [
+    'blanc-chrome://index/hover-panel-leave.js',
+    'blanc-chrome://permission/hover-panel-leave.js',
+    'blanc-chrome://fill-status/hover-panel-leave.js',
+    'blanc-chrome://overlay/hover-panel-leave.js?v=1',
+  ]) assert.equal(chromeResourcePath(url), null, url);
+});
+
+test('the blocker Sunrise is the canonical gold artwork and only the overlay can load it', () => {
+  const asset = path.join(renderer, 'sunrise-hero-mark.png');
+  assert.equal(chromeResourcePath('blanc-chrome://overlay/sunrise-hero-mark.png'), asset);
+  assert.deepEqual(
+    fs.readFileSync(asset),
+    fs.readFileSync(path.resolve(__dirname, '../../site/public/sunrise-hero-mark.png')),
+  );
+  for (const url of [
+    'blanc-chrome://index/sunrise-hero-mark.png',
+    'blanc-chrome://permission/sunrise-hero-mark.png',
+    'blanc-chrome://fill-status/sunrise-hero-mark.png',
+    'blanc-chrome://display-capture-helper/sunrise-hero-mark.png',
+    'blanc-chrome://overlay/sunrise-hero-mark.png?cache=1',
+    'blanc-chrome://overlay/sunrise-hero-mark.png#mark',
+    'blanc-chrome://overlay/%73unrise-hero-mark.png',
+    'blanc-chrome://overlay/site/public/sunrise-hero-mark.png',
+  ]) assert.equal(chromeResourcePath(url), null, url);
+});
+
+test('fill-status host serves its document, script, copy, and shared styles only', () => {
+  assert.equal(CHROME_FILL_STATUS_URL, 'blanc-chrome://fill-status/');
+  assert.equal(chromeResourcePath(CHROME_FILL_STATUS_URL), path.join(renderer, 'fill-status.html'));
+  assert.equal(
+    chromeResourcePath('blanc-chrome://fill-status/fill-status.js'),
+    path.join(renderer, 'fill-status.js'),
+  );
+  assert.equal(
+    chromeResourcePath('blanc-chrome://fill-status/fill-status-copy.js'),
+    path.join(renderer, 'fill-status-copy.js'),
+  );
+  assert.equal(
+    chromeResourcePath('blanc-chrome://fill-status/styles.css'),
+    path.join(renderer, 'styles.css'),
+  );
+  assert.equal(chromeResourcePath('blanc-chrome://fill-status/renderer.js'), null);
+  assert.equal(chromeResourcePath('blanc-chrome://fill-status/../preload.js'), null);
+  // The capsule's copy module belongs to the fill-status host alone.
+  assert.equal(chromeResourcePath('blanc-chrome://index/fill-status-copy.js'), null);
+});
+
+test('display-capture-helper host serves only its document and script', () => {
+  assert.equal(CHROME_DISPLAY_CAPTURE_HELPER_URL, 'blanc-chrome://display-capture-helper/');
+  assert.equal(
+    chromeResourcePath(CHROME_DISPLAY_CAPTURE_HELPER_URL),
+    path.join(renderer, 'display-capture-helper.html'),
+  );
+  assert.equal(
+    chromeResourcePath('blanc-chrome://display-capture-helper/display-capture-helper.js'),
+    path.join(renderer, captureRuntimeForPlatform().helper),
+  );
+  assert.equal(chromeResourcePath('blanc-chrome://display-capture-helper/renderer.js'), null);
+  assert.equal(chromeResourcePath('blanc-chrome://display-capture-helper/../preload.js'), null);
+  assert.equal(chromeResourcePath('blanc-chrome://display-capture-helper/?x=1'), null);
+  assert.equal(chromeResourcePath('blanc-chrome://index/display-capture-helper.js'), null);
+});
+
+test('chrome protocol rejects cross-host scripts and path tricks', () => {
+  for (const url of [
+    'blanc-chrome://index/overlay.js',
+    'blanc-chrome://overlay/renderer.js',
+    // The Island now embeds a monochrome SVG; retired raster is not served.
+    'blanc-chrome://index/shield-horizon.png',
+    'blanc-chrome://overlay/shield-horizon.png',
+    'blanc-chrome://permission/shield-horizon.png',
+    'blanc-chrome://index/shield-horizon.png?cache=1',
+    'blanc-chrome://index/pages/settings.html',
+    'blanc-chrome://index/pages/icon.svg',
+    'blanc-chrome://overlay/pages/icon.svg',
+    'blanc-chrome://index/../main/main.js',
+    'blanc-chrome://index/%2e%2e/main/main.js',
+    'blanc-chrome://index/styles.css?cache=1',
+    // Deleted with the Zzz glyph (quiet is now a row-level dim). The allowlist
+    // fails closed, so its path must stop resolving the moment it leaves
+    // SHARED_ASSETS — a stale entry would keep serving a file that is gone.
+    'blanc-chrome://index/quiet-glyph.js',
+    'blanc-chrome://overlay/quiet-glyph.js',
+    'blanc-chrome://user@index/',
+    'blanc-chrome://unknown/',
+    'file:///etc/passwd',
+    'not a url',
+  ]) assert.equal(chromeResourcePath(url), null, url);
+});
+
+test('split-tab host serves its scriptless document and shared styles only', () => {
+  assert.equal(CHROME_SPLIT_TAB_URL, 'blanc-chrome://split-tab/');
+  assert.equal(chromeResourcePath(CHROME_SPLIT_TAB_URL), path.join(renderer, 'split-tab.html'));
+  assert.equal(chromeResourcePath('blanc-chrome://split-tab/styles.css'), path.join(renderer, 'styles.css'));
+  for (const file of ['renderer.js', 'overlay.js', 'tooltip.html', '../preload.js']) {
+    assert.equal(chromeResourcePath(`blanc-chrome://split-tab/${file}`), null, file);
+  }
+  const html = fs.readFileSync(path.join(renderer, 'split-tab.html'), 'utf8');
+  assert.doesNotMatch(html, /<script/i, 'main writes the site; the document runs no script');
+  assert.match(html, /default-src 'none'/);
+  assert.match(html, /img-src data:/, 'favicons arrive as PNG data URLs only');
+});
+
+test('tooltip host serves its scriptless document and shared styles only', () => {
+  assert.equal(CHROME_TOOLTIP_URL, 'blanc-chrome://tooltip/');
+  assert.equal(chromeResourcePath(CHROME_TOOLTIP_URL), path.join(renderer, 'tooltip.html'));
+  assert.equal(chromeResourcePath('blanc-chrome://tooltip/styles.css'), path.join(renderer, 'styles.css'));
+  for (const file of ['renderer.js', 'overlay.js', 'fill-status.js', 'permission.js', '../preload.js']) {
+    assert.equal(chromeResourcePath(`blanc-chrome://tooltip/${file}`), null, file);
+  }
+  const html = fs.readFileSync(path.join(renderer, 'tooltip.html'), 'utf8');
+  assert.doesNotMatch(html, /<script/i, 'main writes the text; the document runs no script');
+  assert.match(html, /default-src 'none'/);
+});

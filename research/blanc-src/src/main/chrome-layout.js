@@ -1,0 +1,271 @@
+// Pure child-view geometry for Blanc's two desktop tab layouts. Keeping this
+// outside main.js makes the 640px minimum-window edge case testable without
+// Electron and gives the renderer one authoritative rail-width constant.
+
+const { dragBandHeight } = require('./island-autohide');
+
+const VERTICAL_TABS_DEFAULT_WIDTH = 248;
+const VERTICAL_TABS_MIN_WIDTH = 200;
+const VERTICAL_TABS_MAX_WIDTH = 360;
+const VERTICAL_TABS_MIN_PAGE_WIDTH = 392;
+const FIND_OVERLAY_MAX_WIDTH = 560;
+const FIND_OVERLAY_HEIGHT = 160;
+// #findBar is 480px wide and uses max-width: calc(100vw - 24px). Exposing the
+// resulting visible maximum in the geometry result lets tests cover the
+// narrow vertical pane without duplicating that arithmetic at call sites.
+const FIND_CAPSULE_WIDTH = 480;
+const FIND_CAPSULE_HORIZONTAL_GUTTER = 24;
+
+// Blocker dialog and provider chooser. The 12px inset on each side leaves
+// a 380px card, with room below for the approved layout and its shadow.
+// Short windows clamp the view and let the card scroll within these bounds.
+const SHIELD_POPOVER_WIDTH = 404;
+// Allow status/restart guidance and the Dark website switch (with its
+// light-theme note) to fit without scrolling at ordinary window sizes.
+// The card itself keeps its natural content height inside this transparent view.
+const SHIELD_POPOVER_HEIGHT = 580;
+const SHIELD_POPOVER_MARGIN = 12;
+
+const TAB_LAYOUTS = new Set(['island', 'vertical']);
+
+function normalizeTabLayout(value) {
+  return TAB_LAYOUTS.has(value) ? value : 'island';
+}
+
+function dimension(value) {
+  return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+}
+
+function normalizeVerticalTabsWidth(value) {
+  if (!Number.isFinite(value)) return VERTICAL_TABS_DEFAULT_WIDTH;
+  return Math.max(
+    VERTICAL_TABS_MIN_WIDTH,
+    Math.min(VERTICAL_TABS_MAX_WIDTH, Math.round(value))
+  );
+}
+
+/**
+ * @param {{
+ *   width: number,
+ *   height: number,
+ *   chromeHeight: number,
+ *   islandHeight?: number,
+ *   tabLayout?: string,
+ *   verticalTabsWidth?: number,
+ *   platform?: string,
+ * }} input
+ */
+function calculateChromeLayout({
+  width,
+  height,
+  chromeHeight,
+  // Where the Island sits, when that differs from where the page starts: a
+  // floating Island is shown while the page keeps the top of the window.
+  islandHeight = chromeHeight,
+  tabLayout = 'island',
+  verticalTabsWidth = VERTICAL_TABS_DEFAULT_WIDTH,
+  platform,
+}) {
+  const windowWidth = dimension(width);
+  const windowHeight = dimension(height);
+  const stripHeight = Math.min(dimension(chromeHeight), windowHeight);
+  const islandTop = Math.min(dimension(islandHeight), windowHeight);
+  const layout = normalizeTabLayout(tabLayout);
+  const preferredRailWidth = normalizeVerticalTabsWidth(verticalTabsWidth);
+  // BrowserWindow enforces a 640px minimum width, so production can honor the
+  // 200px rail minimum while still preserving at least 392px for the website.
+  // The outer max is window-aware: a wider saved preference temporarily
+  // compresses at a narrow window and returns when room is available again.
+  const verticalTabsMaxWidth = Math.min(
+    VERTICAL_TABS_MAX_WIDTH,
+    Math.max(0, windowWidth - VERTICAL_TABS_MIN_PAGE_WIDTH)
+  );
+  const effectiveRailWidth = Math.min(preferredRailWidth, verticalTabsMaxWidth);
+  const railWidth = layout === 'vertical'
+    ? effectiveRailWidth
+    : 0;
+  const pageWidth = Math.max(0, windowWidth - railWidth);
+  const pageHeight = Math.max(0, windowHeight - stripHeight);
+
+  const pageBounds = {
+    x: railWidth,
+    y: stripHeight,
+    width: pageWidth,
+    height: pageHeight,
+  };
+  // In vertical mode the website pane becomes the visual frame. Keep resting
+  // and expanded Island states on that pane's centerline; find is page-scoped
+  // below the sampled safe-area gutter as well.
+  const panelBounds = {
+    x: railWidth,
+    y: 0,
+    width: pageWidth,
+    height: windowHeight,
+  };
+  const findWidth = Math.min(FIND_OVERLAY_MAX_WIDTH, pageWidth);
+  const findBounds = {
+    x: railWidth + Math.round((pageWidth - findWidth) / 2),
+    y: islandTop,
+    width: findWidth,
+    height: Math.min(FIND_OVERLAY_HEIGHT, pageHeight),
+  };
+
+  return {
+    tabLayout: layout,
+    verticalTabsWidth: effectiveRailWidth,
+    verticalTabsPreferredWidth: preferredRailWidth,
+    verticalTabsMinWidth: Math.min(VERTICAL_TABS_MIN_WIDTH, verticalTabsMaxWidth),
+    verticalTabsMaxWidth,
+    verticalTabsDefaultWidth: Math.min(VERTICAL_TABS_DEFAULT_WIDTH, verticalTabsMaxWidth),
+    railWidth,
+    // Unlike the page pane, the vertical rail owns the complete left edge.
+    // Its chrome background extends behind the macOS traffic-light safe area
+    // while website content retains the sampled 68px gutter below the Island.
+    railBounds: {
+      x: 0,
+      y: 0,
+      width: railWidth,
+      height: windowHeight,
+    },
+    // Guest tabs and the utility sheet intentionally share exact bounds.
+    pageBounds,
+    utilityBounds: { ...pageBounds },
+    // Panel and palette both retain y=0 so the Island expands in place.
+    panelBounds,
+    paletteBounds: { ...panelBounds },
+    findBounds,
+    // The root chrome renderer mirrors these bounds so the resting Island
+    // centers over the same website pane as its expanded states.
+    islandBounds: {
+      x: railWidth,
+      y: 0,
+      width: pageWidth,
+      height: islandTop,
+    },
+    // The invisible window-drag band across the top of the page pane, drawn
+    // by the strip document while the page covers the strip.
+    dragBand: {
+      x: railWidth,
+      y: 0,
+      width: pageWidth,
+      height: Math.min(dragBandHeight(platform), windowHeight),
+    },
+    findCapsuleMaxWidth: Math.max(
+      0,
+      Math.min(FIND_CAPSULE_WIDTH, findWidth - FIND_CAPSULE_HORIZONTAL_GUTTER)
+    ),
+  };
+}
+
+/**
+ * Bounds for the 'shield' overlay mode: centered just below the measured
+ * trigger (window coordinates), clamped inside the window.
+ * Older callers without a measured center retain right-edge anchoring.
+ * @param {{windowWidth: number, stripHeight: number, windowHeight?: number, anchorRight?: number|null, anchorCenter?: number|null, anchorBottom?: number|null}} input
+ */
+function calculateShieldBounds({ windowWidth, stripHeight, windowHeight, anchorRight, anchorCenter, anchorBottom }) {
+  const winWidth = dimension(windowWidth);
+  const width = Math.min(SHIELD_POPOVER_WIDTH, Math.max(0, winWidth - SHIELD_POPOVER_MARGIN * 2));
+  const right = Number.isFinite(anchorCenter) ? Math.round(anchorCenter + width / 2)
+    : Number.isFinite(anchorRight) ? Math.round(anchorRight) : Math.round((winWidth + width) / 2);
+  const x = Math.max(
+    SHIELD_POPOVER_MARGIN,
+    Math.min(right - width, winWidth - width - SHIELD_POPOVER_MARGIN)
+  );
+  // The card begins 10px inside this view; its small point reaches 4px up.
+  // Starting at the circle's bottom leaves a short ~10px circle-to-card join.
+  const y = Number.isFinite(anchorBottom)
+    ? Math.ceil(Math.max(0, Math.min(anchorBottom, dimension(stripHeight)))) : dimension(stripHeight);
+  const height = Number.isFinite(windowHeight)
+    ? Math.min(SHIELD_POPOVER_HEIGHT, Math.max(0, dimension(windowHeight) - y))
+    : SHIELD_POPOVER_HEIGHT;
+  return { x, y, width, height };
+}
+
+// Capture keeps its established size independently of the blocker dialog.
+const CAPTURE_POPOVER_WIDTH = 320;
+const CAPTURE_ROW_HEIGHT = 44;
+const CAPTURE_POPOVER_CHROME = 56; // header + card padding
+const CAPTURE_POPOVER_MAX_ROWS = 5;
+
+/**
+ * Bounds for the 'capture' overlay mode: same anchoring rules as the shield
+ * popover, but height tracks the row count, capped at 5 visible rows (the
+ * list scrolls beyond that — spec §6.2).
+ */
+function calculateCaptureBounds({ windowWidth, stripHeight, anchorRight, rowCount }) {
+  const winWidth = dimension(windowWidth);
+  const width = Math.min(CAPTURE_POPOVER_WIDTH, Math.max(0, winWidth - SHIELD_POPOVER_MARGIN * 2));
+  const rows = Math.max(1, Math.min(CAPTURE_POPOVER_MAX_ROWS, rowCount | 0));
+  const right = Number.isFinite(anchorRight)
+    ? Math.round(anchorRight)
+    : Math.round((winWidth + width) / 2);
+  const x = Math.max(
+    SHIELD_POPOVER_MARGIN,
+    Math.min(right - width, winWidth - width - SHIELD_POPOVER_MARGIN)
+  );
+  return {
+    x, y: dimension(stripHeight), width,
+    height: CAPTURE_POPOVER_CHROME + rows * CAPTURE_ROW_HEIGHT,
+  };
+}
+
+// The 'spaces' overlay: the Spaces menu (300px) opened from the Island's
+// space mark. The view reaches SPACES_MENU_SIDE past the menu's sides, where
+// its shadow (--shadow-popover, a 44px blur) has faded out, so the view's edge
+// never cuts it; above, only SPACES_MENU_PAD, so the view covers no more of
+// the Island. SPACES_MENU_GAP separates the menu from the mark. styles.css
+// places the menu at (SPACES_MENU_SIDE, SPACES_MENU_PAD) inside the view.
+const SPACES_MENU_WIDTH = 300;
+const SPACES_MENU_PAD = 16;
+const SPACES_MENU_SIDE = 44;
+const SPACES_MENU_GAP = 6;
+const SPACES_MENU_MAX_HEIGHT = 640;
+
+/**
+ * Bounds for the 'spaces' overlay mode: the menu's left edge under the mark,
+ * just below it. The menu is kept inside the window; its shadow room may run
+ * past the window's edge, so a mark near either edge still lines up.
+ * @param {{windowWidth: number, windowHeight: number, stripHeight: number, anchorLeft?: number|null, anchorBottom?: number|null}} input
+ */
+function calculateSpacesBounds({ windowWidth, windowHeight, stripHeight, anchorLeft, anchorBottom }) {
+  const winWidth = dimension(windowWidth);
+  const winHeight = dimension(windowHeight);
+  if (!winWidth) return { x: 0, y: 0, width: 0, height: 0 };
+  const width = SPACES_MENU_WIDTH + SPACES_MENU_SIDE * 2;
+  const wanted = Number.isFinite(anchorLeft) ? anchorLeft : (winWidth - SPACES_MENU_WIDTH) / 2;
+  const x = Math.round(Math.max(0, Math.min(wanted, winWidth - SPACES_MENU_WIDTH))) - SPACES_MENU_SIDE;
+  const below = Number.isFinite(anchorBottom) ? Math.min(anchorBottom, dimension(stripHeight)) : dimension(stripHeight);
+  const y = Math.max(0, Math.round(below + SPACES_MENU_GAP - SPACES_MENU_PAD));
+  const height = Math.max(0, Math.min(SPACES_MENU_MAX_HEIGHT, winHeight - y));
+  return { x, y, width, height };
+}
+
+module.exports = {
+  VERTICAL_TABS_DEFAULT_WIDTH,
+  VERTICAL_TABS_MIN_WIDTH,
+  VERTICAL_TABS_MAX_WIDTH,
+  VERTICAL_TABS_MIN_PAGE_WIDTH,
+  FIND_OVERLAY_MAX_WIDTH,
+  FIND_OVERLAY_HEIGHT,
+  FIND_CAPSULE_WIDTH,
+  FIND_CAPSULE_HORIZONTAL_GUTTER,
+  SHIELD_POPOVER_WIDTH,
+  SHIELD_POPOVER_HEIGHT,
+  SHIELD_POPOVER_MARGIN,
+  CAPTURE_POPOVER_WIDTH,
+  CAPTURE_ROW_HEIGHT,
+  CAPTURE_POPOVER_CHROME,
+  CAPTURE_POPOVER_MAX_ROWS,
+  calculateShieldBounds,
+  calculateCaptureBounds,
+  SPACES_MENU_WIDTH,
+  SPACES_MENU_PAD,
+  SPACES_MENU_SIDE,
+  SPACES_MENU_GAP,
+  SPACES_MENU_MAX_HEIGHT,
+  calculateSpacesBounds,
+  normalizeTabLayout,
+  normalizeVerticalTabsWidth,
+  calculateChromeLayout,
+};

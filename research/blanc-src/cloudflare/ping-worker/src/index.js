@@ -1,0 +1,896 @@
+// Collector for Blanc's anonymous launch and bounded product-use events (see
+// src/main/telemetry.js in the main repo). Tallies anonymous counts in Workers
+// KV — no IPs, URLs, browsing data, or game state are ever stored.
+//
+// Two things are counted, from one ping:
+//   1. Launches — every ping bumps aggregate counters (total, per-day,
+//      per-version, per-platform). One person launching 10× counts as 10.
+//   2. Active users — the ping carries a random, per-install id (the client
+//      mints it once and reuses it). The first ping from a given install in a
+//      given day/week/month flips that period's "seen" flag and bumps that
+//      period's unique counter, so repeat launches are deduped into distinct
+//      active users (DAU/WAU/MAU) and growth over time. The install id is an
+//      opaque random token — it maps to a device install, never a person, and
+//      no name/account/IP/browsing data is ever stored beside it.
+//
+// The raw install id is never stored or forwarded (2026-07-11 audit decision):
+// it's HMAC'd with the INSTALL_HASH_SECRET worker secret on arrival, and only
+// that keyed hash appears in KV keys and in the GA4 mirror's client_id. The
+// hash is stable per install (so dedup and retention still work) but can't be
+// reversed or recomputed by anyone without the secret — the privacy policy
+// describes exactly this. If the secret is unset, uniques are SKIPPED (fail
+// closed) rather than falling back to the raw id; launches still count.
+
+import {
+  DL_TARGETS,
+  OPENAI_PIXEL_ID,
+  buildDownloadConversionEvent,
+  validOppref,
+  pickAsset,
+  pinnedDownload,
+  dlCountKey,
+  groupDlCounts,
+} from './dl.js';
+import {
+  markFirstSeen,
+  markNextDayReturn,
+  markWeekTwoReturn,
+  markDayOneEligible,
+  markDayOneSignal,
+  markMonthReturn,
+  DAY_ONE_SIGNALS,
+  DAY_ONE_GROUPS,
+} from './first-seen.js';
+
+const ALLOWED_PLATFORMS = new Set(['darwin', 'win32', 'linux', 'ios']);
+// Blanc for iPhone (M18 design §7.2) is counted entirely apart from desktop:
+// every key its ping touches carries this prefix, so iPhone 1.0.0 never adds
+// to desktop 1.0.0 and desktop's figures don't move. platform:ios is the one
+// shared key. The phone sends only the launch ping: no product events, no
+// first-day signals, and nothing is mirrored to Google Analytics.
+const IOS_KEY_PREFIX = 'ios:';
+
+// A view of KV with every key under `prefix`; list() returns names without
+// it, so the counting and reading helpers work unchanged on either view.
+function prefixedKV(kv, prefix) {
+  return {
+    get: (key) => kv.get(prefix + key),
+    put: (key, value, options) => kv.put(prefix + key, value, options),
+    delete: (key) => kv.delete(prefix + key),
+    async list({ prefix: inner = '', cursor, ...rest } = {}) {
+      const res = await kv.list({ ...rest, prefix: prefix + inner, cursor });
+      return { ...res, keys: res.keys.map((k) => ({ ...k, name: k.name.slice(prefix.length) })) };
+    },
+  };
+}
+const ALLOWED_ARCHES = new Set(['arm64', 'x64', 'ia32']);
+const VERSION_RE = /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The client already coarsens the OS to a bare major (src/main/telemetry.js
+// coarseOsVersion). Anything else is a client that predates the field, or a
+// forged body — both become 'unknown' rather than opening an unbounded key
+// space in KV.
+const OS_VERSION_RE = /^\d{1,4}$/;
+// 'mahjong' is historic: app versions before 1.20.0 offered Mahjong as a
+// start-page layout and still send it. Current builds never do.
+const NEWTAB_LAYOUTS = new Set(['ledger', 'billboard', 'shelf', 'tally', 'mahjong']);
+const USAGE_METRICS = Object.freeze({
+  mahjong: 'mahjong-play',
+  newtabLayouts: Object.freeze({
+    ledger: 'newtab-layout-ledger',
+    billboard: 'newtab-layout-billboard',
+    shelf: 'newtab-layout-shelf',
+    tally: 'newtab-layout-tally',
+    mahjong: 'newtab-layout-mahjong',
+  }),
+});
+const PING_RATE_LIMIT = 20; // per edge-observed IP per minute
+const DEFAULT_DAILY_INGEST_LIMIT = 250_000;
+const MAX_PING_BODY_BYTES = 2048;
+
+const GA_MEASUREMENT_ID = 'G-MN8BLY6GE9';
+const GA_ENDPOINT = 'https://www.google-analytics.com/mp/collect';
+const OPENAI_CONVERSIONS_ENDPOINT = 'https://bzr.openai.com/v1/events';
+
+// How long each period's per-install "seen" flags live. The unique COUNTERS
+// (active:*) never expire — they're the growth history. The seen flags only
+// need to outlive their own period (for dedup) plus enough slack to compute
+// retention against adjacent periods, so they're given generous but bounded
+// TTLs to keep KV from growing without limit.
+const DAY_SEEN_TTL = 90 * 24 * 3600; // ~3 months of daily-cohort history
+const WEEK_SEEN_TTL = 400 * 24 * 3600; // ~13 months of weekly cohorts
+const MONTH_SEEN_TTL = 400 * 24 * 3600; // ~13 months of monthly cohorts (retention) — trimmed from 800d, 2026-07-11 audit
+
+// First new-install cohort whose next-day returns are fully counted: the
+// return:d1 write path must be live for the whole of the following UTC day.
+// Earlier cohorts have no return counter and are omitted from /stats rather
+// than reported as 0%. Set to the UTC day the write path first deploys.
+const NEXT_DAY_RETURN_FIRST_COHORT = '2026-10-03';
+
+// First cohort whose day-one signal split is fully counted: the d1had/d1ret
+// write paths must be live for all of day D and D+1. Earlier cohorts carry no
+// `signals` section rather than zeros. Set to the UTC day AFTER the collector
+// deploy.
+const DAY_ONE_SIGNALS_FIRST_COHORT = '2026-10-12';
+
+// First cohort whose week-two return is fully counted: the return:w2 write
+// path must be live for all of D+7 through D+13. first:<id> already holds the
+// install day, so this is the first full UTC day after the deploy minus 7.
+const WEEK_TWO_RETURN_FIRST_COHORT = '2026-10-12';
+// First desktop version that sends the first-day signals. Installs first seen
+// on this version or later form the `eligible` comparison group; release prep
+// updates it if that release ships under another number.
+const DAY_ONE_SIGNALS_MIN_VERSION = '1.31.0';
+
+// VERSION_RE has already validated `version`, so its first three parts are
+// numeric. A pre-release of the minimum version counts as eligible.
+function sendsDayOneSignals(version, platform) {
+  if (platform === 'ios') return false;
+  const have = version.split(/[.-]/, 3).map(Number);
+  const need = DAY_ONE_SIGNALS_MIN_VERSION.split('.').map(Number);
+  for (let i = 0; i < 3; i++) if (have[i] !== need[i]) return have[i] > need[i];
+  return true;
+}
+
+// Keyed hash of the install id — the only form that ever touches storage or
+// GA. HMAC-SHA-256 under a worker secret, hex-encoded. Returns null (uniques
+// skipped, launches still counted) when the secret isn't configured, so a
+// misdeployed worker degrades to less data, never to raw ids at rest.
+// Deploy note: set with `wrangler secret put INSTALL_HASH_SECRET`. Rotating
+// the secret (or first enabling it) re-buckets every install once — active
+// counts see a one-time discontinuity, then dedup as before.
+async function hashInstallId(env, installId) {
+  if (!env.INSTALL_HASH_SECRET) {
+    console.warn('INSTALL_HASH_SECRET unset — skipping unique-install counting');
+    return null;
+  }
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(env.INSTALL_HASH_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(installId));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Mirrors each ping into GA4 so app launches sit next to website traffic in
+// one dashboard. Three things make GA4's Measurement Protocol actually count
+// the user as "active" in its built-in reports:
+//   1. client_id — stable per install (the HASHED install id — see
+//      hashInstallId; Google never receives the raw token); GA keys users on this.
+//   2. session_id — a random number per launch; GA needs it to count sessions.
+//   3. engagement_time_msec > 0 — without this GA silently drops the user from
+//      its Active Users metric. We send 1ms (nominal) since the ping is a
+//      point event, not a timed session.
+// User properties (platform, arch, app_version) are set once per client_id
+// and stick to the user in GA's user-scoped reports / explorations.
+function forwardToGA(
+  env,
+  { version, platform, arch, osVersion, installId, sessionId },
+  eventName = 'app_launch',
+  eventParams = {},
+) {
+  if (!env.GA_API_SECRET || !installId) return Promise.resolve();
+  const url = `${GA_ENDPOINT}?measurement_id=${GA_MEASUREMENT_ID}&api_secret=${env.GA_API_SECRET}`;
+  const sid = sessionId || String((Math.random() * 0x7FFFFFFF) >>> 0);
+  return fetch(url, {
+    method: 'POST',
+    body: JSON.stringify({
+      client_id: installId,
+      user_properties: {
+        app_version: { value: version },
+        platform: { value: platform },
+        arch: { value: arch },
+        os_version: { value: osVersion },
+      },
+      events: [{
+        name: eventName,
+        params: {
+          session_id: parseInt(sid, 10),
+          engagement_time_msec: 1,
+          app_version: version,
+          platform,
+          arch,
+          os_version: osVersion,
+          ...eventParams,
+        },
+      }],
+    }),
+  }).catch((err) => console.warn('GA forward failed:', err.message));
+}
+
+// Not atomic (KV has no increment primitive) — a handful of concurrent
+// pings can undercount by a request or two. Fine here: nothing downstream
+// needs an exact number, only the aggregate trend.
+async function bump(kv, key) {
+  const current = parseInt((await kv.get(key)) ?? '0', 10);
+  await kv.put(key, String(current + 1));
+}
+
+// Count an install as active in a period the first time it's seen there. The
+// seen flag makes this idempotent across the install's repeat launches; the
+// get-then-bump is only racy for concurrent launches of the SAME install in
+// the SAME period (vanishingly rare, and worst case over-counts by one),
+// which is within the same best-effort tolerance as bump() above.
+// The counter is bumped BEFORE the seen flag is written so a crash between
+// the two loses idempotency (possible +1 overcount on next launch) rather
+// than permanently losing the count (undercount with no recovery).
+async function markActive(kv, scope, bucket, installId, ttl) {
+  const seenKey = `seen:${scope}:${bucket}:${installId}`;
+  if ((await kv.get(seenKey)) !== null) return;
+  await bump(kv, `active:${scope}:${bucket}`);
+  await kv.put(seenKey, '1', { expirationTtl: ttl });
+}
+
+async function markUsageActive(kv, metric, scope, bucket, installId, ttl) {
+  const seenKey = `usage:${metric}:seen:${scope}:${bucket}:${installId}`;
+  if ((await kv.get(seenKey)) !== null) return;
+  await bump(kv, `usage:${metric}:active:${scope}:${bucket}`);
+  await kv.put(seenKey, '1', { expirationTtl: ttl });
+}
+
+async function ingestionGate(request, env, now) {
+  const ip = request.headers.get('CF-Connecting-IP');
+  if (!ip) return { status: 400, reason: 'missing-client-address' };
+  const length = Number(request.headers.get('Content-Length'));
+  if (Number.isFinite(length) && length > MAX_PING_BODY_BYTES) {
+    return { status: 413, reason: 'body-too-large' };
+  }
+  const minuteKey = `ingest:ip:${ip}:${Math.floor(now.getTime() / 60000)}`;
+  const count = Number.parseInt((await env.PINGS.get(minuteKey)) ?? '0', 10);
+  if (count >= PING_RATE_LIMIT) return { status: 429, reason: 'rate-limited' };
+  await env.PINGS.put(minuteKey, String(count + 1), { expirationTtl: 120 });
+
+  const dayKey = `ingest:day:${dayBucket(now)}`;
+  const dayCount = Number.parseInt((await env.PINGS.get(dayKey)) ?? '0', 10);
+  const configuredLimit = Number.parseInt(env.PING_DAILY_LIMIT ?? '', 10);
+  const dailyLimit = Number.isSafeInteger(configuredLimit) && configuredLimit > 0
+    ? configuredLimit
+    : DEFAULT_DAILY_INGEST_LIMIT;
+  if (dayCount >= dailyLimit) return { status: 503, reason: 'daily-cap' };
+  await env.PINGS.put(dayKey, String(dayCount + 1), { expirationTtl: 3 * 24 * 3600 });
+  return null;
+}
+
+// ---- UTC period buckets ----
+function dayBucket(d) {
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+function monthBucket(d) {
+  return d.toISOString().slice(0, 7); // YYYY-MM
+}
+function weekBucket(dt) {
+  // ISO-8601 week: GGGG-Www, week belonging to the year of its Thursday.
+  const d = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate()));
+  const dayNum = (d.getUTCDay() + 6) % 7; // Mon=0 .. Sun=6
+  d.setUTCDate(d.getUTCDate() - dayNum + 3); // Thursday of this week
+  const isoYear = d.getUTCFullYear();
+  const week1Thursday = new Date(Date.UTC(isoYear, 0, 4));
+  const w1Day = (week1Thursday.getUTCDay() + 6) % 7;
+  week1Thursday.setUTCDate(week1Thursday.getUTCDate() - w1Day + 3);
+  const week = 1 + Math.round((d - week1Thursday) / (7 * 86400000));
+  return `${isoYear}-W${String(week).padStart(2, '0')}`;
+}
+function prevDayBucket(dt) {
+  return dayBucket(new Date(dt.getTime() - 86400000));
+}
+function prevMonthBucket(dt) {
+  const d = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth() - 1, 1));
+  return monthBucket(d);
+}
+
+function todayLaunchKey(now) {
+  return `day:${dayBucket(now)}`;
+}
+
+function validatedClientFields(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const version = typeof body.version === 'string' && VERSION_RE.test(body.version.slice(0, 32))
+    ? body.version.slice(0, 32)
+    : null;
+  const platform = ALLOWED_PLATFORMS.has(body.platform) ? body.platform : null;
+  const arch = ALLOWED_ARCHES.has(body.arch) ? body.arch : null;
+  const osVersion = typeof body.osVersion === 'string' && OS_VERSION_RE.test(body.osVersion)
+    ? body.osVersion
+    : 'unknown';
+  // Opaque random token from the client; cap length defensively. Absent for
+  // pre-metrics clients — those still count as launches, just not as uniques.
+  const installId =
+    typeof body.installId === 'string' && UUID_RE.test(body.installId.trim())
+      ? body.installId.trim()
+      : null;
+  const sessionId =
+    typeof body.sessionId === 'number' && Number.isSafeInteger(body.sessionId) &&
+      body.sessionId > 0 && body.sessionId <= 0x7fffffff
+      ? String(Math.floor(body.sessionId))
+      : null;
+  if (!version || !platform || !arch || !installId || !sessionId) return null;
+  return { version, platform, arch, osVersion, installId, sessionId };
+}
+
+async function readClientRequest(request) {
+  try {
+    const body = await request.json();
+    const fields = validatedClientFields(body);
+    return fields ? { body, fields } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function handlePing(request, env, ctx, now) {
+  const client = await readClientRequest(request);
+  if (!client) {
+    console.warn(JSON.stringify({ event: 'ping-rejected', reason: 'implausible-payload' }));
+    return new Response('bad request', { status: 400 });
+  }
+  const { version, platform, arch, osVersion, installId, sessionId } = client.fields;
+
+  // The raw id stops here: everything downstream — KV seen-keys AND the GA
+  // mirror — sees only the keyed hash (or nothing, if the secret is unset).
+  const hashedId = installId ? await hashInstallId(env, installId) : null;
+  const ios = platform === 'ios';
+  const kv = ios ? prefixedKV(env.PINGS, IOS_KEY_PREFIX) : env.PINGS;
+
+  // A public endpoint cannot authenticate a shipped binary, but it can make
+  // retries/replays cheap: an identical install/session event is processed
+  // once. The keyed install hash prevents raw identifiers entering KV.
+  if (hashedId) {
+    const eventKey = `event:${hashedId}:${sessionId}`;
+    if ((await kv.get(eventKey)) !== null) return new Response(null, { status: 204 });
+    await kv.put(eventKey, '1', { expirationTtl: 2 * 24 * 3600 });
+  }
+
+  // GA mirror is queued before the KV writes so a KV failure can't cost
+  // the launch event too. The phone is never mirrored.
+  if (!ios) ctx.waitUntil(forwardToGA(env, { version, platform, arch, osVersion, installId: hashedId, sessionId }));
+
+  // KV get/put can throw transiently; the counts are best-effort anyway
+  // (see bump()), so log and still 204 rather than turning a blip into a
+  // dropped ping — the client (src/main/telemetry.js) never retries.
+  const work = [
+    bump(kv, 'total'),
+    bump(kv, todayLaunchKey(now)),
+    bump(kv, `version:${version}`),
+    bump(env.PINGS, `platform:${platform}`),
+    // Keyed with the platform: a bare '11' would merge macOS 11 and Windows
+    // 11. The phone's own namespace holds only iOS, so it keys the major alone.
+    bump(kv, ios ? `os:${osVersion}` : `os:${platform}:${osVersion}`),
+  ];
+  if (hashedId) {
+    work.push(
+      // One extra KV read per install per launch-day at most — the event:
+      // dedup and markActive reads already dwarf it.
+      markFirstSeen(kv, hashedId, dayBucket(now), bump).then((isNew) =>
+        isNew && sendsDayOneSignals(version, platform) && markDayOneEligible(kv, hashedId, dayBucket(now), bump)),
+      markNextDayReturn(kv, hashedId, dayBucket(now), prevDayBucket(now), bump),
+      markWeekTwoReturn(kv, hashedId, dayBucket(now), bump),
+      markActive(kv, 'day', dayBucket(now), hashedId, DAY_SEEN_TTL),
+      markActive(kv, 'week', weekBucket(now), hashedId, WEEK_SEEN_TTL),
+      markActive(kv, 'month', monthBucket(now), hashedId, MONTH_SEEN_TTL)
+    );
+    // The kill criteria's 30-day retention (port revisit), for the phone only.
+    if (ios) work.push(markMonthReturn(kv, hashedId, dayBucket(now), bump));
+  }
+  await Promise.all(work).catch((err) => console.error('KV write failed:', err.message));
+
+  return new Response(null, { status: 204 });
+}
+
+function usageEventFrom(body) {
+  if (body.event === 'mahjong_play') {
+    return { eventName: 'mahjong_play', metric: USAGE_METRICS.mahjong, params: {} };
+  }
+  if (body.event === 'newtab_layout' && NEWTAB_LAYOUTS.has(body.layout)) {
+    return {
+      eventName: 'newtab_layout',
+      metric: USAGE_METRICS.newtabLayouts[body.layout],
+      params: { layout: body.layout },
+    };
+  }
+  return null;
+}
+
+// The two first-day signals have their own path: no GA forward, no
+// productUsage metric, no per-session replay key (the install-day marker is
+// the dedup). See markDayOneSignal in first-seen.js.
+const DAY_ONE_EVENTS = Object.freeze(Object.fromEntries(DAY_ONE_SIGNALS.map((s) => [`day1_${s}`, s])));
+
+async function handleDayOneSignal(env, fields, signal, now) {
+  const hashedId = await hashInstallId(env, fields.installId);
+  if (hashedId) {
+    await markDayOneSignal(env.PINGS, hashedId, signal, dayBucket(now), bump)
+      .catch((err) => console.error('KV write failed:', err.message));
+  }
+  return new Response(null, { status: 204 });
+}
+
+async function handleUsageEvent(request, env, ctx, now) {
+  const client = await readClientRequest(request);
+  // hasOwn: an event named '__proto__' or 'constructor' must not match.
+  const signal = client && Object.hasOwn(DAY_ONE_EVENTS, client.body.event)
+    ? DAY_ONE_EVENTS[client.body.event]
+    : undefined;
+  if (signal && client.fields.platform !== 'ios') return handleDayOneSignal(env, client.fields, signal, now);
+  // The phone sends only its launch ping (M18 §7.2).
+  const usage = client && client.fields.platform !== 'ios' ? usageEventFrom(client.body) : null;
+  if (!client || !usage) {
+    console.warn(JSON.stringify({ event: 'usage-rejected', reason: 'implausible-payload' }));
+    return new Response('bad request', { status: 400 });
+  }
+
+  const fields = client.fields;
+  const hashedId = await hashInstallId(env, fields.installId);
+  if (hashedId) {
+    const replayKey = `usage:${usage.metric}:event:${hashedId}:${fields.sessionId}`;
+    if ((await env.PINGS.get(replayKey)) !== null) return new Response(null, { status: 204 });
+    await env.PINGS.put(replayKey, '1', { expirationTtl: 2 * 24 * 3600 });
+  }
+
+  ctx.waitUntil(forwardToGA(
+    env,
+    { ...fields, installId: hashedId },
+    usage.eventName,
+    usage.params,
+  ));
+
+  const day = dayBucket(now);
+  const work = [
+    bump(env.PINGS, `usage:${usage.metric}:total`),
+    bump(env.PINGS, `usage:${usage.metric}:day:${day}`),
+  ];
+  if (hashedId) {
+    work.push(
+      markUsageActive(env.PINGS, usage.metric, 'day', day, hashedId, DAY_SEEN_TTL),
+      markUsageActive(env.PINGS, usage.metric, 'week', weekBucket(now), hashedId, WEEK_SEEN_TTL),
+      markUsageActive(env.PINGS, usage.metric, 'month', monthBucket(now), hashedId, MONTH_SEEN_TTL),
+    );
+  }
+  await Promise.all(work).catch((err) => console.error('KV write failed:', err.message));
+  return new Response(null, { status: 204 });
+}
+
+// Read every key under a prefix into { suffix: intValue }. Gets within each
+// list page run in parallel to stay within Workers' CPU/wall-clock budget.
+async function readMap(kv, prefix) {
+  const out = {};
+  let cursor;
+  do {
+    const res = await kv.list({ prefix, cursor });
+    const entries = await Promise.all(
+      res.keys.map(async ({ name }) => [
+        name.slice(prefix.length),
+        parseInt((await kv.get(name)) ?? '0', 10),
+      ])
+    );
+    for (const [k, v] of entries) out[k] = v;
+    cursor = res.list_complete ? undefined : res.cursor;
+  } while (cursor);
+  return out;
+}
+
+// Gather the set of install ids seen in one period, for cohort/retention math.
+// Capped so a runaway install base can't blow the Worker's memory/time budget;
+// truncation is surfaced in the response rather than silently miscomputed.
+async function collectSeen(kv, scope, bucket, cap = 50000) {
+  const prefix = `seen:${scope}:${bucket}:`;
+  const ids = new Set();
+  let cursor;
+  let truncated = false;
+  do {
+    const res = await kv.list({ prefix, cursor });
+    for (const { name } of res.keys) ids.add(name.slice(prefix.length));
+    cursor = res.list_complete ? undefined : res.cursor;
+    if (ids.size >= cap) {
+      truncated = true;
+      break;
+    }
+  } while (cursor);
+  return { ids, truncated };
+}
+
+function pickRecent(map, n) {
+  return Object.fromEntries(
+    Object.keys(map)
+      .sort()
+      .slice(-n)
+      .map((k) => [k, map[k]])
+  );
+}
+
+async function readUsageMetric(kv, metric) {
+  const [total, byDay, daily, weekly, monthly] = await Promise.all([
+    kv.get(`usage:${metric}:total`),
+    readMap(kv, `usage:${metric}:day:`),
+    readMap(kv, `usage:${metric}:active:day:`),
+    readMap(kv, `usage:${metric}:active:week:`),
+    readMap(kv, `usage:${metric}:active:month:`),
+  ]);
+  return {
+    events: {
+      total: parseInt(total ?? '0', 10),
+      byDay: pickRecent(byDay, 30),
+    },
+    activeUsers: {
+      daily: pickRecent(daily, 30),
+      weekly: pickRecent(weekly, 12),
+      monthly: pickRecent(monthly, 12),
+    },
+  };
+}
+
+async function readProductUsage(kv) {
+  const layouts = Object.keys(USAGE_METRICS.newtabLayouts);
+  const [mahjong, ...layoutStats] = await Promise.all([
+    readUsageMetric(kv, USAGE_METRICS.mahjong),
+    ...layouts.map((layout) => readUsageMetric(kv, USAGE_METRICS.newtabLayouts[layout])),
+  ]);
+  return {
+    mahjong,
+    newtabLayouts: Object.fromEntries(layouts.map((layout, i) => [layout, layoutStats[i]])),
+  };
+}
+
+// POST /admin/purge-legacy-ids — one-shot migration for the 2026-07-11 HMAC
+// change: pings before it wrote seen:* markers keyed by the RAW install UUID
+// (some monthly ones with the old 800-day TTL). Deleting them is what makes
+// the privacy policy's "the raw install ID is never stored" true for the
+// whole store, not just for new pings. Deletes ONLY keys whose install
+// segment matches the old UUID format — 64-hex HMAC keys and the aggregate
+// active:*/day:*/version:* counters are untouched. Bounded per invocation to
+// stay inside the Workers subrequest budget; idempotent, so re-run until it
+// returns done:true. Note: deleting the legacy markers breaks active-user
+// dedup and retention cohorts ACROSS the migration boundary only — installs
+// re-count as new once, then dedup as before.
+const PURGE_DELETE_BUDGET = 800;
+const purgeReport = (obj) =>
+  new Response(JSON.stringify(obj), { headers: { 'Content-Type': 'application/json' } });
+async function handlePurgeLegacy(request, env) {
+  if (!env.STATS_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.STATS_TOKEN}`) {
+    return new Response('unauthorized', { status: 401 });
+  }
+  let scanned = 0;
+  let deleted = 0;
+  let cursor;
+  for (;;) {
+    const res = await env.PINGS.list({ prefix: 'seen:', cursor });
+    for (const { name } of res.keys) {
+      scanned++;
+      // Buckets never contain ':' (YYYY-MM-DD / GGGG-Www / YYYY-MM), so the
+      // final segment is always the install token.
+      const installSegment = name.slice(name.lastIndexOf(':') + 1);
+      if (UUID_RE.test(installSegment)) {
+        await env.PINGS.delete(name);
+        deleted++;
+        if (deleted >= PURGE_DELETE_BUDGET) {
+          return purgeReport({ scanned, deleted, done: false });
+        }
+      }
+    }
+    if (res.list_complete) return purgeReport({ scanned, deleted, done: true });
+    cursor = res.cursor;
+  }
+}
+
+// The cohort days /stats shows: the newest 30 install days from the first
+// tracked next-day cohort on.
+function shownCohortDays(newByDay) {
+  return Object.keys(newByDay).sort().slice(-30).filter((day) => day >= NEXT_DAY_RETURN_FIRST_COHORT);
+}
+
+// First-day group counts for exactly the shown days, read directly so the
+// cost stays bounded (3 groups x 2 counters x <= 30 days) however long the
+// never-expiring d1had/d1ret history grows.
+async function readDayOneCounts(kv, days) {
+  const byDay = {};
+  await Promise.all(days.filter((day) => day >= DAY_ONE_SIGNALS_FIRST_COHORT).map(async (day) => {
+    const entries = await Promise.all(DAY_ONE_GROUPS.map(async (group) => {
+      const [had, returned] = await Promise.all([
+        kv.get(`d1had:${group}:${day}`),
+        kv.get(`d1ret:${group}:${day}`),
+      ]);
+      return [group, { had: parseInt(had ?? '0', 10), returnedNextDay: parseInt(returned ?? '0', 10) }];
+    }));
+    const counts = Object.fromEntries(entries);
+    byDay[day] = {
+      eligible: { installs: counts.eligible.had, returnedNextDay: counts.eligible.returnedNextDay },
+      ...Object.fromEntries(DAY_ONE_SIGNALS.map((signal) => [signal, counts[signal]])),
+    };
+  }));
+  return byDay;
+}
+
+// Next-day return per new-install cohort day: installs first seen on D that
+// launched again on D+1 (UTC). `complete` is false while D+1 is still today
+// (or D is today), so a partial reading is never mistaken for a final rate.
+// From DAY_ONE_SIGNALS_FIRST_COHORT each day also carries `signals`: how many
+// of that day's new installs could send the first-day signals (`eligible`),
+// how many had each signal, and how many of each returned. Readers derive the
+// "didn't" group from eligible, never from newInstalls.
+function nextDayReturnByCohort(newByDay, returnD1ByDay, today, dayOneByDay = {}) {
+  const byDay = {};
+  for (const day of shownCohortDays(newByDay)) {
+    const newInstalls = newByDay[day];
+    const returnedNextDay = returnD1ByDay[day] ?? 0;
+    const nextDay = dayBucket(new Date(Date.parse(`${day}T00:00:00Z`) + 86400000));
+    byDay[day] = {
+      newInstalls,
+      returnedNextDay,
+      rate: newInstalls ? Number((returnedNextDay / newInstalls).toFixed(4)) : 0,
+      complete: nextDay < today,
+    };
+    if (dayOneByDay[day]) byDay[day].signals = dayOneByDay[day];
+  }
+  return { firstCohort: NEXT_DAY_RETURN_FIRST_COHORT, byDay };
+}
+
+// Week-two return per new-install cohort day: installs first seen on D that
+// launched again on any day D+7 through D+13 (UTC). The newest 30 install days
+// from the first tracked cohort; `complete` is false until D+13 has ended.
+function weekTwoReturnByCohort(newByDay, returnW2ByDay, today) {
+  const byDay = {};
+  const days = Object.keys(newByDay).sort().slice(-30).filter((day) => day >= WEEK_TWO_RETURN_FIRST_COHORT);
+  for (const day of days) {
+    const newInstalls = newByDay[day];
+    const returnedWeekTwo = returnW2ByDay[day] ?? 0;
+    const lastDay = dayBucket(new Date(Date.parse(`${day}T00:00:00Z`) + 13 * 86400000));
+    byDay[day] = {
+      newInstalls,
+      returnedWeekTwo,
+      rate: newInstalls ? Number((returnedWeekTwo / newInstalls).toFixed(4)) : 0,
+      complete: lastDay < today,
+    };
+  }
+  return { firstCohort: WEEK_TWO_RETURN_FIRST_COHORT, byDay };
+}
+
+// Thirty-day return per iPhone cohort day: installs first seen on D that
+// launched again on any day D+28 through D+34 (UTC). `complete` is false
+// until D+34 has ended.
+function monthReturnByCohort(newByDay, returnM1ByDay, today) {
+  const byDay = {};
+  for (const day of Object.keys(newByDay).sort().slice(-60)) {
+    const newInstalls = newByDay[day];
+    const returnedMonth = returnM1ByDay[day] ?? 0;
+    const lastDay = dayBucket(new Date(Date.parse(`${day}T00:00:00Z`) + 34 * 86400000));
+    byDay[day] = {
+      newInstalls,
+      returnedMonth,
+      rate: newInstalls ? Number((returnedMonth / newInstalls).toFixed(4)) : 0,
+      complete: lastDay < today,
+    };
+  }
+  return { byDay };
+}
+
+// The phone's block in /stats (M18 §7.2): the launch, active-user, retention
+// and return figures desktop's top level has, read from the ios: namespace,
+// plus the 30-day return. No downloads, product usage or first-day split.
+async function iosStats(kv, now) {
+  const [
+    total, byDay, byVersion, byOsVersion, daily, weekly, monthly, newByDay, returnD1ByDay, returnW2ByDay, returnM1ByDay,
+  ] = await Promise.all([
+    kv.get('total'),
+    readMap(kv, 'day:'),
+    readMap(kv, 'version:'),
+    readMap(kv, 'os:'),
+    readMap(kv, 'active:day:'),
+    readMap(kv, 'active:week:'),
+    readMap(kv, 'active:month:'),
+    readMap(kv, 'new:day:'),
+    readMap(kv, 'return:d1:'),
+    readMap(kv, 'return:w2:'),
+    readMap(kv, 'return:m1:'),
+  ]);
+  const thisMonth = monthBucket(now);
+  const lastMonth = prevMonthBucket(now);
+  const [cohort, current] = await Promise.all([
+    collectSeen(kv, 'month', lastMonth),
+    collectSeen(kv, 'month', thisMonth),
+  ]);
+  let returned = 0;
+  for (const id of cohort.ids) if (current.ids.has(id)) returned++;
+  const cohortSize = cohort.ids.size;
+  const today = dayBucket(now);
+  return {
+    launches: { total: parseInt(total ?? '0', 10), byDay, byVersion, byOsVersion },
+    activeUsers: { daily: pickRecent(daily, 30), weekly: pickRecent(weekly, 12), monthly: pickRecent(monthly, 12) },
+    retention: {
+      cohortMonth: lastMonth,
+      returnedInMonth: thisMonth,
+      cohortSize,
+      returned,
+      rate: cohortSize ? Number((returned / cohortSize).toFixed(4)) : 0,
+      truncated: cohort.truncated || current.truncated,
+    },
+    newInstalls: { byDay: pickRecent(newByDay, 60) },
+    nextDayReturn: nextDayReturnByCohort(newByDay, returnD1ByDay, today),
+    weekTwoReturn: weekTwoReturnByCohort(newByDay, returnW2ByDay, today),
+    monthReturn: monthReturnByCohort(newByDay, returnM1ByDay, today),
+  };
+}
+
+// GET /stats — bearer-token-gated readout so the counts are visible
+// without opening the Cloudflare dashboard's KV browser.
+async function handleStats(request, env, now) {
+  if (!env.STATS_TOKEN || request.headers.get('Authorization') !== `Bearer ${env.STATS_TOKEN}`) {
+    return new Response('unauthorized', { status: 401 });
+  }
+
+  const [
+    total, byDay, byVersion, byPlatform, byOsVersion,
+    daily, weekly, monthly, dlFlat, newByDay, returnD1ByDay, returnW2ByDay, productUsage,
+  ] = await Promise.all([
+    env.PINGS.get('total'),
+    readMap(env.PINGS, 'day:'),
+    readMap(env.PINGS, 'version:'),
+    readMap(env.PINGS, 'platform:'),
+    readMap(env.PINGS, 'os:'),
+    readMap(env.PINGS, 'active:day:'),
+    readMap(env.PINGS, 'active:week:'),
+    readMap(env.PINGS, 'active:month:'),
+    // 'dl:' cannot collide with 'dlcache:release' — the prefix requires a
+    // colon as the third character.
+    readMap(env.PINGS, 'dl:'),
+    // No other key family starts 'new:'.
+    readMap(env.PINGS, 'new:day:'),
+    readMap(env.PINGS, 'return:d1:'),
+    readMap(env.PINGS, 'return:w2:'),
+    readProductUsage(env.PINGS),
+  ]);
+  const ios = await iosStats(prefixedKV(env.PINGS, IOS_KEY_PREFIX), now);
+
+  // Month-over-month retention: of the installs active last month, how many
+  // came back this month. Bounded by collectSeen's cap.
+  const thisMonth = monthBucket(now);
+  const lastMonth = prevMonthBucket(now);
+  // The first-day split needs the shown cohort days, so it runs alongside the
+  // retention scan rather than in the first batch.
+  const [cohort, current, dayOneByDay] = await Promise.all([
+    collectSeen(env.PINGS, 'month', lastMonth),
+    collectSeen(env.PINGS, 'month', thisMonth),
+    readDayOneCounts(env.PINGS, shownCohortDays(newByDay)),
+  ]);
+  let returned = 0;
+  for (const id of cohort.ids) if (current.ids.has(id)) returned++;
+  const cohortSize = cohort.ids.size;
+
+  const stats = {
+    launches: {
+      total: parseInt(total ?? '0', 10),
+      byDay,
+      byVersion,
+      byPlatform,
+      byOsVersion,
+    },
+    activeUsers: {
+      daily: pickRecent(daily, 30),
+      weekly: pickRecent(weekly, 12),
+      monthly: pickRecent(monthly, 12),
+    },
+    retention: {
+      cohortMonth: lastMonth,
+      returnedInMonth: thisMonth,
+      cohortSize,
+      returned,
+      rate: cohortSize ? Number((returned / cohortSize).toFixed(4)) : 0,
+      truncated: cohort.truncated || current.truncated,
+    },
+    siteDownloads: {
+      byDay: groupDlCounts(dlFlat),
+    },
+    newInstalls: {
+      byDay: pickRecent(newByDay, 60),
+    },
+    nextDayReturn: nextDayReturnByCohort(newByDay, returnD1ByDay, dayBucket(now), dayOneByDay),
+    weekTwoReturn: weekTwoReturnByCohort(newByDay, returnW2ByDay, dayBucket(now)),
+    productUsage,
+    ios,
+  };
+  return new Response(JSON.stringify(stats, null, 2), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+const RELEASES_LATEST_PAGE = 'https://github.com/bnfy/blanc/releases/latest';
+const RELEASE_CACHE_KEY = 'dlcache:release';
+const RELEASE_CACHE_FRESH_MS = 10 * 60 * 1000;
+
+// Resolve the latest release's assets, KV-cached. The cache entry is stored
+// WITHOUT a TTL and carries its own fetchedAt: when GitHub is unreachable or
+// rate-limits (unauthenticated Workers egress IPs are shared, 60 req/hr/IP),
+// a stale entry keeps /dl serving artifacts instead of dumping every click
+// on the releases page.
+async function latestReleaseAssets(env, now) {
+  let cached = null;
+  try {
+    cached = JSON.parse((await env.PINGS.get(RELEASE_CACHE_KEY)) ?? 'null');
+  } catch { /* corrupt cache reads as absent */ }
+  if (cached && now.getTime() - cached.fetchedAt < RELEASE_CACHE_FRESH_MS) return cached.assets;
+  try {
+    const res = await fetch('https://api.github.com/repos/bnfy/blanc/releases/latest', {
+      headers: { 'User-Agent': 'blanc-ping-worker', Accept: 'application/vnd.github+json' },
+    });
+    if (!res.ok) throw new Error(`GitHub ${res.status}`);
+    const release = await res.json();
+    const assets = (release.assets ?? [])
+      .map((a) => ({ name: a.name, browser_download_url: a.browser_download_url }));
+    if (!assets.length) throw new Error('empty asset list');
+    await env.PINGS.put(RELEASE_CACHE_KEY, JSON.stringify({ fetchedAt: now.getTime(), assets }));
+    return assets;
+  } catch (err) {
+    console.warn('release resolve failed:', err.message);
+    return cached?.assets ?? null;
+  }
+}
+
+// GET /dl/<target> — counted download redirect for the website. Bumps
+// one KV counter per click (a bare count: no IP, no UA, nothing per-user)
+// and 302s to the latest release artifact. ANY failure degrades to the
+// releases page so a person always reaches the file; unknown targets
+// redirect without counting.
+async function handleDownload(request, env, ctx, now, target) {
+  const redirect = (to) => new Response(null, {
+    status: 302,
+    headers: { Location: to, 'Cache-Control': 'no-store' },
+  });
+  if (!DL_TARGETS.has(target)) return redirect(RELEASES_LATEST_PAGE);
+  ctx.waitUntil(
+    bump(env.PINGS, dlCountKey(dayBucket(now), target))
+      .catch((err) => console.error('dl count failed:', err.message))
+  );
+  const oppref = new URL(request.url).searchParams.get('oppref');
+  if (env.OPENAI_CONVERSIONS_API_KEY && validOppref(oppref)) {
+    const event = buildDownloadConversionEvent({
+      target,
+      oppref,
+      timestampMs: now.getTime(),
+      eventId: crypto.randomUUID(),
+    });
+    ctx.waitUntil(
+      fetch(`${OPENAI_CONVERSIONS_ENDPOINT}?pid=${encodeURIComponent(OPENAI_PIXEL_ID)}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${env.OPENAI_CONVERSIONS_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ validate_only: false, events: [event] }),
+      }).then((response) => {
+        if (!response.ok) throw new Error('conversion request rejected');
+      }).catch(() => console.warn('OpenAI conversion send failed'))
+    );
+  }
+  const pinned = pinnedDownload(target);
+  if (pinned) return redirect(pinned);
+  const assets = await latestReleaseAssets(env, now);
+  const asset = assets ? pickAsset(assets, target) : null;
+  return redirect(asset ? asset.browser_download_url : RELEASES_LATEST_PAGE);
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const now = new Date();
+    if (request.method === 'POST' && (url.pathname === '/ping' || url.pathname === '/event')) {
+      const denied = await ingestionGate(request, env, now);
+      if (denied) {
+        console.warn(JSON.stringify({
+          event: url.pathname === '/ping' ? 'ping-rejected' : 'usage-rejected',
+          reason: denied.reason,
+        }));
+        return new Response(denied.reason, {
+          status: denied.status,
+          headers: denied.status === 429 ? { 'Retry-After': '60' } : {},
+        });
+      }
+      return url.pathname === '/ping'
+        ? handlePing(request, env, ctx, now)
+        : handleUsageEvent(request, env, ctx, now);
+    }
+    if (request.method === 'GET' && url.pathname === '/stats') return handleStats(request, env, now);
+    if (request.method === 'GET' && url.pathname.startsWith('/dl/')) {
+      return handleDownload(request, env, ctx, now, url.pathname.slice('/dl/'.length));
+    }
+    if (request.method === 'POST' && url.pathname === '/admin/purge-legacy-ids') return handlePurgeLegacy(request, env);
+    return new Response('not found', { status: 404 });
+  },
+};

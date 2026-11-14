@@ -1,0 +1,484 @@
+// src/main/workspaces-model.js
+// Named Workspaces — pure entitlement-free decisions. NO require('electron').
+// Mirrors the Electron-free pattern of session-workspace.js / patron-model.js
+// so every branch is unit-testable. This file owns the record shape and its
+// repair rules; workspaces.js owns the store, main.js owns the tabs.
+
+const { validProfileId } = require('./local-profile-model');
+const { recaseWorkspacesFile } = require('./group-name-case');
+const { savedSplitColumns } = require('./split-model');
+const { savedPolicyColumns } = require('./document-policy');
+// A workspace id must survive a round-trip through session.json's
+// `workspaceId` binding pointer, so the rule is DEFINED in session-workspace
+// and imported here — one direction only. Defining it here and importing it
+// there would be a cycle: Node would hand session-workspace a partial exports
+// object, leaving validWindowId undefined mid-load and failing every id.
+const { validWorkspaceId } = require('./session-workspace');
+// A space's colour and symbol: the shared pure module the chrome documents
+// also load, so main and the menu agree on presets, symbols and defaults.
+const Identity = require('../renderer/space-identity');
+
+const WORKSPACES_VERSION = 2;
+const RECOVERY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Bounded like the closed-tab entry cap: keeps the file small and the ⌘L
+// list scannable. A plan-time decision, not a spec requirement.
+const MAX_WORKSPACES = 25;
+const MAX_NAME_LENGTH = 60;
+
+/** A fresh empty file. Returns a NEW object each call — a shared default
+ * would let one profile's store mutate another's. */
+// groupNamesRecased: group names here were given their capital first letter
+// once (spec 2026-10-16-island-lower-section §9.2); a file without it predates
+// case-keeping group names.
+const EMPTY_FILE = () => ({ version: WORKSPACES_VERSION, groupNamesRecased: 1, workspaces: [], deleted: [] });
+
+/** The user's handle for switching: trimmed, whitespace-collapsed, capped.
+ * Null when nothing survives, which is what makes an empty name a rejection
+ * rather than a workspace called "". */
+function sanitizeName(raw) {
+  if (typeof raw !== 'string') return null;
+  const clean = raw.trim().replace(/\s+/g, ' ').slice(0, MAX_NAME_LENGTH);
+  return clean === '' ? null : clean;
+}
+
+// Always a NEW array. Returning the caller's array by reference would let a
+// later updateCapture (or a store write) mutate the object we normalized from.
+const asArray = (value) => (Array.isArray(value) ? value.slice() : []);
+const sharedRecordId=value=>typeof value==='string'&&/^[0-9a-f]{32}$/.test(value);
+const sharedTabColumn=(source,length)=>Array.isArray(source.tabIds)&&source.tabIds.length===length
+  ? {tabIds:source.tabIds.map(id=>sharedRecordId(id)?id:null)} : {};
+/** Where the Recently closed band sits among the Space's groups; the default
+ * (0, under Pinned) is never written. */
+const closedSlotColumn = (source) => ({
+  ...(Number.isInteger(source.closedSlot) && source.closedSlot > 0 ? { closedSlot: source.closedSlot } : {}),
+  // The order as drawn (spec 2026-10-17) and the band's item index; the
+  // closedSlot above stays the rollback copy, counting groups only.
+  ...(source.sectionOrder === true ? { sectionOrder: true } : {}),
+  ...(Number.isInteger(source.closedIndex) && source.closedIndex > 0 ? { closedIndex: source.closedIndex } : {}),
+});
+
+/** One workspace record, repaired — or null when it cannot be trusted.
+ * Rejects (rather than repairs) identity fields: a record with no id, no
+ * usable name, or a foreign profileId is not this file's to keep. */
+function normalizeWorkspace(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (!validWorkspaceId(raw.id)) return null;
+  if (!validProfileId(raw.profileId)) return null;
+  const name = sanitizeName(raw.name);
+  if (name === null) return null;
+  if (!Array.isArray(raw.urls)) return null;
+
+  const urls = asArray(raw.urls);
+  const meta = asArray(raw.meta);
+  return {
+    id: raw.id,
+    ...(raw.preservedLocal===true?{preservedLocal:true}:{}),
+    name,
+    profileId: raw.profileId,
+    createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : 0,
+    updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : 0,
+    revision: Number.isSafeInteger(raw.revision) && raw.revision >= 0 ? raw.revision : 0,
+    urls,
+    activeIndex: Number.isInteger(raw.activeIndex) ? raw.activeIndex : 0,
+    groups: asArray(raw.groups),
+    groupIds: asArray(raw.groupIds),
+    pinned: asArray(raw.pinned),
+    // Titles/favicons are zipped onto `urls`. A length mismatch means a
+    // writer moved the URL column, so the record survives without its meta
+    // rather than pairing a title with the wrong tab.
+    meta: meta.length === urls.length ? meta : [],
+    ...sharedTabColumn(raw,urls.length),
+    ...(sharedRecordId(raw.sharedId)?{sharedId:raw.sharedId}:{}),
+    ...(sharedRecordId(raw.sharedId)&&['active','dormant'].includes(raw.sharedLink)?{sharedLink:raw.sharedLink}:{}),
+    ...(sharedRecordId(raw.recoveredFrom)?{recoveredFrom:raw.recoveredFrom}:{}),
+    ...(Array.isArray(raw.localFiles) && raw.localFiles.length === urls.length
+      ? { localFiles: raw.localFiles.map((value) => value === true) } : {}),
+    ...closedSlotColumn(raw),
+    ...savedSplitColumns(raw, urls.length),
+    ...savedPolicyColumns(raw),
+    // Identity fields only when valid; normalizeFile assigns the defaults.
+    ...(Identity.normalizeHex(raw.color) ? { color: Identity.normalizeHex(raw.color) } : {}),
+    ...(Identity.isSymbol(raw.symbol) ? { symbol: raw.symbol } : {}),
+  };
+}
+
+/** Records with a colour and symbol each: a missing or invalid one becomes the
+ * first preset/symbol no other record uses, in list order. Stable once
+ * written: the load path persists the result (spec D13). */
+function withIdentities(records, others = []) {
+  const result = records.map((record) => ({ ...record }));
+  for (const record of result) {
+    if (record.color && record.symbol) continue;
+    const taken = [...others, ...result.filter((other) => other !== record)];
+    const defaults = Identity.defaultsFor(taken.map(({ color, symbol }) => ({ color, symbol })));
+    if (!record.color) record.color = defaults.color;
+    if (!record.symbol) record.symbol = defaults.symbol;
+  }
+  return result;
+}
+
+/** The whole file, repaired: invalid records dropped, ids de-duplicated
+ * (first wins), and the list bounded. Call loadFile at disk boundaries: a
+ * future format must never enter this supported-format normalizer. */
+function normalizeFile(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const seen = new Set();
+  const workspaces = [];
+  let ordinaryCount=0;
+  for (const entry of asArray(source.workspaces)) {
+    const workspace = normalizeWorkspace(entry);
+    if (!workspace || seen.has(workspace.id)) continue;
+    seen.add(workspace.id);
+    // A remote concurrent addition or a preservation copy must not disappear
+    // on the next disk read. Ordinary local creation still uses the cap.
+    if(!workspace.sharedId&&!workspace.recoveredFrom&&!workspace.preservedLocal) {
+      if(ordinaryCount>=MAX_WORKSPACES)continue;
+      ordinaryCount++;
+    }
+    workspaces.push(workspace);
+  }
+  // v1 displayed most-recently-saved first; migrate that order once.
+  if (source.version === 1) workspaces.sort((a, b) => b.updatedAt - a.updatedAt);
+  const deleted = asArray(source.deleted).flatMap((entry) => {
+    const workspace = normalizeWorkspace(entry?.workspace);
+    return workspace && !seen.has(workspace.id) && Number.isFinite(entry.deletedAt)
+      ? [{ workspace, deletedAt: entry.deletedAt, index: Number.isInteger(entry.index) ? entry.index : workspaces.length }] : [];
+  }).slice(-MAX_WORKSPACES);
+  const identified = withIdentities(workspaces);
+  return {
+    version: WORKSPACES_VERSION,
+    groupNamesRecased: 1,
+    workspaces: identified,
+    deleted: deleted.map((entry) => ({ ...entry, workspace: withIdentities([entry.workspace], identified)[0] })),
+  };
+}
+
+function loadFile(raw) {
+  if (raw && typeof raw === 'object' && Number(raw.version) > WORKSPACES_VERSION) {
+    return { status: 'future-format', file: raw };
+  }
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.workspaces)) {
+    return { status: 'corrupt', file: EMPTY_FILE() };
+  }
+  const file = normalizeFile(raw);
+  // Names saved before group names kept their case get a capital once; the
+  // stamp normalizeFile writes means this never runs on the file again.
+  if (raw.groupNamesRecased !== 1) return { status: 'supported', file: recaseWorkspacesFile(file).file };
+  return { status: 'supported', file };
+}
+
+const OPTIONAL_CAPTURE_COLUMNS = ['localFiles', 'closedSlot', 'sectionOrder', 'closedIndex', 'splits', 'splitIds', 'documentPolicy', 'inheritsDocumentPolicy', 'tabIds'];
+
+/** The tab columns a capture carries, copied so the record never aliases the
+ * live arrays main.js built it from. */
+const captureColumns = (capture) => {
+  const source = capture && typeof capture === 'object' ? capture : {};
+  const urls = asArray(source.urls);
+  const meta = asArray(source.meta);
+  return {
+    urls,
+    activeIndex: Number.isInteger(source.activeIndex) ? source.activeIndex : 0,
+    groups: asArray(source.groups),
+    groupIds: asArray(source.groupIds),
+    pinned: asArray(source.pinned),
+    meta: meta.length === urls.length ? meta : [],
+    ...sharedTabColumn(source,urls.length),
+    ...(Array.isArray(source.localFiles) && source.localFiles.length === urls.length
+      ? { localFiles: source.localFiles.map((value) => value === true) } : {}),
+    ...closedSlotColumn(source),
+    ...savedSplitColumns(source, urls.length),
+    // Page-opened tabs' document-policy marks (document-policy.js).
+    ...savedPolicyColumns(source),
+  };
+};
+
+/** Names are the user's handle for switching, so a collision inside one
+ * profile is confusing rather than merely redundant. Case-insensitive.
+ * `exceptId` lets a rename keep its own current name. */
+const nameTaken = (file, profileId, name, exceptId = null) => {
+  const wanted = name.toLowerCase();
+  return file.workspaces.some((w) =>
+    w.profileId === profileId && w.id !== exceptId && w.name.toLowerCase() === wanted);
+};
+
+const withWorkspaces = (file, workspaces) => ({ ...file, version: WORKSPACES_VERSION, workspaces });
+
+function createWorkspace(file, { name, profileId, capture, now, id, color, symbol } = {}) {
+  const clean = normalizeFile(file);
+  const safeName = sanitizeName(name);
+  if (safeName === null) return { file: clean, error: 'invalid-name' };
+  if (clean.workspaces.length >= MAX_WORKSPACES) return { file: clean, error: 'limit' };
+  if (nameTaken(clean, profileId, safeName)) return { file: clean, error: 'duplicate-name' };
+
+  const defaults = Identity.defaultsFor(clean.workspaces);
+  const workspace = normalizeWorkspace({
+    id, name: safeName, profileId, createdAt: now, updatedAt: now, ...captureColumns(capture),
+    color: Identity.normalizeHex(color) ?? defaults.color,
+    symbol: Identity.isSymbol(symbol) ? symbol : defaults.symbol,
+  });
+  // A caller-supplied id or profileId that cannot be stored is a programming
+  // error, not a user error — surface it rather than writing a broken record.
+  if (!workspace) return { file: clean, error: 'invalid-record' };
+  return { file: withWorkspaces(clean, [...clean.workspaces, workspace]), workspace };
+}
+
+/** Rename, recolour or change the symbol of one space: any subset of
+ * `{ name, color, symbol }`. Unchanged values write nothing. */
+function updateWorkspace(file, id, patch = {}, now) {
+  const clean = normalizeFile(file);
+  const existing = clean.workspaces.find((w) => w.id === id);
+  if (!existing) return { file: clean, error: 'not-found' };
+  const next = { ...existing };
+  if (patch.name !== undefined) {
+    const safeName = sanitizeName(patch.name);
+    if (safeName === null) return { file: clean, error: 'invalid-name' };
+    if (nameTaken(clean, existing.profileId, safeName, id)) return { file: clean, error: 'duplicate-name' };
+    next.name = safeName;
+  }
+  if (patch.color !== undefined) {
+    const color = Identity.normalizeHex(patch.color);
+    if (!color) return { file: clean, error: 'invalid-color' };
+    next.color = color;
+  }
+  if (patch.symbol !== undefined) {
+    if (!Identity.isSymbol(patch.symbol)) return { file: clean, error: 'invalid-symbol' };
+    next.symbol = patch.symbol;
+  }
+  if (next.name === existing.name && next.color === existing.color && next.symbol === existing.symbol) {
+    return { file: clean, workspace: existing, unchanged: true };
+  }
+  next.updatedAt = now;
+  return {
+    file: withWorkspaces(clean, clean.workspaces.map((w) => (w.id === id ? next : w))),
+    workspace: next,
+  };
+}
+
+function deleteWorkspace(file, id, now = Date.now()) {
+  const clean = normalizeFile(file);
+  const workspaces = clean.workspaces.filter((w) => w.id !== id);
+  const index = clean.workspaces.findIndex((w) => w.id === id);
+  const next = withWorkspaces(clean, workspaces);
+  next.deleted = clean.deleted.filter((d) => now - d.deletedAt < RECOVERY_TTL_MS);
+  if (index >= 0) next.deleted.push({ workspace: clean.workspaces[index], index, deletedAt: now });
+  next.deleted = next.deleted.slice(-MAX_WORKSPACES);
+  return {
+    file: next,
+    removed: workspaces.length !== clean.workspaces.length,
+  };
+}
+
+/** Autosave: replace the tab columns from a live capture. Identity fields
+ * (id/name/profileId/createdAt) are preserved — a capture is not a rename. */
+function updateCapture(file, id, capture, now) {
+  const clean = normalizeFile(file);
+  const existing = clean.workspaces.find((w) => w.id === id);
+  if (!existing) return { file: clean };
+  const columns = captureColumns(capture);
+  if (JSON.stringify(captureColumns(existing)) === JSON.stringify(columns)) {
+    return { file: clean, workspace: existing, unchanged: true };
+  }
+  const workspace = { ...existing, ...columns, updatedAt: now, revision: existing.revision + 1 };
+  // Optional columns are written only when they carry something, so one the
+  // new capture omits must not survive from the old record (a band moved back
+  // under Pinned, a local file closed).
+  for (const key of OPTIONAL_CAPTURE_COLUMNS) if (!(key in columns)) delete workspace[key];
+  return {
+    file: withWorkspaces(clean, clean.workspaces.map((w) => (w.id === id ? workspace : w))),
+    workspace,
+  };
+}
+
+/** One profile's workspaces in stable manual order. */
+function listForProfile(file, profileId) {
+  return normalizeFile(file).workspaces
+    .filter((w) => w.profileId === profileId);
+}
+
+// ---------------------------------------------------------------------------
+// Single-window binding.
+//
+// `bindings` maps workspaceId -> windowId. The caller (main.js's
+// deriveWorkspaceBindings) derives it from EVERY window-runtime record, live
+// or not — a window-runtime whose native window is currently gone (macOS
+// dock-close of the primary window) still legitimately holds its workspace,
+// so it stays in the map. "Live" here means "exists in the runtime registry",
+// not "has an open window" — a caller resolving `focus` against an entry
+// must be prepared to recreate that window before focusing it. This model
+// has no concept of window liveness at all; it just moves ids around.
+//
+// Every map produced here is null-prototype: even if a hostile id slipped past
+// validWorkspaceId (a hand-edited file, a future caller), assigning it can
+// neither poison a prototype nor collide with an inherited name. The id reject
+// is defense in depth, not the only line.
+// ---------------------------------------------------------------------------
+
+const boundWindow = (bindings, workspaceId) => {
+  if (!bindings || typeof bindings !== 'object') return null;
+  if (typeof workspaceId !== 'string' || workspaceId === '') return null;
+  if (!Object.prototype.hasOwnProperty.call(bindings, workspaceId)) return null;
+  const windowId = bindings[workspaceId];
+  return typeof windowId === 'string' && windowId !== '' ? windowId : null;
+};
+
+/** Copy into a null-prototype map, keeping own string entries only. */
+function cloneBindings(bindings) {
+  const next = Object.create(null);
+  if (!bindings || typeof bindings !== 'object') return next;
+  for (const key of Object.keys(bindings)) {
+    const windowId = bindings[key];
+    if (typeof windowId === 'string' && windowId !== '') next[key] = windowId;
+  }
+  return next;
+}
+
+/** What opening `workspaceId` from `requestingWindowId` should do. */
+function resolveOpen(bindings, workspaceId, requestingWindowId) {
+  const windowId = boundWindow(bindings, workspaceId);
+  if (!windowId) return { action: 'swap' };            // unbound — this window takes it
+  if (windowId === requestingWindowId) return { action: 'noop' };  // already here
+  return { action: 'focus', windowId };                 // live elsewhere — never double-bind
+}
+
+// ---------------------------------------------------------------------------
+// Scratch guard (follow-up to Task 9): applyWorkspaceToWindow closes EVERY
+// outgoing tab with `record: false`, so nothing lands in Recently Closed.
+// Persistable tabs on a BOUND window are covered by autosaveWorkspaceBindings
+// (and by the workspace capture). Private tabs are not: they are excluded
+// from capture, session, sync, and Recently Closed, so a bound window that
+// holds a private page still loses it on every switch. A scratch window has
+// no save target at all, so its persistable non-blank tabs are at risk too.
+// Blank internal newtabs (including the private start page) are the floor —
+// nothing a user would recognize as work.
+// ---------------------------------------------------------------------------
+
+/** The blank ledger page, with or without `?private=1`. Compared via URL
+ * parts rather than string equality so this file never has to know the
+ * private query flag. `blankNewTabUrl` is passed in so we never duplicate
+ * main.js's NEW_TAB_URL constant. */
+function isBlankNewTabUrl(url, blankNewTabUrl) {
+  if (typeof url !== 'string' || typeof blankNewTabUrl !== 'string' || url === '') return false;
+  if (url === blankNewTabUrl) return true;
+  try {
+    const blank = new URL(blankNewTabUrl);
+    const candidate = new URL(url);
+    return candidate.protocol === blank.protocol
+      && candidate.host === blank.host
+      && candidate.pathname === blank.pathname;
+  } catch {
+    return false;
+  }
+}
+
+/** How many of THIS window's live tabs apply will close with no recovery.
+ * `tabs` is `{ url, private }[]` — the live list, NOT persistableEntries
+ * (that filter is what made private-only windows skip the guard).
+ * `privateCount` is split out so the overlay can hide "save first" when
+ * every at-risk tab is private — save-as never captures those, so offering
+ * it would re-trip the guard and drop the original action. */
+function unsavedTabsAtRisk({ bound, tabs, blankNewTabUrl }) {
+  const list = Array.isArray(tabs) ? tabs : [];
+  let persistable = 0;
+  let privateCount = 0;
+  for (const tab of list) {
+    if (!tab) continue;
+    const url = typeof tab.url === 'string' ? tab.url : '';
+    if (isBlankNewTabUrl(url, blankNewTabUrl)) continue;
+    if (tab.private) {
+      privateCount += 1;
+      continue;
+    }
+    if (!bound && url) persistable += 1;
+  }
+  return { persistable, privateCount };
+}
+
+function scratchSwitchGuardResult(opts) {
+  const { persistable, privateCount } = unsavedTabsAtRisk(opts);
+  const tabCount = persistable + privateCount;
+  return tabCount > 0 ? { ok: false, error: 'unsaved-scratch', tabCount, privateCount } : null;
+}
+
+function scratchSwitchNeedsGuard(opts) {
+  return scratchSwitchGuardResult(opts) != null;
+}
+
+/** Bind one workspace to one window, releasing BOTH prior claims: the window's
+ * previous workspace and the workspace's previous window. Either leftover
+ * would give a single slot two autosave writers. */
+function bindingsAfterSwap(bindings, { workspaceId, windowId } = {}) {
+  const next = cloneBindings(bindings);
+  if (!validWorkspaceId(workspaceId) || typeof windowId !== 'string' || windowId === '') return next;
+  for (const key of Object.keys(next)) {
+    if (next[key] === windowId) delete next[key];       // this window's previous workspace
+  }
+  next[workspaceId] = windowId;                          // also replaces the workspace's previous window
+  return next;
+}
+
+/** A window closed (or became scratch): it binds nothing. */
+function bindingsAfterUnbind(bindings, { windowId } = {}) {
+  const next = cloneBindings(bindings);
+  for (const key of Object.keys(next)) {
+    if (next[key] === windowId) delete next[key];
+  }
+  return next;
+}
+
+/** A workspace was deleted: whatever window showed it becomes scratch. */
+function bindingsAfterDelete(bindings, workspaceId) {
+  const next = cloneBindings(bindings);
+  if (typeof workspaceId === 'string' && Object.prototype.hasOwnProperty.call(next, workspaceId)) {
+    delete next[workspaceId];
+  }
+  return next;
+}
+
+function restoreWorkspace(file, id, now = Date.now()) {
+  const clean = normalizeFile(file);
+  const entry = clean.deleted.find((d) => d.workspace.id === id && now - d.deletedAt < RECOVERY_TTL_MS);
+  if (!entry) return { error: 'not-found' };
+  if (clean.workspaces.length >= MAX_WORKSPACES) return { error: 'limit' };
+  if (nameTaken(clean, entry.workspace.profileId, entry.workspace.name)) return { error: 'duplicate-name' };
+  clean.workspaces.splice(Math.max(0, Math.min(entry.index, clean.workspaces.length)), 0, entry.workspace);
+  clean.deleted = clean.deleted.filter((d) => d.workspace.id !== id);
+  return { file: clean, workspace: entry.workspace };
+}
+
+/** Move one space to `index` in this profile's list; an index past the end
+ * means the end. A negative or non-integer index is refused, never guessed. */
+function moveWorkspaceTo(file, id, index) {
+  const clean = normalizeFile(file);
+  const from = clean.workspaces.findIndex((w) => w.id === id);
+  if (from < 0) return { error: 'not-found' };
+  if (!Number.isInteger(index) || index < 0) return { error: 'invalid-index' };
+  const target = Math.min(clean.workspaces.length - 1, index);
+  const [workspace] = clean.workspaces.splice(from, 1);
+  clean.workspaces.splice(target, 0, workspace);
+  return { file: clean, workspace, unchanged: target === from };
+}
+
+module.exports = {
+  loadFile, captureColumns, restoreWorkspace, moveWorkspaceTo, RECOVERY_TTL_MS,
+  WORKSPACES_VERSION,
+  MAX_WORKSPACES,
+  MAX_NAME_LENGTH,
+  EMPTY_FILE,
+  sanitizeName,
+  normalizeWorkspace,
+  normalizeFile,
+  createWorkspace,
+  updateWorkspace,
+  deleteWorkspace,
+  updateCapture,
+  listForProfile,
+  // Exported so Task 6's session-pointer validation reuses this exact rule
+  // (validWindowId + the __proto__ reject) instead of re-deriving it.
+  validWorkspaceId,
+  resolveOpen,
+  scratchSwitchNeedsGuard,
+  scratchSwitchGuardResult,
+  bindingsAfterSwap,
+  bindingsAfterUnbind,
+  bindingsAfterDelete,
+};

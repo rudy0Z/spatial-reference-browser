@@ -1,0 +1,92 @@
+name: Site
+
+# Builds the Astro marketing site and runs every browser suite in test/site
+# against the built preview, so a PR can't break the site or leave a suite to
+# drift. Root package.json is a build input (JSON-LD softwareVersion) and
+# provides Playwright; the changelog generator is part of the releases.json
+# contract; the wordmark outlines and the Sunrise artwork are the sources of
+# the site's lockup assets; the apt mirror script runs before Playwright.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'test/site/**'
+      - 'package.json'
+      - 'scripts/generate-site-changelog.mjs'
+      - 'scripts/ci-apt-mirror.sh'
+      - 'assets/wordmark/**'
+      - 'assets/sunrise-mark.svg'
+      - '.github/workflows/site.yml'
+  pull_request:
+    paths:
+      - 'site/**'
+      - 'test/site/**'
+      - 'package.json'
+      - 'scripts/generate-site-changelog.mjs'
+      - 'scripts/ci-apt-mirror.sh'
+      - 'assets/wordmark/**'
+      - 'assets/sunrise-mark.svg'
+      - '.github/workflows/site.yml'
+
+# A new push to a pull request cancels that PR's older run. Pushes to main,
+# schedules and manual dispatches each get their own group (run_id), so
+# none is ever cancelled or queued behind another.
+concurrency:
+  group: site-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            site/package-lock.json
+      # Root packages provide Playwright for the browser suites; they never
+      # launch Electron, so skip its binary download.
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      # Chromium's system libraries come through apt, so point apt off
+      # the runner's default mirror first (scripts/ci-apt-mirror.sh): that
+      # mirror stopped resolving on November 11, 2026.
+      - run: bash scripts/ci-apt-mirror.sh && npx playwright install --with-deps chromium
+      - run: npm ci
+        working-directory: site
+      # The condensed Newsreader headings are derived from the pinned fontsource
+      # files. Rebuild them with the hash-locked tools and fail if the committed
+      # fonts differ, so a fontsource bump can't ship without its rebuild.
+      - name: Check the condensed Newsreader fonts are current
+        run: |
+          python3 -m venv "$RUNNER_TEMP/fontenv"
+          "$RUNNER_TEMP/fontenv/bin/pip" install --disable-pip-version-check --require-hashes \
+            -r site/scripts/build-condensed-newsreader.requirements.txt
+          "$RUNNER_TEMP/fontenv/bin/python" site/scripts/build-condensed-newsreader.py
+          if [ -n "$(git status --porcelain -- site/src/fonts)" ]; then
+            git status --short -- site/src/fonts
+            echo "::error::site/src/fonts is stale. Run site/scripts/build-condensed-newsreader.py and commit the result."
+            exit 1
+          fi
+      # The header and footer lockups are generated from the committed wordmark
+      # outlines and the app's Sunrise artwork (sharp comes from the root).
+      - name: Check the lockup assets are current
+        run: node site/scripts/build-lockup-assets.mjs --check
+      # Blubird's licence keeps its font files out of this public repository,
+      # so CI builds and tests the site with the Inter fallback.
+      - run: npm run build
+        working-directory: site
+      - name: Run the site browser suites
+        working-directory: site
+        run: |
+          npm run preview -- --background --host 127.0.0.1 --port 4322
+          trap 'npm run preview -- stop' EXIT
+          BLANC_SITE_URL=http://127.0.0.1:4322 node --test ../test/site/*.test.mjs

@@ -1,0 +1,167 @@
+# Desktop acceptance harness
+
+Binds the shared, platform-neutral scenarios in [`spec/acceptance/`](../../spec/acceptance/)
+to the **desktop (Electron)** implementation, so they execute against the real
+app. This is the "desktop step definitions" track referred to in
+`spec/acceptance/README.md` — the same `.feature` files will get iOS and Android
+bindings later; only the step definitions here are desktop-specific.
+
+## How it works
+
+- **Driver:** [Playwright's Electron support](https://playwright.dev/docs/api/class-electron)
+  (`_electron.launch`) starts the packaged app once per run.
+- **Bridge:** a tiny, env-guarded main-process surface (`src/main/test-hook.js`,
+  installed only when `BLANC_TEST=1`) exposes real state readers and actions on
+  `globalThis.__blanc`. Steps call it through the idempotent
+  `globalThis.__blancCall` wrapper via `electronApp.evaluate()`, which runs in
+  the Electron **main process** — so the scenarios drive the actual
+  `tabs`/`groups` state and the real settings/history/bookmarks stores, not a
+  reimplementation. Each call carries an id: if Chromium's inspector loses a
+  completed reply, the harness can request that same result without replaying
+  a mutating action.
+- **Offline & isolated:** `BLANC_TEST` also skips the network ad-engine build so
+  the app launches with no internet, and each run uses a throwaway
+  `--user-data-dir` so no prior session/history/settings leaks in. Tab URLs load
+  from a local fixtures server (`support/fixtures-server.js`).
+- **Async settling:** a `WebContentsView`'s URL isn't final until its navigation
+  commits, so assertions that depend on it poll via `world.waitForState()`.
+
+Layout:
+```
+test/desktop/
+  cucumber.mjs            profiles (runnable / dry / default)
+  support/
+    world.js             the `this` in steps: call()/state()/waitForState()/fixtureUrl()
+    test-hook-call.js    call ids + one safe retry for a lost inspector reply
+    hooks.js             launch app + fixtures (BeforeAll), reset (Before), teardown
+    fixtures-server.js   local pages so tab URLs load offline
+    context.js           state shared across hooks/world/steps
+  steps/
+    runnable.steps.js    the implemented step definitions
+```
+
+## Running
+
+```bash
+npm install                          # installs cucumber + playwright (+ electron)
+
+npm run test:acceptance:dry          # dry-run: verify every runnable step resolves
+                                     # (no Electron/display needed)
+
+npm run test:acceptance:desktop      # execute the runnable scenarios against the app
+xvfb-run -a npm run test:acceptance:desktop   # ...on a headless Linux/CI box
+
+npm run test:packaged:regressions    # deterministic signed-build release regressions
+npm run test:external-links          # isolated Electron URL/window lifecycle
+npm run test:pdf-viewer:desktop      # PDFs render in the built-in viewer with each blocker
+npm run test:packaged:external-links # interactive macOS LaunchServices + native foreground gate
+node test/desktop/packaged-media-smoke.mjs  # cross-platform packaged site grants + live fake audio/video tracks
+npm run test:packaged:native-media   # macOS-only real device/TCC check; records no audio
+npm run test:packaged:native-camera  # macOS-only real camera/TCC check; records/uploads no frames
+npm run test:packaged:favicons-live  # both pre-tag live favicon matrices (52 unique public sites)
+BLANC_FAVICON_MATRIX=primary npm run test:packaged:favicons-live    # original 25 + App Store Connect
+BLANC_FAVICON_MATRIX=additional npm run test:packaged:favicons-live # separate 26
+```
+
+The desktop script is plain `cucumber-js` so it works on a dev machine with a
+display (macOS); prefix `xvfb-run -a` on headless Linux.
+
+The two favicon live matrices are intentionally not PR/CI checks because third-party
+availability is outside the repository's control. The fail-closed release
+script runs two non-overlapping sets (26 primary, 26 additional) against the signed packaged
+candidate before creating the immutable source tag, alongside the deterministic
+packaged regression smoke. Sites run in cold batches of at most five: enough
+concurrency to cover background-tab behavior without turning favicon
+compatibility into an unrelated homepage resource-saturation test.
+
+Google OAuth browser-compatibility coverage is intentionally separate from the
+cross-platform product scenarios here. See [`test/oauth/`](../oauth/README.md)
+for the deterministic Electron contract and opt-in live-site canary.
+
+## What's implemented vs. backlog
+
+The **`runnable`** profile is the subset wired to real assertions today — the
+scenarios drivable purely through main-process state or pure app logic:
+
+| Implemented (30 stable IDs) | |
+|---|---|
+| F2-1..F2-4 | tab reopen / duplicate / pin-order / new-tab-ungrouped |
+| F3-1, F3-4, F3-5 | group create+move / prune-on-empty / grouped-pin ordering |
+| F4-4, F4-5 | private-session isolation / private start-page load |
+| F5-1..F5-5 | address routing / 4 engines / OS hand-off / autocomplete routing + privacy |
+| F7-2 | slash-command effects (/new, /downloads, /find) |
+| F9-1, F9-2 | favorite active page / add-all-tabs |
+| F10-2 | clear history |
+| F12-3 | ad-block global toggle |
+| F14-1..F14-4 | settings validation + device-local search-suggestion opt-out |
+| F16-2..F16-7 | utility-sheet routing, isolation, actions, and toggle behavior |
+| F17-1 | current app icon → applied |
+| F35-1..F35-9 | four-layout persistence, responsive Inter typography, Billboard local top sites, and standalone Mahjong footer launch |
+
+Run `npm run test:acceptance:dry` — **35 scenarios, 169 steps, 0 undefined**
+(Scenario Outlines expand per example: F5-2 → 4 rows, F7-2 → 3).
+
+The **`default`** profile (`not @mobile`) selects the whole desktop-applicable
+set. Scenarios outside the explicit `RUNNABLE` ID list are backlog: they report
+as `undefined` until their step definitions are written. They fall into three
+groups, by what they additionally need:
+
+1. **Further overlay / WebContentsView DOM automation** — autocomplete now uses
+   test-only overlay readers, but broader Quick Switcher, find-in-page,
+   internal-page, and theming assertions still need purpose-built `__blanc`
+   readers or guest-view handles.
+2. **Real navigation / external fixtures** — address-bar search routing, history
+   recording on visit, downloads, permissions, HTTP-auth cancellation. Extend the fixtures
+   server (search stubs, a basic-auth route, a downloadable file) and drive real
+   navigations.
+3. **OS-level behaviour** — OS URI hand-off, telemetry ping capture, the desktop
+   updater. Need process/network mocking.
+
+### External-link activation gate (macOS)
+
+`npm run test:external-links` exercises the real Electron lifecycle in a
+throwaway development profile, including startup, hidden/minimized windows,
+windowless reopen, profile selection, and second-instance URL batches. It also
+holds a recreated chrome document until after a user hide/minimize, checking
+that readiness delivers the link once without undoing that action, and that a
+fresh handoff restores normally.
+
+Run `npm run test:packaged:external-links` against a signed candidate on an
+interactive macOS desktop. Set `BLANC_PACKAGED_EXECUTABLE` to its absolute
+executable path when it is outside `dist/mac-arm64`. Quit other Blanc instances
+first and leave focus to the test while it runs: it alternates Finder and the
+isolated candidate without changing the default browser or your saved profile.
+It uses real LaunchServices URL delivery and checks the selected tab plus
+AppKit's frontmost PID and WindowServer's onscreen browser window. Hidden and
+minimized cases repeat ten times each; background, combined hidden/minimized,
+closed-window, and background reload behavior are checked as well.
+Repeat with `npm run test:packaged:external-links -- --background-delivery`
+to check activation when LaunchServices only delivers the URL and does not
+bring the app forward on the test's behalf.
+
+Before release, separately record an actual email-link click on the affected
+Mac and a handoff from another desktop/full-screen Space. Neither synthetic
+Electron events nor a renderer's `document.hasFocus()` substitute for that
+evidence. This interactive gate is separate from unattended release tests.
+
+### Deliberate proxies
+
+Two places assert a level below the literal step text, because it's the reliable,
+offline-verifiable signal. Both tighten once the DOM-automation backlog lands.
+
+- **Favorites** — *"X appears on the favorites page"* checks the **store the page
+  renders from** (`bookmarks.listBookmarks()`), not the rendered DOM.
+- **Address routing (F5)** — *"the active tab navigates to …"* checks the app's
+  **routing decision** (`normalizeAddressInput` / the hand-off predicate), not an
+  actual external navigation, which can't complete offline. The heuristic is the
+  substantive, deterministic part.
+
+## Verification status
+
+- ✅ **Dry-run green** (`-p dry`, exit 0): the harness code loads (Playwright +
+  Cucumber import cleanly) and every step in the runnable set resolves to exactly
+  one definition — the suite is fully wired.
+- ⏸️ **Live execution** requires the Electron binary. In some sandboxes the
+  binary download is blocked (GitHub release assets 403 through a proxy), so the
+  live run can't be exercised there; it runs on any machine/CI where
+  `npm install` fetches Electron. `xvfb` is only needed for headless Linux.

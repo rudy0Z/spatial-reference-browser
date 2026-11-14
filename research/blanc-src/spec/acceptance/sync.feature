@@ -1,0 +1,219 @@
+@sync
+Feature: Tab sync (open tabs from other devices)
+  Other devices' open tabs are browsable read-only via E2EE profile sync;
+  publishing is per-device opt-in and off by default.
+
+  @F27-1 @F27 @all
+  Scenario: Sharing open tabs is off by default
+    Given sync is enabled on this device
+    Then the "share this device's open tabs" setting is off
+    And no tab snapshot for this device is published
+
+  @F27-2 @F27 @all
+  Scenario: A remote device's tab opens locally as a new ungrouped tab
+    Given a synced device "MacBook Air" with 3 shared tabs
+    When I open the palette, open Other devices and unfold "MacBook Air"
+    And I choose its first remote tab
+    Then it opens as a new ungrouped local tab
+
+  @F27-3 @F27 @all
+  Scenario: Turning sharing off retracts this device's tabs
+    Given sharing open tabs is on and synced
+    When I turn sharing off
+    Then other devices no longer list this device
+
+  @F27-4 @F27 @desktop
+  Scenario: The moving-in checklist can be hidden permanently
+    Given a profile that completed first run
+    And the moving-in checklist is incomplete and not hidden
+    When I open a new tab
+    And I resize the desktop window to 900 by 600
+    Then the moving-in checklist shows "0/4"
+    When I hide the moving-in checklist
+    Then the moving-in checklist remains hidden
+    When I open a new tab
+    Then the moving-in checklist remains hidden
+
+  @F27-5 @F27 @desktop
+  Scenario: The moving-in checklist opens Settings at Sync and tracks progress
+    Given a profile that completed first run
+    And the moving-in checklist is incomplete and not hidden
+    When I open a new tab
+    And I choose Set up Sync from the moving-in checklist
+    Then the settings page opens in the utility sheet under the blanc scheme
+    And the Settings sheet is at the "sync" section
+    When I mark Sync complete in the moving-in checklist
+    Then the Sync task stays checked at "1/4"
+
+  @F27-6 @F27 @desktop
+  Scenario: The sync command opens Settings at the Sync section
+    Given a profile that completed first run
+    When I run the slash command "/sync"
+    Then the settings page opens in the utility sheet under the blanc scheme
+    And the Settings sheet is at the "sync" section
+
+  @F27-7 @F27 @desktop
+  Scenario: Completion waits until the covered start page can show it
+    Given a profile that completed first run
+    And the moving-in checklist is incomplete and not hidden
+    When I open a new tab
+    Then the moving-in checklist shows "0/4"
+    When I mark tab migration complete in the moving-in checklist
+    And I mark the first space complete in the moving-in checklist
+    And I mark the iPhone connected in the moving-in checklist
+    And I choose Set up Sync from the moving-in checklist
+    Then the Settings sheet is at the "sync" section
+    When I mark Sync complete in the moving-in checklist
+    Then the moving-in completion waits behind Settings
+    When I close the Settings sheet
+    Then the moving-in checklist briefly confirms completion
+    And the moving-in checklist retires
+
+  @F27-8 @F27 @desktop
+  Scenario: Adding this device with a code stops at an invalid code
+    Given a profile that completed first run
+    When I run the slash command "/sync"
+    Then the Settings sheet is at the "sync" section
+    And the Sync card offers Add this device to my sync before Start syncing from this device
+    When I choose Add this device to my sync
+    Then the code field replaces the name and passphrase fields
+    When I type "K7MR-4PX" into the code field
+    Then Connect is disabled
+    When I type "K7MR-4PX2" into the code field
+    Then Connect is enabled
+    When I choose Use my sync name and passphrase instead
+    Then the name and passphrase fields replace the code field
+
+  @F27-9 @F27 @desktop
+  Scenario: Other devices opens above the footer and starts closed
+    Given another device is sharing its tabs
+    When I open the Island panel for other devices
+    Then the Other devices button shows 1
+    And the tab list shows no device rows
+    When I toggle Other devices
+    Then the Other devices drawer lists "Press Mac" between the tab list and the footer
+    When I unfold "Press Mac" from the keyboard
+    Then keyboard focus stays on the "Press Mac" header
+    When I toggle Other devices
+    Then the Other devices drawer is closed
+    When I toggle Other devices
+    And I close and reopen the Island panel
+    Then the Other devices drawer is closed
+
+  @F27-10 @F27 @desktop
+  Scenario: Typing steps the Other devices drawer aside
+    Given another device is sharing its tabs
+    When I open the Island panel for other devices
+    And I toggle Other devices
+    And I type "a" into the Island address field
+    Then the Other devices drawer is closed
+    When I clear the Island address field
+    Then the Other devices drawer lists "Press Mac" between the tab list and the footer
+
+  @F27-11 @F27 @desktop
+  Scenario: Without other devices there is no Other devices button
+    Given no other device is sharing its tabs
+    When I open the Island panel for other devices
+    Then there is no Other devices button
+
+  @F27-12 @F27 @desktop
+  Scenario: The Other devices drawer leaves the tab list room in a small window
+    Given ten tabs are open
+    And eight other devices are sharing their tabs
+    And the window is 640 by 480 with the Island at 125%
+    When I open the Island panel for other devices
+    And I toggle Other devices
+    Then the tab list keeps at least two rows and the footer stays in the window
+
+  @F27-13 @F27 @desktop
+  Scenario: Rename Device… names another device wherever it is listed
+    Given another device is sharing its tabs
+    When I open the Island panel for other devices
+    And I choose Rename Device… for "Press Mac"
+    Then the command bar reads "Press Mac" with "Press Mac" selected
+    And the panel says the field renames the device
+    When I type "Work laptop" and press Enter in the command bar
+    Then the start page lists "Remote press needle" from "Work laptop"
+    When I open the Island panel for other devices
+    And I toggle Other devices
+    Then the Other devices drawer lists "Work laptop" between the tab list and the footer
+    And the Quick Switcher lists "Remote press needle" from "Work laptop"
+    When I choose Rename Device… for "Work laptop"
+    And I clear the command bar and press Enter
+    And I open the Island panel for other devices
+    And I toggle Other devices
+    Then the Other devices drawer lists "Press Mac" between the tab list and the footer
+
+  # Design 2026-10-28 §5.2–§5.4: Sync without a passphrase. Runs against a
+  # local copy of the Worker, so a real account is created and paired.
+  @F27-14 @F27 @desktop @sync-server
+  Scenario: Turning on Sync needs no name or passphrase
+    Given a profile that completed first run
+    When I run the slash command "/sync"
+    Then the Settings sheet is at the "sync" section
+    And the Sync card leads with Turn on Sync and keeps the passphrase paths under Other ways
+    When I choose Turn on Sync
+    Then Sync is on under the name "My Blanc"
+    And the recovery-code prompt is shown
+
+  # Design 2026-10-28 §6.3–§6.4: the sheet notices the device that took the
+  # code and asks the Spaces question in place.
+  @F27-15 @F27 @desktop @sync-server
+  Scenario: The Add device sheet says when the new device joined
+    Given a profile that completed first run
+    When I run the slash command "/sync"
+    Then the Settings sheet is at the "sync" section
+    When I choose Turn on Sync
+    Then Sync is on under the name "My Blanc"
+    When I choose Add device
+    Then the sheet shows a pairing code
+    And the window asks to be left out of screen capture
+    When a new device named "zzz-peer" joins the sync
+    Then the sheet says "zzz-peer joined."
+    And the sheet asks to keep Spaces and groups in sync
+    When I choose Not now in the sheet
+    Then the sheet no longer asks and offers Done
+    And no window asks to be left out of screen capture
+
+  # Design 2026-10-28 §6.2–§6.3: closing Settings while a code is still live
+  # ends the capture request and the watch with it.
+  @F27-16 @F27 @desktop @sync-server
+  Scenario: Closing Settings while a code shows lets the window be captured again
+    Given a profile that completed first run
+    When I run the slash command "/sync"
+    Then the Settings sheet is at the "sync" section
+    When I choose Turn on Sync
+    Then Sync is on under the name "My Blanc"
+    When I choose Add device
+    Then the sheet shows a pairing code
+    And the window asks to be left out of screen capture
+    When I close the Settings sheet
+    Then no window asks to be left out of screen capture
+    When I run the slash command "/sync"
+    Then the sheet shows a pairing code
+    And the window asks to be left out of screen capture
+
+  # Design 2026-10-28 §6.1–§6.2: Connect your iPhone with Sync off creates
+  # nothing until Continue, and offers the code path to someone who syncs.
+  @F27-17 @F27 @desktop @sync-server
+  Scenario: Connect your iPhone with Sync off asks before turning it on
+    Given a profile that completed first run
+    When I run the slash command "/sync"
+    Then the Settings sheet is at the "sync" section
+    When I choose Connect your iPhone
+    Then the sheet offers to turn on Sync for this computer
+    When I choose to add this computer with a code first
+    Then the code field replaces the name and passphrase fields
+    And Sync is still off
+
+  @F27-18 @F27 @desktop @sync-server
+  Scenario: Connect your iPhone shows the code as a QR the iPhone can scan
+    Given a profile that completed first run
+    And the moving-in checklist is incomplete and not hidden
+    When I open a new tab
+    And I choose Connect your iPhone from the moving-in checklist
+    Then the sheet offers to turn on Sync for this computer
+    When I choose Continue in the sheet
+    Then Sync is on under the name "My Blanc"
+    And the sheet shows a pairing code
+    And the sheet's QR encodes the pair link for that code

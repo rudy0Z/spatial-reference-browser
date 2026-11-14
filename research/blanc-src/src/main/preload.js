@@ -1,0 +1,319 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+// Sandboxed Electron preloads have only a narrow built-in `require`; importing
+// a local helper here would abort this entire preload before browserAPI exists.
+// Main owns the authoritative capability gate. This renderer-side projection
+// uses the platform value already provided by Electron's sandboxed `process`.
+// Keep this list in step with SUPPORTED_PLATFORMS in onepassword-availability.js
+// (test/unit/onepassword-availability.test.js compares them).
+const ONE_PASSWORD_AVAILABLE = ['darwin', 'win32', 'linux'].includes(process.platform);
+// Acceptance only: main passes --blanc-test-platform (never outside its test
+// mode) so the chrome draws for Windows or Linux on any machine.
+const TEST_PLATFORM_ARG = '--blanc-test-platform=';
+const testPlatformArg = (process.argv ?? []).find((arg) => typeof arg === 'string' && arg.startsWith(TEST_PLATFORM_ARG));
+const testPlatform = testPlatformArg?.slice(TEST_PLATFORM_ARG.length);
+const CHROME_PLATFORM = testPlatform === 'win32' || testPlatform === 'linux' ? testPlatform : process.platform;
+
+// This preload is intentionally attached only to Blanc's three privileged
+// chrome surfaces. Re-check the committed document before exposing anything:
+// a future accidental reuse of this preload must fail closed.
+const TRUSTED_CHROME_DOCUMENTS = new Set([
+  'blanc-chrome://index/',
+  'blanc-chrome://overlay/',
+  'blanc-chrome://permission/',
+  'blanc-chrome://float/',
+  'blanc-chrome://glance/',
+]);
+
+if (TRUSTED_CHROME_DOCUMENTS.has(window.location.href)) {
+  contextBridge.exposeInMainWorld('browserAPI', {
+    platform: CHROME_PLATFORM,
+
+  createTab: (url, opts) => ipcRenderer.invoke('tabs:create', url, opts),
+  closeTab: (id) => ipcRenderer.invoke('tabs:close', id),
+  reopenClosedTab: () => ipcRenderer.invoke('tabs:reopen-closed'),
+  reopenClosedEntry: (entryId) => ipcRenderer.invoke('tabs:reopen-entry', entryId),
+  forgetClosedEntry: (entryId) => ipcRenderer.invoke('tabs:forget-closed-entry', entryId),
+  clearClosedEntries: () => ipcRenderer.invoke('tabs:clear-closed'),
+  selectTab: (tabId, mode) => ipcRenderer.invoke('tabs:select', tabId, mode),
+  switchTab: (id) => ipcRenderer.invoke('tabs:switch', id),
+  navigate: (id, url) => ipcRenderer.invoke('tabs:navigate', id, url),
+  search: (id, query, engine) => ipcRenderer.invoke('tabs:search', id, query, engine),
+  goBack: (id) => ipcRenderer.invoke('tabs:back', id),
+  goForward: (id) => ipcRenderer.invoke('tabs:forward', id),
+  toggleReaderMode: (id) => ipcRenderer.invoke('tabs:reader-toggle', id),
+  reload: (id) => ipcRenderer.invoke('tabs:reload', id),
+  stop: (id) => ipcRenderer.invoke('tabs:stop', id),
+  moveTab: (id, target) => ipcRenderer.invoke('tabs:move', id, target),
+  reorderGroup: (id, beforeGroupId) => ipcRenderer.invoke('groups:reorder', id, beforeGroupId),
+  moveClosedSection: (beforeGroupId) => ipcRenderer.invoke('groups:move-closed', beforeGroupId),
+  renameGroup: (groupId, name) => ipcRenderer.invoke('groups:rename', groupId, name),
+  setGroupColor: (groupId, color) => ipcRenderer.invoke('groups:set-color', groupId, color),
+  newTabInGroup: (groupId) => ipcRenderer.invoke('groups:new-tab', groupId),
+  moveGroupToNewWindow: (groupId) => ipcRenderer.invoke('groups:move-to-new-window', groupId),
+  openGroupSpaceMenu: (groupId, point) => ipcRenderer.invoke('groups:space-menu', groupId, point),
+  ungroupGroup: (groupId) => ipcRenderer.invoke('groups:ungroup', groupId),
+  activateTabFromRail: (id) => ipcRenderer.invoke('tabs:activate-from-rail', id),
+  setGlanceTab: (id) => ipcRenderer.invoke('tabs:set-glance', id),
+  openGlancePicker: (query) => ipcRenderer.invoke('tabs:open-glance-picker', query),
+  closeGlance: () => ipcRenderer.invoke('tabs:close-glance'),
+  openGlanceAsTab: () => ipcRenderer.invoke('tabs:open-glance-as-tab'),
+  setTabGroup: (id, groupId) => ipcRenderer.invoke('tabs:set-group', id, groupId),
+  groupTabsByName: (tabIds, name) => ipcRenderer.invoke('tabs:group-many-by-name', tabIds, name),
+  groupTabByName: (id, name) => ipcRenderer.invoke('tabs:group-by-name', id, name),
+  toggleGroupCollapsed: (groupId) => ipcRenderer.invoke('tabs:toggle-group-collapsed', groupId),
+  focusGroup: (groupId) => ipcRenderer.invoke('tabs:focus-group', groupId),
+  closeGroup: (groupId) => ipcRenderer.invoke('tabs:close-group', groupId),
+  toggleBookmark: () => ipcRenderer.invoke('tabs:toggle-bookmark'),
+  saveFavorite: (folder) => ipcRenderer.invoke('tabs:save-favorite', folder),
+  toggleTabPinned: (id) => ipcRenderer.invoke('tabs:toggle-pinned', id),
+  toggleTabMuted: (id) => ipcRenderer.invoke('tabs:toggle-muted', id),
+  duplicateTab: (id) => ipcRenderer.invoke('tabs:duplicate', id),
+  renameTab: (id, name) => ipcRenderer.invoke('tabs:rename', id, name),
+  openPage: (name, section) => ipcRenderer.invoke('tabs:open-page', name, section),
+  getAllTabs: () => ipcRenderer.invoke('tabs:get-all'),
+  findInPage: (id, query, options) => ipcRenderer.invoke('tabs:find', id, query, options),
+  stopFindInPage: (id) => ipcRenderer.invoke('tabs:find-stop', id),
+
+  respondPermission: (id, allow) => ipcRenderer.send('permissions:respond', { id, allow }),
+  onPermissionPrompt: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('permissions:prompt', listener);
+    return () => ipcRenderer.removeListener('permissions:prompt', listener);
+  },
+
+  reportChromeLayout: (height) => ipcRenderer.send('chrome:layout', { height }),
+  reportIslandRect: (rect) => ipcRenderer.send('chrome:island-rect', rect),
+  showTooltip: (tip) => ipcRenderer.send('chrome:tooltip-show', tip),
+  hideTooltip: () => ipcRenderer.send('chrome:tooltip-hide'),
+  onShieldAnchor: (callback) => {
+    const listener = (_event, anchor) => callback(anchor);
+    ipcRenderer.on('overlay:shield-anchor', listener);
+    return () => ipcRenderer.removeListener('overlay:shield-anchor', listener);
+  },
+  onIslandProximity: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('chrome:island-proximity', listener);
+    return () => ipcRenderer.removeListener('chrome:island-proximity', listener);
+  },
+  setTabLayout: (layout) => ipcRenderer.invoke('chrome:set-tab-layout', layout),
+  previewVerticalTabsWidth: (width) =>
+    ipcRenderer.send('chrome:preview-vertical-tabs-width', width),
+  setVerticalTabsWidth: (width) =>
+    ipcRenderer.invoke('chrome:set-vertical-tabs-width', width),
+  onVerticalTabsWidth: (callback) => {
+    const listener = (_event, metrics) => callback(metrics);
+    ipcRenderer.on('chrome:vertical-tabs-width', listener);
+    return () => ipcRenderer.removeListener('chrome:vertical-tabs-width', listener);
+  },
+  onGlanceLayout: (callback) => {
+    const listener = (_event, layout) => callback(layout);
+    ipcRenderer.on('chrome:glance-layout', listener);
+    return () => ipcRenderer.removeListener('chrome:glance-layout', listener);
+  },
+  moveGlanceCard: (input) => ipcRenderer.invoke('chrome:glance-card-move', input),
+  resizeGlanceCard: (input) => ipcRenderer.invoke('chrome:glance-card-resize', input),
+  resetGlanceCard: (input) => ipcRenderer.invoke('chrome:glance-card-reset', input),
+  keepGlanceAsSplit: () => ipcRenderer.invoke('chrome:split-keep-glance'),
+  removeFromSplit: (tabId) => ipcRenderer.invoke('chrome:split-remove', tabId),
+  closeSplit: (tabId) => ipcRenderer.invoke('chrome:split-close', tabId),
+  resizeSplit: (splitId, index, axis, point) => ipcRenderer.send('chrome:resize-split', splitId, index, axis, point),
+  resetSplit: (splitId) => ipcRenderer.invoke('chrome:reset-split', splitId),
+  onSplitLayout: (callback) => {
+    const listener = (_event, layout) => callback(layout);
+    ipcRenderer.on('chrome:split-layout', listener);
+    return () => ipcRenderer.removeListener('chrome:split-layout', listener);
+  },
+  onGlanceStatus: (callback) => {
+    const listener = (_event, message) => callback(message);
+    ipcRenderer.on('chrome:glance-status', listener);
+    return () => ipcRenderer.removeListener('chrome:glance-status', listener);
+  },
+  onPillNotice: (callback) => {
+    const listener = (_event, kind) => callback(kind);
+    ipcRenderer.on('chrome:pill-notice', listener);
+    return () => ipcRenderer.removeListener('chrome:pill-notice', listener);
+  },
+
+  openIsland: () => ipcRenderer.send('chrome:open-island'),
+  openIslandCommands: () => ipcRenderer.send('chrome:open-island-commands'),
+  beginNewGroup: () => ipcRenderer.send('chrome:new-group'),
+  openIslandTyping: (char) => ipcRenderer.send('chrome:open-island-typing', char),
+  openFindBar: () => ipcRenderer.send('chrome:open-find'),
+  openShieldPopover: (anchor) => ipcRenderer.send('chrome:open-shield', anchor),
+  selectBlockingProvider: (provider, restart = false) => ipcRenderer.invoke('chrome:blocking-provider', provider, restart),
+  openBlockingPopup: () => ipcRenderer.invoke('chrome:blocking-popup'),
+  openCapturePopover: (anchor) => ipcRenderer.send('chrome:open-capture', anchor),
+  openSpacesMenu: (anchor) => ipcRenderer.send('chrome:open-spaces', anchor),
+  openGroupMenu: (groupId, anchor) => ipcRenderer.send('chrome:open-group-menu', groupId, anchor),
+  captureStop: (surfaceId) => ipcRenderer.send('chrome:capture-stop', surfaceId),
+  captureFocus: (surfaceId) => ipcRenderer.send('chrome:capture-focus', surfaceId),
+  switcherPick: (tabId) => ipcRenderer.send('chrome:switcher-pick', tabId),
+  copyActiveLink: (clean) => ipcRenderer.send('chrome:copy-link', clean),
+  stopDisplayShare: (shareId) => ipcRenderer.send('display-capture:stop', { shareId }),
+  resolveDisplayPicker: (choice) => ipcRenderer.send('display-capture:picker-resolve', choice),
+  openMainMenu: (point) => ipcRenderer.invoke('chrome:open-main-menu', point),
+  closeOverlay: (reason) => ipcRenderer.send('overlay:close', reason),
+  reportPanelDrawn: () => ipcRenderer.send('overlay:panel-drawn'),
+  /** Keep main's Escape handler in sync with the footer workspace popover so
+   * Esc can cancel an editor / close the menu without dismissing the island. */
+  setWorkspaceSwitcherOpen: (open) => ipcRenderer.send('chrome:workspace-switcher', !!open),
+  setOverlayDragState: (active) => ipcRenderer.send('overlay:drag-state', !!active),
+  onOverlayEscape: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('overlay:escape', listener);
+    return () => ipcRenderer.removeListener('overlay:escape', listener);
+  },
+
+  listHistory: (opts) => ipcRenderer.invoke('chrome:history-list', opts),
+  // F52 Tab Archive: projected rows only; restore takes an entry id.
+  archiveList: () => ipcRenderer.invoke('chrome:archive-list'),
+  archiveRestore: (id) => ipcRenderer.invoke('chrome:archive-restore', id),
+  // Spec D6: the one-time first-archive notice ({count} or null) and its end.
+  archiveNotice: () => ipcRenderer.invoke('chrome:archive-notice'),
+  archiveNoticeDone: (action) => ipcRenderer.invoke('chrome:archive-notice-done', action),
+  listFavorites: () => ipcRenderer.invoke('chrome:favorites-list'),
+  listRemoteTabs: () => ipcRenderer.invoke('chrome:remote-tabs-list'),
+  renameDevice: (deviceId, name) => ipcRenderer.invoke('chrome:rename-device', deviceId, name),
+  // Send to device (M7b): main resolves the tab's address itself.
+  listSendTargets: () => ipcRenderer.invoke('chrome:send-targets'),
+  sendTabToDevice: (tabId, deviceId) => ipcRenderer.invoke('chrome:send-tab', tabId, deviceId),
+  listSentToThisDevice: () => ipcRenderer.invoke('chrome:sent-list'),
+  openSentItem: (id) => ipcRenderer.invoke('chrome:sent-open', id),
+  dismissSentItem: (id) => ipcRenderer.invoke('chrome:sent-dismiss', id),
+  cancelWorkspaceAction: () => ipcRenderer.send('chrome:workspaces-cancel'),
+  listWorkspaces: () => ipcRenderer.invoke('chrome:workspaces-list'),
+  createSpaceWithLink: (name, identity) => ipcRenderer.invoke('chrome:workspaces-create-with-link', name, identity),
+  createSpaceWithTabs: (name, identity, tabIds) => ipcRenderer.invoke('chrome:workspaces-create-with-tabs', name, identity, tabIds),
+  createSpaceWithTab: (name, identity, tabId) => ipcRenderer.invoke('chrome:workspaces-create-with-tab', name, identity, tabId),
+  saveWorkspaceAs: (name, identity) => ipcRenderer.invoke('chrome:workspaces-save-as', name, identity),
+  // opts: { decision?: string, newWindow?: true } — `decision` echoes the token
+  // from an unsaved-scratch result (a confirmed "discard and switch");
+  // `newWindow` opens elsewhere. Omitted for a plain open/create attempt.
+  openWorkspace: (id, opts) => ipcRenderer.invoke('chrome:workspaces-open', id, opts),
+  createBlankWorkspace: (name, opts) => ipcRenderer.invoke('chrome:workspaces-create-blank', name, opts),
+  removeWorkspace: (id) => ipcRenderer.invoke('chrome:workspaces-remove', id),
+  restoreWorkspace: (id) => ipcRenderer.invoke('chrome:workspaces-restore', id),
+  forgetWorkspace: (id) => ipcRenderer.invoke('chrome:workspaces-forget', id),
+  updateWorkspace: (id, patch) => ipcRenderer.invoke('chrome:workspaces-update', id, patch),
+  moveWorkspaceTo: (id, index) => ipcRenderer.invoke('chrome:workspaces-move-to', id, index),
+  undoRemoveWorkspace: (id) => ipcRenderer.invoke('chrome:workspaces-undo-remove', id),
+  searchSuggestions: (query) => ipcRenderer.invoke('chrome:search-suggestions', query),
+  bangs: () => ipcRenderer.invoke('chrome:bangs'),
+  onBangsChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('bangs:changed', listener);
+    return () => ipcRenderer.removeListener('bangs:changed', listener);
+  },
+  bangIcons: (hosts) => ipcRenderer.invoke('chrome:bang-icons', hosts),
+  onBangIconsChanged: (callback) => {
+    const listener = (_event, change) => callback(change);
+    ipcRenderer.on('bang-icons:changed', listener);
+    return () => ipcRenderer.removeListener('bang-icons:changed', listener);
+  },
+  onRemoteTabsUpdated: (callback) => {
+    const listener = (_event, devices) => callback(devices);
+    ipcRenderer.on('chrome:remote-tabs-updated', listener);
+    return () => ipcRenderer.removeListener('chrome:remote-tabs-updated', listener);
+  },
+  onSentToThisDeviceUpdated: (callback) => {
+    const listener = (_event, items) => callback(items);
+    ipcRenderer.on('chrome:sent-updated', listener);
+    return () => ipcRenderer.removeListener('chrome:sent-updated', listener);
+  },
+  onWorkspacesUpdated: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('chrome:workspaces-updated', listener);
+    return () => ipcRenderer.removeListener('chrome:workspaces-updated', listener);
+  },
+  onWorkspaceAction: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('overlay:workspace-action', listener);
+    return () => ipcRenderer.removeListener('overlay:workspace-action', listener);
+  },
+  clearHistory: () => ipcRenderer.invoke('chrome:history-clear'),
+  toggleAdblock: () => ipcRenderer.invoke('chrome:adblock-toggle'),
+  allowAdsOnActiveSite: () => ipcRenderer.invoke('chrome:adblock-exempt-active'),
+  toggleDarkSiteOnActiveSite: () => ipcRenderer.invoke('chrome:dark-site-active'),
+  routeActiveSite: (mode) => ipcRenderer.invoke('chrome:route-active', mode),
+  siteInfoForgetCertificateException: () => ipcRenderer.invoke('chrome:site-info-forget-certificate-exception'),
+  sleepBackgroundTabs: () => ipcRenderer.invoke('chrome:sleep-background-tabs'),
+  keepMiniWindow: () => ipcRenderer.invoke('chrome:mini-keep'),
+  inviteFriend: () => ipcRenderer.invoke('chrome:invite-friend'),
+  ...(ONE_PASSWORD_AVAILABLE ? {
+    fillLoginFromOnePassword: () => ipcRenderer.invoke('chrome:onepassword-fill'),
+  } : {}),
+  cycleTheme: (theme) => ipcRenderer.invoke('chrome:cycle-theme', theme),
+  onThemeAppearance: (callback) => {
+    const listener = (_event, appearance) => callback(appearance);
+    ipcRenderer.on('chrome:theme-appearance', listener);
+    return () => ipcRenderer.removeListener('chrome:theme-appearance', listener);
+  },
+
+  minimizeWindow: () => ipcRenderer.send('window:minimize'),
+  maximizeWindow: () => ipcRenderer.send('window:maximize'),
+  closeWindow: () => ipcRenderer.send('window:close'),
+
+  onTabsUpdated: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('tabs:updated', listener);
+    return () => ipcRenderer.removeListener('tabs:updated', listener);
+  },
+  onPageTint: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('chrome:page-tint', listener);
+    return () => ipcRenderer.removeListener('chrome:page-tint', listener);
+  },
+  onDownloadsActivity: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('chrome:downloads', listener);
+    return () => ipcRenderer.removeListener('chrome:downloads', listener);
+  },
+  acknowledgeDownloads: () => ipcRenderer.send('chrome:downloads-ack'),
+  onOverlayShow: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('overlay:show', listener);
+    return () => ipcRenderer.removeListener('overlay:show', listener);
+  },
+  onOverlayHide: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('overlay:hide', listener);
+    return () => ipcRenderer.removeListener('overlay:hide', listener);
+  },
+  onOverlayToggle: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('overlay:toggle', listener);
+    return () => ipcRenderer.removeListener('overlay:toggle', listener);
+  },
+  onIslandState: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('chrome:island-state', listener);
+    return () => ipcRenderer.removeListener('chrome:island-state', listener);
+  },
+  onIslandCovered: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('chrome:island-covered', listener);
+    return () => ipcRenderer.removeListener('chrome:island-covered', listener);
+  },
+  onFloatFrame: (callback) => {
+    const listener = (_e, frame) => callback(frame);
+    ipcRenderer.on('chrome:float-frame', listener);
+    return () => ipcRenderer.removeListener('chrome:float-frame', listener);
+  },
+  onFloatShown: (callback) => {
+    const listener = (_e, shown) => callback(shown);
+    ipcRenderer.on('chrome:float-shown', listener);
+    return () => ipcRenderer.removeListener('chrome:float-shown', listener);
+  },
+  onStripHidden: (callback) => {
+    const listener = (_e, hidden) => callback(hidden);
+    ipcRenderer.on('chrome:strip-hidden', listener);
+    return () => ipcRenderer.removeListener('chrome:strip-hidden', listener);
+  },
+  onFindResult: (callback) => {
+    const listener = (_e, payload) => callback(payload);
+    ipcRenderer.on('chrome:find-result', listener);
+    return () => ipcRenderer.removeListener('chrome:find-result', listener);
+  },
+  });
+}

@@ -1,0 +1,288 @@
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const {
+  installPlatformMainMenuShortcut,
+  isPlatformMainMenuShortcut,
+  menuLabelText,
+  popupPlatformMainMenu,
+  popupPoint,
+  supportsPlatformMainMenu,
+} = require('../../src/main/platform-main-menu');
+
+const ROOT = path.resolve(__dirname, '..', '..');
+
+test('the custom main-menu affordance is limited to Windows and Linux', () => {
+  assert.equal(supportsPlatformMainMenu('win32'), true);
+  assert.equal(supportsPlatformMainMenu('linux'), true);
+  assert.equal(supportsPlatformMainMenu('darwin'), false);
+});
+
+test('Alt+F is the platform main-menu shortcut on Windows and Linux', () => {
+  const input = {
+    type: 'keyDown',
+    key: 'f',
+    alt: true,
+    control: false,
+    meta: false,
+    shift: false,
+    isAutoRepeat: false,
+  };
+
+  assert.equal(isPlatformMainMenuShortcut(input, 'win32'), true);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, key: 'F' }, 'linux'), true);
+  assert.equal(isPlatformMainMenuShortcut(input, 'darwin'), false);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, type: 'keyUp' }, 'win32'), false);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, isAutoRepeat: true }, 'win32'), false);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, alt: false }, 'win32'), false);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, control: true }, 'win32'), false);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, meta: true }, 'win32'), false);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, shift: true }, 'win32'), false);
+  assert.equal(isPlatformMainMenuShortcut({ ...input, key: 'm' }, 'win32'), false);
+});
+
+test('the shortcut opens the menu below the upper-left button', async () => {
+  let beforeInput = null;
+  let popupOptions = null;
+  let prevented = false;
+  const webContents = {
+    on(eventName, listener) {
+      assert.equal(eventName, 'before-input-event');
+      beforeInput = listener;
+    },
+  };
+  const window = {
+    isDestroyed: () => false,
+    getContentBounds: () => ({ width: 640, height: 480 }),
+  };
+  const Menu = {
+    getApplicationMenu: () => ({
+      items: [{ label: 'File' }],
+      popup(options) {
+        popupOptions = options;
+        options.callback();
+      },
+    }),
+  };
+
+  installPlatformMainMenuShortcut({
+    webContents,
+    Menu,
+    getWindow: () => window,
+    platform: 'win32',
+  });
+  assert.equal(typeof beforeInput, 'function');
+
+  beforeInput(
+    { preventDefault: () => { prevented = true; } },
+    {
+      type: 'keyDown',
+      key: 'f',
+      alt: true,
+      control: false,
+      meta: false,
+      shift: false,
+      isAutoRepeat: false,
+    }
+  );
+  await Promise.resolve();
+
+  assert.equal(prevented, true);
+  assert.equal(popupOptions.window, window);
+  assert.equal(popupOptions.x, 8);
+  assert.equal(popupOptions.y, 38);
+
+  let registeredOnMac = false;
+  installPlatformMainMenuShortcut({
+    webContents: { on: () => { registeredOnMac = true; } },
+    Menu,
+    getWindow: () => window,
+    platform: 'darwin',
+  });
+  assert.equal(registeredOnMac, false);
+});
+
+test('popup coordinates are integer content coordinates clamped to the window', () => {
+  assert.deepEqual(
+    popupPoint({ x: 1250.6, y: 38.2 }, { width: 1280, height: 800 }),
+    { x: 1251, y: 38 }
+  );
+  assert.deepEqual(
+    popupPoint({ x: -20, y: Number.NaN }, { width: 1280, height: 800 }),
+    { x: 0, y: 0 }
+  );
+  assert.deepEqual(
+    popupPoint({ x: 9000, y: 9000 }, { width: 1280, height: 800 }),
+    { x: 1279, y: 799 }
+  );
+});
+
+test('the platform button pops up the existing live application menu', async () => {
+  let popupOptions = null;
+  const applicationMenu = {
+    items: [{ label: 'File' }],
+    popup(options) {
+      popupOptions = options;
+      options.callback();
+    },
+  };
+  const Menu = { getApplicationMenu: () => applicationMenu };
+  const window = {
+    isDestroyed: () => false,
+    getContentBounds: () => ({ width: 640, height: 480 }),
+  };
+
+  assert.equal(
+    await popupPlatformMainMenu({
+      Menu,
+      window,
+      point: { x: 610, y: 38 },
+      platform: 'win32',
+    }),
+    true
+  );
+  assert.equal(popupOptions.window, window);
+  assert.equal(popupOptions.x, 610);
+  assert.equal(popupOptions.y, 38);
+  assert.equal(typeof popupOptions.callback, 'function');
+});
+
+test('macOS and missing window/menu state never open a popup', async () => {
+  let popupCalls = 0;
+  const menu = { items: [{ label: 'File' }], popup: () => { popupCalls += 1; } };
+  const Menu = { getApplicationMenu: () => menu };
+  const window = {
+    isDestroyed: () => false,
+    getContentBounds: () => ({ width: 640, height: 480 }),
+  };
+
+  assert.equal(await popupPlatformMainMenu({ Menu, window, platform: 'darwin' }), false);
+  assert.equal(await popupPlatformMainMenu({ Menu, window: null, platform: 'linux' }), false);
+  assert.equal(
+    await popupPlatformMainMenu({
+      Menu: { getApplicationMenu: () => null },
+      window,
+      platform: 'linux',
+    }),
+    false
+  );
+  assert.equal(popupCalls, 0);
+});
+
+test('Downloads and Settings live in File rather than View', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src/main/main.js'), 'utf8');
+  // Menu labels come from the interface catalog (F44); the menus are found by key.
+  const fileStart = main.indexOf("label: t('menu.file')");
+  const profilesStart = main.indexOf("label: t('menu.profiles')", fileStart);
+  const viewStart = main.indexOf("label: t('menu.view')", profilesStart);
+  const tabsStart = main.indexOf("label: t('menu.tabs')", viewStart);
+
+  assert.ok(fileStart >= 0 && profilesStart > fileStart);
+  assert.ok(viewStart > profilesStart && tabsStart > viewStart);
+
+  const fileMenu = main.slice(fileStart, profilesStart);
+  const viewMenu = main.slice(viewStart, tabsStart);
+  assert.match(fileMenu, /command\('downloads'\)/);
+  assert.match(fileMenu, /command\('settings'\)/);
+  assert.doesNotMatch(viewMenu, /command\('(?:downloads|settings)'\)/);
+});
+
+test('Tabs exposes the last-active-tab chord only on macOS', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src/main/main.js'), 'utf8');
+  assert.match(
+    main,
+    /const LAST_ACTIVE_TAB_ACCELERATOR = process\.platform === 'darwin'\s*\? 'Cmd\+Alt\+Z'\s*: null;/
+  );
+  assert.match(
+    main,
+    /id: 'switch-last-active-tab',[\s\S]*?label: t\('menu\.switchLastTab'\),[\s\S]*?LAST_ACTIVE_TAB_ACCELERATOR[\s\S]*?enabled: !!lastActiveTabId\(runtime\),[\s\S]*?click: bound\(switchToLastActiveTab\)/
+  );
+  assert.doesNotMatch(main, /CmdOrCtrl\+Alt\+Z/);
+});
+
+test('Edit exposes the copy-clean-link chord only on macOS', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src/main/main.js'), 'utf8');
+  assert.match(
+    main,
+    /const COPY_CLEAN_LINK_ACCELERATOR = process\.platform === 'darwin'\s*\? 'Cmd\+Alt\+Shift\+C'\s*: null;/
+  );
+  assert.match(
+    main,
+    /command\('copy-link'\),\s*\{\s*id: 'copy-clean-link',[\s\S]*?label: mn\(t\('menu\.copyCleanLink'\)\),[\s\S]*?COPY_CLEAN_LINK_ACCELERATOR[\s\S]*?copyCleanBrowserCommandLink\(target\)/
+  );
+  // Ctrl+Alt is AltGr on international Windows/Linux layouts.
+  assert.doesNotMatch(main, /'(?:CmdOrCtrl|Ctrl)\+Alt\+Shift\+C'/);
+});
+
+test('with vertical tabs the menu button moves into the rail instead of hiding under it', () => {
+  const styles = fs.readFileSync(path.join(ROOT, 'src/renderer/styles.css'), 'utf8');
+  const rail = fs.readFileSync(path.join(ROOT, 'src/renderer/vertical-tabs.js'), 'utf8');
+
+  // The rail owns the window's top-left corner in this layout, so the button
+  // changes parent with the layout (F28-19 drives it in the real app).
+  // It keeps keyboard focus across the move.
+  assert.match(rail, /function moveKeepingFocus\(element, parent, before = null\) \{[\s\S]*?const hadFocus = document\.activeElement === element;\s*parent\.insertBefore\(element, before\);\s*if \(hadFocus\) element\.focus\(\{ preventScroll: true \}\);/);
+  assert.match(rail, /function placeMainMenuButton\(layout\) \{[\s\S]*?if \(layout === 'vertical'\) \{[\s\S]*?moveKeepingFocus\(mainMenuButton, toolbar, toolbar\.firstElementChild\);[\s\S]*?\} else \{\s*moveKeepingFocus\(mainMenuButton, document\.getElementById\('strip'\), document\.getElementById\('islandPill'\)\);/);
+  assert.equal(rail.match(/placeMainMenuButton\((?:'island'|layout)\);/g)?.length, 2,
+    'every path that sets the layout places the button');
+  // In the rail's row it takes the row's own button look.
+  assert.match(styles, /\.vertical-tabs-toolbar #mainMenuButton \{[^}]*position: static;[^}]*width: 28px;[^}]*height: 28px;/);
+  assert.match(styles, /\.vertical-tabs-toolbar #mainMenuButton:hover,\s*\.vertical-tabs-toolbar #mainMenuButton\[aria-expanded="true"\] \{[^}]*background: var\(--surface\);/);
+});
+
+test('chrome markup and IPC keep one native menu definition', () => {
+  const html = fs.readFileSync(path.join(ROOT, 'src/renderer/index.html'), 'utf8');
+  const renderer = fs.readFileSync(path.join(ROOT, 'src/renderer/renderer.js'), 'utf8');
+  const preload = fs.readFileSync(path.join(ROOT, 'src/main/preload.js'), 'utf8');
+  const main = fs.readFileSync(path.join(ROOT, 'src/main/main.js'), 'utf8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/renderer/styles.css'), 'utf8');
+
+  // The auto-hide drag band (island-autohide.test.js) may lead the strip.
+  assert.match(html, /<div id="strip">\s*(?:<div id="dragBand"[^>]*><\/div>\s*)?<button\s+id="mainMenuButton"[\s\S]*aria-haspopup="menu"[\s\S]*hidden/);
+  assert.match(html, /<path d="M3 4\.5h10M3 8h10M3 11\.5h10"\/?>/);
+  assert.doesNotMatch(html, /<circle cx="8"/);
+  assert.match(html, /<div id="windowControls" class="no-drag"><\/div>/);
+  assert.match(styles, /#mainMenuButton \{[\s\S]*position: absolute;[\s\S]*top: 8px;[\s\S]*left: 8px;[\s\S]*width: 34px;[\s\S]*height: 30px/);
+  assert.match(styles, /#mainMenuButton:hover,[\s\S]*#mainMenuButton:focus-visible,[\s\S]*background: var\(--accent-dim\)/);
+  assert.match(styles, /#strip\.tint-dark #mainMenuButton:focus-visible[\s\S]*background: rgba\(255, 255, 255, 0\.14\);[\s\S]*color: #f5f5f5/);
+  assert.match(styles, /#mainMenuButton:focus-visible \{ outline: none; \}/);
+  assert.match(renderer, /if \(!isMac\) \{[\s\S]*mainMenuButton\.hidden = false/);
+  assert.match(renderer, /getBoundingClientRect\(\)/);
+  assert.match(renderer, /window\.browserAPI\.openMainMenu/);
+  assert.match(preload, /ipcRenderer\.invoke\('chrome:open-main-menu', point\)/);
+  assert.match(main, /event\.sender !== rt\(\)\.window\?\.webContents/);
+  assert.match(main, /popupPlatformMainMenu\(\{ Menu, window: rt\(\)\.window, point \}\)/);
+  assert.match(main, /label: t\('menu\.help'\)[\s\S]*isMac \? \[\] : \[[\s\S]*label: t\('menu\.app\.about', \{ app: app\.name \}\)[\s\S]*showAboutPanel\(\{ app, t \}\)/);
+  assert.match(main, /function installChromeShortcuts\(webContents, owner = rt\(\)\) \{[\s\S]*installVerticalTabsShortcut\(webContents, owner\);[\s\S]*installPlatformMainMenuShortcut/);
+  // [^)]* can't span a nested-paren argument like rt().window.webContents, so
+  // this stops at the next statement boundary (;) instead of the next ')'.
+  assert.equal((main.match(/installChromeShortcuts\([^;]*webContents\)/g) ?? []).length >= 2, true);
+  assert.match(
+    fs.readFileSync(path.join(ROOT, 'src/main/platform-main-menu.js'), 'utf8'),
+    /Menu\.getApplicationMenu\(\)/
+  );
+});
+
+// The shortcuts sheet showed "Search && Commands" on Windows and Linux: it
+// copied the live menu's labels, where a literal "&" is escaped as "&&".
+test('a menu label reads as the native menu shows it', () => {
+  for (const platform of ['win32', 'linux']) {
+    assert.equal(menuLabelText('Search && Commands', platform), 'Search & Commands');
+    assert.equal(menuLabelText('&File', platform), 'File', 'a lone & only marks a mnemonic');
+    assert.equal(menuLabelText('Q&&A &&& more', platform), 'Q&A & more');
+    assert.equal(menuLabelText('Reload Tab', platform), 'Reload Tab');
+  }
+  // macOS has no mnemonics, so its labels are never escaped.
+  assert.equal(menuLabelText('Search & Commands', 'darwin'), 'Search & Commands');
+});
+
+test('the shortcuts sheet shows menu labels as the menu does', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'src/main/main.js'), 'utf8');
+  const start = main.indexOf('function listShortcuts()');
+  assert.notEqual(start, -1, 'listShortcuts was found');
+  const body = main.slice(start, main.indexOf('\n}\n', start));
+  assert.match(body, /label: menuLabelText\(item\.label\)/);
+  assert.match(body, /collect\(top\.submenu\?\.items, menuLabelText\(top\.label\)\)/);
+});

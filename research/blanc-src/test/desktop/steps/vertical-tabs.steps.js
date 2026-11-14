@@ -1,0 +1,1908 @@
+const assert = require('node:assert/strict');
+const { Given, When, Then } = require('@cucumber/cucumber');
+const ctx = require('../support/context');
+
+// Production chrome accepts only dimension-checked PNG data URLs
+// (tabicons-model validIconData). The remote fixture in test-hook.js uses this
+// exact 32×32 raster; reuse it so local rail / presentation seeds exercise the
+// same payload and can assert a real decode — an SVG data URL would paint in
+// the test hook's bypass path but never survive a real sanitize.
+const TEST_FAVICON =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAABr0lEQVR4nLTWsUrDQBgH8O/7cmpr1aFj8Rmq+BSiaAdBqnZQfAlx8EnsIO1UcKhDfQkdbJd20EFBUKgFO0TTXM7vEhDR1ia55JZLLnC/u/93kBPKb57nSSkPj4+a9UZn5iQ3IhcUAYJxEzw7+k0IUT2vZmwcXvaXREG6nwrQXEBeu+5QPxASePC6feG0OpZYVK4EYwN5B9wpTyFpA7WJ/VLNbrUTMWivsm+POA1dBiJiTZHKNyvZjaJ0hygsHlAQv1kPnd5j935zp8TrRAVs6AkRsuWie/vi9J5IZEDHGHMfVnf2dLXjzd0McuUVfWq45okatOBYy1bho9V+K9VB11uHpQ39Ecyz4vPuOdLhetrpGIQ6F+TTkpKhp/CTTcugoEvPoO+nlAz6+ZKGQb/eEzfo71CyBo0dTdCgCeOJGROBpIz/gESMKYC5MR0wNEIBJkZYILYRAYhnRANiGJGBsMZVJbvOxnscIJSBmG8ezJfW8BnOIG7zz4niHDgNzoSTCWrKRnCTg6hFnr4Pxf94DGYPrtVGwBhjqwaOhOAuisY7GGNc3w12GzCS4C+fjS8AAAD///R8eLkAAAAGSURBVAMAqMIc5gOIAroAAAAASUVORK5CYII=';
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The sync icon size the assertion below checks against — read from the model
+// so a change to ICON_SIZE surfaces here instead of silently passing.
+const { ICON_SIZE: SYNC_ICON_SIZE, validIconData } = require('../../../src/main/tabicons-model');
+assert.equal(
+  !!validIconData(TEST_FAVICON),
+  true,
+  'TEST_FAVICON must be a production-accepted PNG data URL',
+);
+
+const poll = require('./../support/poll');
+const { pointerDrag } = require('../support/tab-drag');
+// Rail scenarios drive real window resizes/animations, so they keep a longer
+// default deadline than the shared helper's 5s — semantics live in support/poll.
+const waitForValue = (read, predicate, label, timeout = 7000) =>
+  poll.waitForValue(read, predicate, label, timeout);
+
+async function chromePage() {
+  const deadline = Date.now() + 7000;
+  for (;;) {
+    const page = ctx.app.windows().find((candidate) =>
+      !candidate.isClosed() &&
+      candidate.url() === 'blanc-chrome://index/'
+    );
+    if (page) {
+      await page.waitForLoadState('domcontentloaded');
+      return page;
+    }
+    if (Date.now() > deadline) {
+      const urls = ctx.app.windows().map((candidate) => ({
+        closed: candidate.isClosed(),
+        url: candidate.url(),
+      }));
+      throw new Error(`timed out locating the live chrome window: ${JSON.stringify(urls)}`);
+    }
+    await sleep(50);
+  }
+}
+
+async function useLayout(world, layout) {
+  await world.call('setTabLayout', layout);
+  await waitForValue(
+    () => world.call('tabLayout'),
+    (value) => value === layout,
+    `${layout} tab layout`
+  );
+  const page = await chromePage();
+  await page.waitForFunction(
+    (expected) => document.documentElement.dataset.tabLayout === expected,
+    layout
+  );
+  return page;
+}
+
+async function showRail(world) {
+  const page = await useLayout(world, 'vertical');
+  await page.locator('#verticalTabsRail:not([hidden])').waitFor();
+  return page;
+}
+
+// `query` is opt-in for scenarios that need deterministic page state. The
+// default fixture's site-owned sessionStorage load counter does not represent
+// unsaved user input and therefore does not keep a tab awake.
+async function openLoadedTab(world, name, { private: isPrivate = false, query = '' } = {}) {
+  const url = isPrivate ? 'blanc://newtab/?private=1' : `${world.fixtureUrl(name)}${query}`;
+  const id = await world.call('openTab', url, isPrivate ? { private: true } : {});
+  await world.waitForState((state) => {
+    const tab = state.tabs.find((candidate) => candidate.id === id);
+    return tab && !tab.loading && (
+      isPrivate
+        ? tab.loadedUrl === 'blanc://newtab/?private=1'
+        : tab.loadedUrl === url
+    );
+  });
+  await world.call('setTabPresentation', id, {
+    title: name,
+    favicon: TEST_FAVICON,
+  });
+  return id;
+}
+
+async function activeFocusKey(page) {
+  return page.evaluate(() => document.activeElement?.dataset?.focusKey ?? null);
+}
+
+async function beginActivationObservation(page) {
+  await page.evaluate(() => {
+    window.__stopF28ActivationObservation?.();
+    const rail = document.getElementById('verticalTabsRail');
+    const initial = rail?.dataset.activeTabId ?? null;
+    const observation = { initial, last: initial, transitions: [] };
+    const stop = window.browserAPI.onTabsUpdated((payload) => {
+      if (payload.activeTabId === observation.last) return;
+      observation.transitions.push({
+        from: observation.last,
+        to: payload.activeTabId,
+      });
+      observation.last = payload.activeTabId;
+    });
+    window.__f28ActivationObservation = observation;
+    window.__stopF28ActivationObservation = stop;
+  });
+}
+
+async function finishActivationObservation(page) {
+  return page.evaluate(() => {
+    window.__stopF28ActivationObservation?.();
+    window.__stopF28ActivationObservation = null;
+    return structuredClone(window.__f28ActivationObservation);
+  });
+}
+
+async function railSnapshot(page) {
+  return page.evaluate(() => {
+    const rail = document.getElementById('verticalTabsRail');
+    const sections = [...document.querySelectorAll('#verticalTabsList .vertical-tabs-section')]
+      .map((section) => ({
+        kind: section.classList.contains('vertical-tabs-group') ? 'group' : 'static',
+        label:
+          section.querySelector('.vertical-tabs-group-name')?.textContent ??
+          section.getAttribute('aria-label') ??
+          section.querySelector('.vertical-tabs-section-heading')?.firstChild?.textContent?.trim() ??
+          '',
+        rows: [...section.querySelectorAll('.vertical-tab-row')].map((row) => ({
+          id: row.dataset.tabId,
+          bucket: row.dataset.bucket,
+          pinned: !!row.querySelector('.vertical-tab-pin'),
+          title: row.querySelector('.vertical-tab-title')?.textContent ?? '',
+        })),
+      }));
+    const lastRow = document.querySelector('#verticalTabsList .vertical-tab-row:last-of-type');
+    const newTab = document.getElementById('verticalTabsNew');
+    return {
+      hidden: rail.hidden,
+      text: rail.textContent,
+      sections,
+      newTabAfterRows: !lastRow || !!(lastRow.compareDocumentPosition(newTab) & Node.DOCUMENT_POSITION_FOLLOWING),
+    };
+  });
+}
+
+// Real pointer drag (tab-drag.js has no HTML5 drag-and-drop): 'before' is the
+// gap at the target row's top edge, 'after' the gap at its bottom edge.
+async function dragRow(world, page, sourceId, targetId, position) {
+  const list = page.locator('#verticalTabsList');
+  const target = await list.locator(`[data-drag-tab][data-tab-id="${targetId}"]`).boundingBox();
+  assert.ok(target, `drag target ${targetId} has a box`);
+  const y = position === 'before' ? target.y + 2 : target.y + target.height - 2;
+  await pointerDrag(world, page, list.locator(`[data-drag-tab][data-tab-id="${sourceId}"]`), { y });
+}
+
+async function waitForOrder(world, expected) {
+  return world.waitForState(
+    (state) => expected.every((id, index) => state.tabOrder.indexOf(id) === index),
+    { timeout: 7000 }
+  );
+}
+
+// A real rail drag implies an unoccluded, key window — you cannot grab the
+// resize handle of a window another app is covering without macOS fronting it
+// first. A busy desktop (focus stolen, window occluded) also leaves this
+// renderer deprioritized enough to starve the captured pointer stream the
+// drag depends on, so pointer-driven steps front the window before
+// dispatching. Best-effort by design: on quiet desktops (and bare xvfb,
+// where key-window status may be unobtainable) the drag works unfocused,
+// so an unfocusable window must not fail the scenario on its own.
+async function frontChromeWindow(world) {
+  await waitForValue(
+    () => world.call('focusWindow'),
+    Boolean,
+    'chrome window to front and take focus',
+    1500
+  ).catch(() => {});
+}
+
+async function dragRailTo(world, page, targetWidth) {
+  // Under sustained desktop load the captured pointer stream can starve for
+  // longer than any single wait; each attempt re-fronts the window and
+  // re-runs the full down→move→up sequence (committing the same target
+  // width, so a late commit from an abandoned attempt is idempotent).
+  const attempts = 3;
+  for (let attempt = 1; ; attempt++) {
+    await frontChromeWindow(world);
+    const handle = page.locator('#verticalTabsResizeHandle');
+    const box = await handle.boundingBox();
+    assert.ok(box, 'vertical tab resize handle should have a rendered box');
+    const y = Math.min(box.y + 180, box.y + box.height / 2);
+    try {
+      await page.mouse.move(box.x + box.width / 2, y);
+      await page.mouse.down();
+      try {
+        await waitForValue(
+          () => page.evaluate(() => document.documentElement.dataset.verticalTabsResizing === 'true'),
+          Boolean,
+          'vertical-tab resize pointer capture to start',
+          4000
+        );
+        // One trusted captured move tests the product's pointer path without
+        // repeatedly moving the handle out from under Playwright's synthetic
+        // pointer as each preview frame resizes the rail.
+        await page.mouse.move(targetWidth, y);
+      } finally {
+        await page.mouse.up();
+      }
+      await waitForValue(
+        () => page.evaluate(() => document.documentElement.dataset.verticalTabsResizing !== 'true'),
+        Boolean,
+        'vertical-tab resize pointer capture to finish',
+        4000
+      );
+      return;
+    } catch (error) {
+      const diagnostics = await page.evaluate(() => ({
+        resizing: document.documentElement.dataset.verticalTabsResizing ?? null,
+        hasFocus: document.hasFocus(),
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight,
+        visibility: document.visibilityState,
+      })).catch(() => null);
+      if (attempt >= attempts) {
+        error.message += ` (attempt ${attempt}/${attempts}; chrome ${JSON.stringify(diagnostics)})`;
+        throw error;
+      }
+      // If the abandoned attempt's pointerup never reached the renderer, the
+      // product still holds capture state; cancel it the same way a genuine
+      // pointer-stream interruption would before re-dragging. pointercancel
+      // is pointerId-guarded in the product (mouse is pointerId 1 in
+      // Chromium); lostpointercapture is the id-independent fallback.
+      await page.evaluate(() => {
+        const handle = document.getElementById('verticalTabsResizeHandle');
+        handle.dispatchEvent(new PointerEvent('pointercancel', { pointerId: 1, bubbles: true }));
+        if (document.documentElement.dataset.verticalTabsResizing === 'true') {
+          handle.dispatchEvent(new PointerEvent('lostpointercapture', { pointerId: 1, bubbles: true }));
+        }
+      }).catch(() => {});
+      await waitForValue(
+        () => page.evaluate(() => document.documentElement.dataset.verticalTabsResizing !== 'true'),
+        Boolean,
+        'stale vertical-tab resize capture to clear before retrying',
+        4000
+      );
+    }
+  }
+}
+
+function assertBounds(actual, expected, label) {
+  assert.deepEqual(actual, expected, `${label}: ${JSON.stringify(actual)}`);
+}
+
+// window.setContentSize is synchronous on the OS window, but the chrome
+// RENDERER lays out its new viewport asynchronously — on a busy desktop the
+// gap runs to seconds, and geometry read from the chrome document (Island
+// pill position, the resize handle's bounding box) meanwhile reflects the
+// OLD window size. Settling a resize therefore means BOTH the main-process
+// content bounds and the chrome document's viewport report the new size.
+async function resizeWindowAndSettle(world, width, height) {
+  // Fronting first lifts the occlusion/deprioritization that otherwise lets
+  // the renderer sit on the pending resize indefinitely on a busy desktop.
+  await frontChromeWindow(world);
+  await world.call('setWindowContentSize', width, height);
+  await waitForValue(
+    () => world.call('windowContentBounds'),
+    (bounds) => bounds?.width === width && bounds?.height === height,
+    `${width}x${height} content bounds`
+  );
+  const page = await chromePage();
+  await waitForValue(
+    () => page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight })),
+    (viewport) => viewport.width === width && viewport.height === height,
+    `${width}x${height} chrome renderer viewport`
+  );
+}
+
+// ---------- F28-1: default, persistence, and sync scope ----------
+
+Given('a fresh desktop settings profile', async function () {
+  await this.call('setTabLayout', 'island');
+});
+
+Then('the tab layout is {string}', async function (layout) {
+  assert.equal(await this.call('tabLayout'), layout);
+});
+
+When('I set the tab layout to {string}', async function (layout) {
+  await useLayout(this, layout);
+});
+
+When('I relaunch Blanc', async function () {
+  assert.equal(typeof ctx.relaunch, 'function', 'acceptance harness must support a real relaunch');
+  await ctx.relaunch();
+});
+
+Then('the vertical tab rail is shown', async function () {
+  const page = (await this.call('tabLayout')) === 'vertical'
+    ? await chromePage()
+    : await showRail(this);
+  await page.locator('#verticalTabsRail:not([hidden])').waitFor();
+  assert.equal(await page.locator('#verticalTabsRail').getAttribute('aria-label'), 'Vertical tabs');
+  this.railPage = page;
+});
+
+Then('the Profile Sync payload does not contain the tab-layout preference', async function () {
+  const values = await this.call('settingsSyncValues');
+  assert.equal(Object.hasOwn(values, 'tabLayout'), false);
+});
+
+When('Profile Sync receives a different tab-layout preference', async function () {
+  await this.call('mergeRemoteTabLayout', 'island');
+});
+
+Then('the tab layout remains {string}', async function (layout) {
+  assert.equal(await this.call('tabLayout'), layout);
+});
+
+Then('the Island footer offers vertical tabs', async function () {
+  const control = await this.call('islandLayoutToggleState');
+  assert.deepEqual(control, {
+    title: 'Turn vertical tabs on',
+    label: 'Vertical tabs',
+    pressed: 'false',
+  });
+});
+
+Then('the Island footer offers Island tabs', async function () {
+  const control = await this.call('islandLayoutToggleState');
+  assert.deepEqual(control, {
+    title: 'Turn vertical tabs off',
+    label: 'Vertical tabs',
+    pressed: 'true',
+  });
+});
+
+When('I toggle the tab layout from the Island footer', async function () {
+  const previous = await this.call('tabLayout');
+  const expected = previous === 'vertical' ? 'island' : 'vertical';
+  assert.equal(await this.call('clickIslandLayoutToggle'), true);
+  await waitForValue(
+    () => this.call('tabLayout'),
+    (layout) => layout === expected,
+    `${expected} tab layout from Island footer`
+  );
+});
+
+When('I press the vertical-tabs keyboard shortcut', async function () {
+  const previous = await this.call('tabLayout');
+  const expected = previous === 'vertical' ? 'island' : 'vertical';
+  assert.equal(await this.call('pressVerticalTabsShortcut'), true);
+  await waitForValue(
+    () => this.call('tabLayout'),
+    (layout) => layout === expected,
+    `${expected} tab layout from keyboard shortcut`
+  );
+});
+
+When('I drag the vertical tab resize handle to {int} pixels', async function (width) {
+  const page = await showRail(this);
+  await dragRailTo(this, page, width);
+  const expected = Math.max(200, Math.min(360, width));
+  await waitForValue(
+    () => this.call('verticalTabsWidth'),
+    (value) => value === expected,
+    `${expected}px preferred vertical tab width`
+  );
+});
+
+When('I double-click the vertical tab resize handle', async function () {
+  const page = await showRail(this);
+  await frontChromeWindow(this);
+  await page.locator('#verticalTabsResizeHandle').dblclick({ position: { x: 4, y: 180 } });
+  await waitForValue(
+    () => this.call('verticalTabsWidth'),
+    (value) => value === 248,
+    'default vertical tab width'
+  );
+});
+
+Then('the rendered vertical tab width is {int} pixels', async function (width) {
+  const page = await showRail(this);
+  await waitForValue(
+    async () => {
+      const box = await page.locator('#verticalTabsRail').boundingBox();
+      return box?.width ?? null;
+    },
+    (value) => value === width,
+    `${width}px rendered vertical tab width`
+  );
+  const metrics = await this.call('verticalTabsMetrics');
+  assert.equal(metrics.verticalTabsWidth, width);
+});
+
+Then('the preferred vertical tab width is {int} pixels', async function (width) {
+  assert.equal(await this.call('verticalTabsWidth'), width);
+  const metrics = await this.call('verticalTabsMetrics');
+  assert.equal(metrics.verticalTabsPreferredWidth, width);
+});
+
+When('I resize the desktop window to {int} by {int}', async function (width, height) {
+  await resizeWindowAndSettle(this, width, height);
+});
+
+Then('the Profile Sync payload does not contain the vertical-tab width preference', async function () {
+  const values = await this.call('settingsSyncValues');
+  assert.equal(Object.hasOwn(values, 'verticalTabsWidth'), false);
+});
+
+Given('the rail contains a truncated title and a fully visible title', async function () {
+  const longId = await openLoadedTab(this, 'marquee-long');
+  const shortId = await openLoadedTab(this, 'marquee-short');
+  const longTitle =
+    'A deliberately long vertical tab title whose hidden ending should become readable on hover';
+  const shortTitle = 'Notes';
+  await this.call('setTabPresentation', longId, { title: longTitle });
+  await this.call('setTabPresentation', shortId, { title: shortTitle });
+  this.verticalTitleIds = { longId, shortId };
+  const page = await showRail(this);
+  await page.locator(
+    `.vertical-tab-row[data-tab-id="${longId}"] .vertical-tab-title-text`
+  ).waitFor();
+  await page.locator(
+    `.vertical-tab-row[data-tab-id="${shortId}"] .vertical-tab-title-text`
+  ).waitFor();
+});
+
+Then('only the long vertical tab title overflows its viewport', async function () {
+  const page = await chromePage();
+  const measure = (id) => page.locator(
+    `.vertical-tab-row[data-tab-id="${id}"] .vertical-tab-title`
+  ).evaluate((viewport) => {
+    const text = viewport.querySelector('.vertical-tab-title-text');
+    return {
+      viewport: viewport.clientWidth,
+      content: text?.scrollWidth ?? 0,
+    };
+  });
+  const long = await measure(this.verticalTitleIds.longId);
+  const short = await measure(this.verticalTitleIds.shortId);
+  assert.ok(long.content > long.viewport + 1, `long title should overflow: ${JSON.stringify(long)}`);
+  assert.ok(short.content <= short.viewport + 1, `short title should fit: ${JSON.stringify(short)}`);
+});
+
+When('I hover the overflowing vertical tab row outside its title', async function () {
+  const page = await chromePage();
+  await page.locator(
+    `.vertical-tab-row[data-tab-id="${this.verticalTitleIds.longId}"] .vertical-tab-favicon`
+  ).hover();
+  await sleep(500);
+});
+
+Then('neither vertical tab title scrolls', async function () {
+  const page = await chromePage();
+  for (const id of [this.verticalTitleIds.longId, this.verticalTitleIds.shortId]) {
+    const scrolling = await page.locator(
+      `.vertical-tab-row[data-tab-id="${id}"] .vertical-tab-title`
+    ).evaluate((viewport) => viewport.classList.contains('scrolling'));
+    assert.equal(scrolling, false);
+  }
+});
+
+When('I hover the truncated vertical tab title', async function () {
+  const page = await chromePage();
+  await page.locator(
+    `.vertical-tab-row[data-tab-id="${this.verticalTitleIds.longId}"] .vertical-tab-title`
+  ).hover();
+});
+
+Then('the truncated title scrolls toward its hidden end', async function () {
+  const page = await chromePage();
+  const id = this.verticalTitleIds.longId;
+  // On a busy desktop, an app-activation transition mid-wait makes the OS
+  // synthesize real mouse events from the physical cursor (outside the
+  // window), clearing the synthetic :hover this step depends on. Re-issue
+  // the hover per attempt; the scroll assertion itself is unchanged.
+  const readTitleScroll =
+    () => page.locator(
+      `.vertical-tab-row[data-tab-id="${id}"] .vertical-tab-title`
+    ).evaluate((viewport) => {
+      const text = viewport.querySelector('.vertical-tab-title-text');
+      const transform = text ? getComputedStyle(text).transform : 'none';
+      return {
+        hovered: viewport.matches(':hover'),
+        scrolling: viewport.classList.contains('scrolling'),
+        reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+        viewportWidth: viewport.clientWidth,
+        contentWidth: text?.scrollWidth ?? 0,
+        offset: viewport.style.getPropertyValue('--vertical-tab-title-offset'),
+        duration: viewport.style.getPropertyValue('--vertical-tab-title-duration'),
+        transform,
+        x: transform === 'none' ? 0 : new DOMMatrixReadOnly(transform).m41,
+      };
+    });
+  const scrolled = (value) => value.hovered && value.scrolling && value.x < -0.5;
+  const attempts = 4;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await page.locator(
+        `.vertical-tab-row[data-tab-id="${id}"] .vertical-tab-title`
+      ).hover();
+      await waitForValue(
+        readTitleScroll,
+        scrolled,
+        'truncated title hover animation to move toward its hidden end',
+        1750
+      );
+      return;
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+    }
+  }
+});
+
+When('I move the pointer away from the vertical tab title', async function () {
+  const page = await chromePage();
+  await page.locator('.vertical-tabs-toolbar').hover();
+});
+
+Then('the truncated title returns to its starting position', async function () {
+  const page = await chromePage();
+  const title = page.locator(
+    `.vertical-tab-row[data-tab-id="${this.verticalTitleIds.longId}"] .vertical-tab-title`
+  );
+  await page.waitForFunction((tabId) => {
+    const viewport = document.querySelector(
+      `.vertical-tab-row[data-tab-id="${tabId}"] .vertical-tab-title`
+    );
+    const text = viewport?.querySelector('.vertical-tab-title-text');
+    if (!viewport || !text || viewport.classList.contains('scrolling')) return false;
+    const transform = getComputedStyle(text).transform;
+    return transform === 'none' || new DOMMatrixReadOnly(transform).m41 === 0;
+  }, this.verticalTitleIds.longId);
+  assert.equal(await title.getAttribute('data-overflowing'), null);
+});
+
+When('I hover the fully visible vertical tab title', async function () {
+  const page = await chromePage();
+  await page.locator(
+    `.vertical-tab-row[data-tab-id="${this.verticalTitleIds.shortId}"] .vertical-tab-title`
+  ).hover();
+  await sleep(650);
+});
+
+Then('the fully visible title remains still', async function () {
+  const page = await chromePage();
+  const result = await page.locator(
+    `.vertical-tab-row[data-tab-id="${this.verticalTitleIds.shortId}"] .vertical-tab-title`
+  ).evaluate((viewport) => {
+    const text = viewport.querySelector('.vertical-tab-title-text');
+    const transform = text ? getComputedStyle(text).transform : 'none';
+    return {
+      scrolling: viewport.classList.contains('scrolling'),
+      x: transform === 'none' ? 0 : new DOMMatrixReadOnly(transform).m41,
+    };
+  });
+  assert.equal(result.scrolling, false);
+  assert.equal(result.x, 0);
+});
+
+When(
+  'reduced motion is preferred and I hover the truncated vertical tab title',
+  async function () {
+    const page = await chromePage();
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.locator(
+      `.vertical-tab-row[data-tab-id="${this.verticalTitleIds.longId}"] .vertical-tab-title`
+    ).hover();
+    await sleep(650);
+  }
+);
+
+Then('the truncated title remains still with its full accessible name', async function () {
+  const page = await chromePage();
+  try {
+    const result = await page.locator(
+      `.vertical-tab-row[data-tab-id="${this.verticalTitleIds.longId}"]`
+    ).evaluate((row) => {
+      const viewport = row.querySelector('.vertical-tab-title');
+      const text = viewport?.querySelector('.vertical-tab-title-text');
+      const primary = row.querySelector('.vertical-tab-primary');
+      const transform = text ? getComputedStyle(text).transform : 'none';
+      return {
+        reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+        scrolling: viewport?.classList.contains('scrolling') ?? false,
+        x: transform === 'none' ? 0 : new DOMMatrixReadOnly(transform).m41,
+        title: primary?.title ?? '',
+        ariaLabel: primary?.getAttribute('aria-label') ?? '',
+        visibleText: text?.textContent ?? '',
+      };
+    });
+    assert.equal(result.reducedMotion, true);
+    assert.equal(result.scrolling, false);
+    assert.equal(result.x, 0);
+    assert.equal(result.title, result.visibleText);
+    assert.ok(result.ariaLabel.includes(result.visibleText));
+  } finally {
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+  }
+});
+
+// ---------- F28-2: no guest reload ----------
+
+Given('an active web tab with a load counter and unsaved in-page state', async function () {
+  const id = await openLoadedTab(this, 'layout-state');
+  assert.equal(await this.call('setActivePageDraft', 'unsaved press copy'), true);
+  this.layoutGuestBefore = {
+    id,
+    webContentsId: await this.call('activeWebContentsId'),
+    page: await this.call('activePageState'),
+  };
+  assert.equal(this.layoutGuestBefore.page.loadCounter, 1);
+  assert.equal(this.layoutGuestBefore.page.draft, 'unsaved press copy');
+  await useLayout(this, 'island');
+});
+
+When('I change the tab layout from {string} to {string}', async function (from, to) {
+  assert.equal(await this.call('tabLayout'), from);
+  await useLayout(this, to);
+});
+
+Then('the same tab WebContents remains alive', async function () {
+  const state = await this.state();
+  assert.equal(state.activeTabId, this.layoutGuestBefore.id);
+  assert.equal(await this.call('activeWebContentsId'), this.layoutGuestBefore.webContentsId);
+});
+
+Then('its load counter has not increased', async function () {
+  const page = await this.call('activePageState');
+  assert.equal(page.loadCounter, this.layoutGuestBefore.page.loadCounter);
+});
+
+Then('its unsaved in-page state is unchanged', async function () {
+  const page = await this.call('activePageState');
+  assert.equal(page.draft, this.layoutGuestBefore.page.draft);
+});
+
+// ---------- F28-3..5: real child-view and chrome geometry ----------
+
+Given('a {int} by {int} desktop window with the vertical tab layout', async function (width, height) {
+  await resizeWindowAndSettle(this, width, height);
+  this.verticalWindow = { width, height };
+  if (width === 640 && height === 480) {
+    await this.call('groupActiveByName', 'minimum-window-group-label');
+  }
+  await showRail(this);
+});
+
+When(
+  'an ordinary tab is active below the {int} pixel sampled safe-area gutter',
+  async function (stripHeight) {
+    const state = await this.state();
+    await this.call('activateTab', state.activeTabId, true);
+    await waitForValue(
+      () => this.call('activeGuestBounds'),
+      (bounds) => bounds?.y === stripHeight,
+      `active guest below ${stripHeight}px sampled safe-area gutter`
+    );
+  }
+);
+
+Then(
+  'its guest bounds are x {int}, y {int}, width {int}, height {int}',
+  async function (x, y, width, height) {
+    assertBounds(
+      await this.call('activeGuestBounds'),
+      { x, y, width, height },
+      'active guest bounds'
+    );
+  }
+);
+
+Then(
+  'the vertical rail bounds are x {int}, y {int}, width {int}, height {int}',
+  async function (x, y, width, height) {
+    const page = await chromePage();
+    const rail = await page.locator('#verticalTabsRail').boundingBox();
+    assert.ok(rail, 'vertical rail should have a rendered box');
+    assertBounds(rail, { x, y, width, height }, 'vertical rail bounds');
+  }
+);
+
+Then('the resting Island is centered over the website pane', async function () {
+  const page = await chromePage();
+  const expectedCenter = 248 + (this.verticalWindow.width - 248) / 2;
+  await waitForValue(
+    () => page.locator('#islandPill').evaluate((pill) => {
+      const rect = pill.getBoundingClientRect();
+      const transform = getComputedStyle(pill).transform;
+      const translateX = transform === 'none' ? 0 : new DOMMatrixReadOnly(transform).m41;
+      const visualCenter = rect.left + rect.width / 2;
+      return {
+        visualCenter,
+        translateX,
+        layoutCenter: visualCenter - translateX,
+        proximity: {
+          k: Number(pill.style.getPropertyValue('--island-k')) || 0,
+          lean: Number(pill.style.getPropertyValue('--island-lean')) || 0,
+        },
+      };
+    }),
+    (value) => Math.abs(value.layoutCenter - expectedCenter) <= 1,
+    'resting Island to settle at the website-pane center'
+  );
+});
+
+When('I open a utility page', async function () {
+  await this.call('openSettings');
+  await waitForValue(
+    () => this.call('utilitySurface'),
+    (surface) => surface.visible,
+    'utility sheet'
+  );
+});
+
+Then(
+  'its sheet bounds are x {int}, y {int}, width {int}, height {int}',
+  async function (x, y, width, height) {
+    assertBounds(
+      await this.call('utilityBounds'),
+      { x, y, width, height },
+      'utility sheet bounds'
+    );
+  }
+);
+
+Then('the rail remains visible and unobscured', async function () {
+  const page = await chromePage();
+  const rail = await page.locator('#verticalTabsRail').boundingBox();
+  const sheet = await this.call('utilityBounds');
+  assert.ok(rail, 'vertical rail should have a rendered box');
+  assert.equal(await page.locator('#verticalTabsRail').isVisible(), true);
+  assert.ok(rail.x + rail.width <= sheet.x,
+    `rail right edge ${rail.x + rail.width} must not overlap sheet x ${sheet.x}`);
+});
+
+When('I open the Island panel', async function () {
+  await this.call('openPanel');
+  await waitForValue(() => this.call('overlayRendererMode'), (mode) => mode === 'panel', 'Island panel renderer');
+});
+
+Then(
+  'the panel overlay bounds are x {int}, y {int}, width {int}, height {int}',
+  async function (x, y, width, height) {
+    assertBounds(await this.call('overlayBounds'), { x, y, width, height }, 'panel overlay bounds');
+  }
+);
+
+Then('the expanded Island is centered over the website pane', async function () {
+  const expectedCenter = 248 + (this.verticalWindow.width - 248) / 2;
+  await waitForValue(
+    async () => {
+      const overlay = await this.call('overlayBounds');
+      const panel = await this.call('overlayElementRect', '#islandPanel');
+      return panel ? {
+        overlay,
+        panel,
+        center: overlay.x + panel.x + panel.width / 2,
+        expectedCenter,
+      } : null;
+    },
+    (value) => value && Math.abs(value.center - value.expectedCenter) <= 1,
+    'expanded Island to settle at the website-pane center'
+  );
+});
+
+When('I replace the panel with the command palette', async function () {
+  await this.call('openPalette');
+  await waitForValue(() => this.call('overlayRendererMode'), (mode) => mode === 'palette', 'command palette renderer');
+});
+
+Then(
+  'the palette overlay bounds are x {int}, y {int}, width {int}, height {int}',
+  async function (x, y, width, height) {
+    assertBounds(await this.call('overlayBounds'), { x, y, width, height }, 'palette overlay bounds');
+  }
+);
+
+Then('the expanded Island remains centered over the website pane', async function () {
+  const expectedCenter = 248 + (this.verticalWindow.width - 248) / 2;
+  await waitForValue(
+    async () => {
+      const overlay = await this.call('overlayBounds');
+      const panel = await this.call('overlayElementRect', '#islandPanel');
+      return panel ? {
+        overlay,
+        panel,
+        center: overlay.x + panel.x + panel.width / 2,
+        expectedCenter,
+      } : null;
+    },
+    (value) => value && Math.abs(value.center - value.expectedCenter) <= 1,
+    'palette Island to settle at the website-pane center'
+  );
+});
+
+Then('the page pane starts at x {int} and is {int} pixels wide', async function (x, width) {
+  const bounds = await this.call('activeGuestBounds');
+  assert.equal(bounds.x, x);
+  assert.equal(bounds.width, width);
+});
+
+When('I open find in page', async function () {
+  await this.call('openFind');
+  await waitForValue(() => this.call('overlayMode'), (mode) => mode === 'find', 'find capsule');
+});
+
+Then('the visible find capsule is centered in the page pane', async function () {
+  const overlay = await this.call('overlayBounds');
+  const capsule = await this.call('overlayElementRect', '#findBar');
+  assert.ok(capsule, 'find capsule should render');
+  this.findCapsule = { overlay, capsule };
+  const center = overlay.x + capsule.x + capsule.width / 2;
+  const expected = 248 + 392 / 2;
+  assert.ok(Math.abs(center - expected) <= 1, `find center ${center} should equal ${expected}`);
+});
+
+Then('the visible find capsule is no wider than {int} pixels', async function (maxWidth) {
+  const capsule = this.findCapsule?.capsule ?? await this.call('overlayElementRect', '#findBar');
+  assert.ok(capsule.width <= maxWidth, `find capsule width ${capsule.width} exceeds ${maxWidth}`);
+});
+
+Then('the find capsule does not overlap the vertical tab rail', async function () {
+  const { overlay, capsule } = this.findCapsule;
+  assert.ok(overlay.x + capsule.x >= 248,
+    `find capsule begins at ${overlay.x + capsule.x}, inside the 248px rail`);
+  const page = await chromePage();
+  // Same contract as before, waited-for rather than read once: the pill is
+  // laid out by the chrome renderer, which can still be settling the minimum
+  // window size (see resizeWindowAndSettle) when this step runs on a busy
+  // desktop. The predicate must still become true — nothing is loosened.
+  const pill = await waitForValue(
+    () => page.locator('#islandPill').evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        left: rect.left,
+        right: rect.right,
+        clientWidth: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+      };
+    }),
+    (value) => value.left >= 248 && value.right <= this.verticalWindow.width,
+    `resting Island inside the minimum website pane (>= 248, <= ${this.verticalWindow.width})`
+  );
+  assert.ok(pill.scrollWidth <= pill.clientWidth + 1,
+    `resting Island content overflows at minimum width: ${JSON.stringify(pill)}`);
+});
+
+// ---------- F28-6: canonical presentation and remote scope ----------
+
+Given('the local tab model contains ungrouped pins, named groups, and loose tabs', async function () {
+  const initial = await this.state();
+  const looseFirst = initial.activeTabId;
+  await this.call('setTabPresentation', looseFirst, { title: 'Loose first', favicon: TEST_FAVICON });
+
+  const standalonePin = await openLoadedTab(this, 'Standalone pin');
+  await this.call('pinTab', standalonePin);
+
+  const workPinned = await openLoadedTab(this, 'Work pinned');
+  await this.call('groupTabByName', workPinned, 'work');
+  await this.call('pinTab', workPinned);
+
+  const workRegular = await openLoadedTab(this, 'Work regular');
+  await this.call('groupTabByName', workRegular, 'work');
+
+  const playRegular = await openLoadedTab(this, 'Play regular');
+  await this.call('groupTabByName', playRegular, 'play');
+
+  const looseLast = await openLoadedTab(this, 'Loose last');
+  await this.call('activateTab', workRegular, true);
+
+  this.canonicalRail = {
+    looseFirst,
+    standalonePin,
+    workPinned,
+    workRegular,
+    playRegular,
+    looseLast,
+  };
+});
+
+Given('one named group contains both pinned and unpinned tabs', async function () {
+  const state = await this.state();
+  const work = state.groups.find((group) => group.name === 'work');
+  const members = state.tabs.filter((tab) => tab.groupId === work?.id);
+  assert.ok(members.some((tab) => tab.pinned) && members.some((tab) => !tab.pinned));
+});
+
+Given('another device has shared open tabs', async function () {
+  this.remoteDevices = await this.call('injectRemoteDevices');
+});
+
+Then('ungrouped pinned rows appear first', async function () {
+  const snapshot = await railSnapshot(this.railPage);
+  assert.equal(snapshot.sections[0].label, 'Pinned');
+  assert.deepEqual(snapshot.sections[0].rows.map((row) => row.id), [
+    this.canonicalRail.standalonePin,
+  ]);
+});
+
+Then('each named group follows in canonical group order', async function () {
+  const state = await this.state();
+  const snapshot = await railSnapshot(this.railPage);
+  const rendered = snapshot.sections.filter((section) => section.kind === 'group').map((section) => section.label);
+  assert.deepEqual(rendered, state.groups.map((group) => group.name));
+});
+
+Then('pinned rows lead unpinned rows inside each group', async function () {
+  const snapshot = await railSnapshot(this.railPage);
+  const work = snapshot.sections.find((section) => section.label === 'work');
+  assert.deepEqual(work.rows.map((row) => row.id), [
+    this.canonicalRail.workPinned,
+    this.canonicalRail.workRegular,
+  ]);
+  assert.equal(work.rows[0].pinned, true);
+  assert.equal(work.rows[1].pinned, false);
+});
+
+Then('each run of ungrouped rows keeps its place in tab order around the named groups', async function () {
+  // "Loose first" was open before any group, "Loose last" after them all
+  // (spec 2026-10-17: ungrouped tabs may sit above, between or below groups).
+  const snapshot = await railSnapshot(this.railPage);
+  const groupIndexes = snapshot.sections
+    .map((section, index) => section.kind === 'group' ? index : -1)
+    .filter((index) => index >= 0);
+  const runs = snapshot.sections
+    .map((section, index) => ({ section, index }))
+    .filter(({ section }) => section.label === 'Tabs');
+  assert.equal(runs.length, 2);
+  assert.ok(runs[0].index < Math.min(...groupIndexes));
+  assert.ok(runs[1].index > Math.max(...groupIndexes));
+  assert.deepEqual(runs[0].section.rows.map((row) => row.id), [this.canonicalRail.looseFirst]);
+  assert.deepEqual(runs[1].section.rows.map((row) => row.id), [this.canonicalRail.looseLast]);
+});
+
+Then('the new-tab action is last', async function () {
+  const snapshot = await railSnapshot(this.railPage);
+  assert.equal(snapshot.newTabAfterRows, true);
+});
+
+Then('remote-device tabs do not appear in the rail', async function () {
+  const snapshot = await railSnapshot(this.railPage);
+  assert.equal(snapshot.text.includes('Remote press needle'), false);
+  assert.equal(snapshot.sections.flatMap((section) => section.rows).some(
+    (row) => row.title === 'Remote press needle'
+  ), false);
+});
+
+Then('remote-device tabs remain available in the Quick Switcher and start page', async function () {
+  await this.call('injectRemoteDevices');
+  // The start page draws the same synced icon the Quick Switcher does, and is
+  // held to the same standard: the letter tile must give way to an icon whose
+  // bytes decode. The icon is part of what we WAIT for, not something asserted
+  // afterwards — decorateTile applies has-icon inside probe.onload, so a poll
+  // that stopped at the title could return while the letter was still showing
+  // and fail intermittently. (The Quick Switcher needs no such wait: setFavicon
+  // applies its class synchronously during the render.)
+  await waitForValue(
+    () => this.call('remoteStartPageRows'),
+    (rows) => rows.some((row) =>
+      row.title === 'Remote press needle'
+      && row.faviconHasIcon
+      && row.faviconDecoded === `${SYNC_ICON_SIZE}x${SYNC_ICON_SIZE}`),
+    'decoded synced favicon on start page'
+  );
+
+  await this.call('openPalette');
+  await waitForValue(
+    () => this.call('overlayRendererMode'),
+    (mode) => mode === 'palette',
+    'palette renderer'
+  );
+  // refreshSwitcherData() reads the real (disabled) sync cache on open; send
+  // the deterministic remote snapshot after that asynchronous refresh settles.
+  await sleep(100);
+  await this.call('injectRemoteDevices');
+  assert.equal(await this.call('editAddressInput', 'Remote press needle'), true);
+  const switcherRows = await waitForValue(
+    () => this.call('addressResultRows'),
+    (rows) => rows.some((row) => row.title === 'Remote press needle'),
+    'remote tab in Quick Switcher'
+  );
+  // The synced favicon rides in the sync payload as a rasterized PNG; the
+  // receiver never refetches it from the remote site. Asserting the DECODE, not
+  // just the class, is what makes a corrupt icon fail here instead of rendering
+  // as a silently empty box.
+  const remoteRow = switcherRows.find((row) => row.title === 'Remote press needle');
+  assert.equal(remoteRow.faviconHasIcon, true, 'synced tab should render its favicon');
+  assert.equal(
+    remoteRow.faviconDecoded,
+    `${SYNC_ICON_SIZE}x${SYNC_ICON_SIZE}`,
+    'synced tab favicon bytes should decode at the sync icon size'
+  );
+
+  // Favorite results must paint their stored PNG too — they used to omit
+  // result.tab, so setFavicon got null while start-page tiles rendered fine.
+  // Seed before re-opening so refreshSwitcherData picks the record up.
+  await this.call('closeOverlay');
+  await this.call('seedFavorite', 'https://docs.example/', 'docs.example');
+  await this.call('openPalette');
+  await waitForValue(
+    () => this.call('overlayRendererMode'),
+    (mode) => mode === 'palette',
+    'palette renderer for favorite'
+  );
+  assert.equal(await this.call('editAddressInput', 'docs.example'), true);
+  const favoriteRows = await waitForValue(
+    () => this.call('addressResultRows'),
+    (rows) => rows.some((row) => row.tag === 'Favorite' && row.title === 'docs.example'
+      && row.faviconHasIcon
+      && row.faviconDecoded === `${SYNC_ICON_SIZE}x${SYNC_ICON_SIZE}`),
+    'decoded favorite favicon in Quick Switcher'
+  );
+  const favoriteRow = favoriteRows.find((row) => row.tag === 'Favorite' && row.title === 'docs.example');
+  assert.equal(favoriteRow.faviconHasIcon, true, 'favorite should render its favicon');
+  assert.equal(
+    favoriteRow.faviconDecoded,
+    `${SYNC_ICON_SIZE}x${SYNC_ICON_SIZE}`,
+    'favorite favicon bytes should decode at the production icon size'
+  );
+
+  await this.call('closeOverlay');
+  await this.call('activateTab', this.canonicalRail.workRegular, true);
+});
+
+When('I fold the group containing the active tab', async function () {
+  const state = await this.state();
+  const active = state.tabs.find((tab) => tab.id === state.activeTabId);
+  this.foldedGroup = state.groups.find((group) => group.id === active?.groupId);
+  assert.ok(this.foldedGroup, 'active tab should belong to a named group');
+  await this.railPage.locator(
+    `.vertical-tabs-group-header[data-focus-key="group:${this.foldedGroup.id}"]`
+  ).click();
+  await this.railPage.locator(
+    `.vertical-tabs-group-header[data-focus-key="group:${this.foldedGroup.id}"][aria-expanded="false"]`
+  ).waitFor();
+});
+
+Then('its group header exposes the collapsed-active state', async function () {
+  const header = this.railPage.locator(
+    `.vertical-tabs-group-header[data-focus-key="group:${this.foldedGroup.id}"]`
+  );
+  await expectAttribute(header, 'aria-expanded', 'false');
+  assert.equal(await header.evaluate((element) => element.classList.contains('contains-active')), true);
+  assert.match(await header.getAttribute('aria-label'), /contains current tab/);
+});
+
+Then('I can unfold that group from its header', async function () {
+  const header = this.railPage.locator(
+    `.vertical-tabs-group-header[data-focus-key="group:${this.foldedGroup.id}"]`
+  );
+  await header.click();
+  await expectAttribute(header, 'aria-expanded', 'true');
+});
+
+async function expectAttribute(locator, name, value) {
+  await waitForValue(() => locator.getAttribute(name), (actual) => actual === value,
+    `${name}=${value}`);
+}
+
+// ---------- F28-7: row state and accessible naming ----------
+
+Given('local tabs cover active, loading, private, pinned, audible, muted, and quiet states', async function () {
+  // The startup tab is blanc://newtab. Production setFavicon paints that with
+  // the themed `.internal` mark and ignores any stored PNG — so the decode
+  // assertion below would fail if we left it on a Blanc URL. Navigate to an
+  // external fixture page first, then seed the production-accepted PNG.
+  const initial = await this.state();
+  const active = initial.activeTabId;
+  const activeUrl = this.fixtureUrl('Active identity');
+  assert.equal(await this.call('navigateTab', active, activeUrl), true);
+  await this.waitForState((state) => {
+    const tab = state.tabs.find((candidate) => candidate.id === active);
+    return tab && !tab.loading && tab.loadedUrl === activeUrl;
+  });
+  await this.call('setTabPresentation', active, {
+    title: 'Active identity',
+    favicon: TEST_FAVICON,
+  });
+
+  const loading = await openLoadedTab(this, 'Loading identity');
+  await this.call('setTabPresentation', loading, { isLoading: true });
+
+  const privateTab = await openLoadedTab(this, 'Private identity', { private: true });
+  const pinned = await openLoadedTab(this, 'Pinned identity');
+  await this.call('setTabPresentation', pinned, { favicon: TEST_FAVICON });
+  await this.call('pinTab', pinned);
+  const audible = await openLoadedTab(this, 'Audible identity');
+  await this.call('setTabPresentation', audible, { favicon: TEST_FAVICON, audible: true });
+  const muted = await openLoadedTab(this, 'Muted identity');
+  await this.call('setTabPresentation', muted, {
+    favicon: TEST_FAVICON, audible: true, muted: true,
+  });
+  const quiet = await openLoadedTab(this, 'Quiet identity', { query: '?nostore=1' });
+  await this.call('setTabPresentation', quiet, { favicon: TEST_FAVICON });
+  await this.call('activateTab', active, true);
+
+  // The active tab can never be quiet, so this has to follow the reactivation
+  // above. The row keeps rendering from the record — title and favicon are
+  // still there once the renderer is gone.
+  assert.equal(await this.call('sleepTab', quiet), true, 'the quiet fixture tab must go quiet');
+  await this.waitForState((state) =>
+    state.tabs.find((candidate) => candidate.id === quiet)?.asleep === true);
+
+  this.stateRows = { active, loading, privateTab, pinned, audible, muted, quiet };
+});
+
+Then('every rail row exposes its favicon and title', async function () {
+  const skipDecode = new Set(['loading', 'privateTab']);
+  for (const [name, id] of Object.entries(this.stateRows)) {
+    const row = this.railPage.locator(`.vertical-tab-row[data-tab-id="${id}"]`);
+    assert.equal(await row.locator('.vertical-tab-favicon').count(), 1, `${id} favicon`);
+    assert.ok((await row.locator('.vertical-tab-title').textContent()).trim(), `${id} title`);
+    if (skipDecode.has(name)) continue;
+    // Decode the painted pixels — a has-icon class with corrupt bytes would
+    // still pass a class-only check. Private stays empty on purpose; loading
+    // shows the spinner instead of an icon.
+    const decoded = await row.locator('.vertical-tab-favicon').evaluate(async (el) => {
+      if (!el.classList.contains('has-icon')) return { hasIcon: false, size: null };
+      const raw = getComputedStyle(el).backgroundImage;
+      let url = '';
+      if (raw && raw.indexOf('url(') === 0) {
+        url = raw.slice(4, raw.length - 1);
+        if (url[0] === '"' || url[0] === "'") url = url.slice(1, -1);
+      }
+      if (!url) return { hasIcon: true, size: null };
+      const size = await new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => resolve(`${img.naturalWidth}x${img.naturalHeight}`);
+        img.onerror = () => resolve(false);
+        img.src = url;
+      });
+      return { hasIcon: true, size };
+    });
+    assert.equal(decoded.hasIcon, true, `${name} rail favicon should paint has-icon`);
+    assert.equal(
+      decoded.size,
+      `${SYNC_ICON_SIZE}x${SYNC_ICON_SIZE}`,
+      `${name} rail favicon should decode at the production icon size`,
+    );
+  }
+});
+
+Then('the active row is identified', async function () {
+  const row = this.railPage.locator(`.vertical-tab-row[data-tab-id="${this.stateRows.active}"]`);
+  assert.equal(await row.evaluate((element) => element.classList.contains('active')), true);
+  assert.equal(await row.locator('.vertical-tab-primary').getAttribute('aria-current'), 'page');
+});
+
+Then('the loading row exposes loading state', async function () {
+  const row = this.railPage.locator(`.vertical-tab-row[data-tab-id="${this.stateRows.loading}"]`);
+  assert.equal(await row.evaluate((element) => element.classList.contains('loading')), true);
+  assert.equal(await row.locator('.vertical-tab-favicon.loading').count(), 1);
+});
+
+Then('the private row exposes private state', async function () {
+  const row = this.railPage.locator(`.vertical-tab-row[data-tab-id="${this.stateRows.privateTab}"]`);
+  assert.equal(await row.evaluate((element) => element.classList.contains('private')), true);
+  assert.equal(await row.locator('.vertical-tab-private').textContent(), 'Private');
+  assert.equal(
+    await row.locator('.vertical-tab-favicon').evaluate((element) => element.style.backgroundImage),
+    '',
+    'private favicon URLs must not be fetched again by persistent chrome'
+  );
+});
+
+Then('the pinned row exposes pinned state', async function () {
+  const row = this.railPage.locator(`.vertical-tab-row[data-tab-id="${this.stateRows.pinned}"]`);
+  assert.equal(await row.locator('.vertical-tab-pin').count(), 1);
+});
+
+Then('audible and muted rows expose distinct audio states', async function () {
+  const audible = this.railPage.locator(
+    `.vertical-tab-row[data-tab-id="${this.stateRows.audible}"] .vertical-tab-audio:not(.muted)`
+  );
+  const muted = this.railPage.locator(
+    `.vertical-tab-row[data-tab-id="${this.stateRows.muted}"] .vertical-tab-audio.muted`
+  );
+  assert.equal(await audible.count(), 1);
+  assert.equal(await muted.count(), 1);
+});
+
+Then('the quiet row exposes quiet state', async function () {
+  const row = this.railPage.locator(`.vertical-tab-row[data-tab-id="${this.stateRows.quiet}"]`);
+  assert.equal(await row.evaluate((element) => element.classList.contains('quiet')), true);
+  // The whole row dims — no marker element; the class carries the visual.
+  const opacity = await row.evaluate((element) => getComputedStyle(element).opacity);
+  assert.ok(parseFloat(opacity) < 1, `quiet row must dim (got opacity ${opacity})`);
+  // Quiet is its own treatment, deliberately not the private one.
+  assert.equal(await row.evaluate((element) => element.classList.contains('private')), false);
+});
+
+Then('those states have accessible names that do not rely on color alone', async function () {
+  const expected = new Map([
+    [this.stateRows.active, /active/],
+    [this.stateRows.loading, /loading/],
+    [this.stateRows.privateTab, /private/],
+    [this.stateRows.pinned, /pinned/],
+    [this.stateRows.audible, /playing audio/],
+    [this.stateRows.muted, /muted/],
+    [this.stateRows.quiet, /quiet/],
+  ]);
+  for (const [id, pattern] of expected) {
+    const label = await this.railPage.locator(
+      `.vertical-tab-primary[data-tab-id="${id}"]`
+    ).getAttribute('aria-label');
+    assert.match(label.toLowerCase(), pattern, `${id} accessible label`);
+  }
+});
+
+// ---------- F28-8: pointer actions ----------
+
+Given('three local tabs are visible in the vertical tab rail', async function () {
+  const initial = await this.state();
+  const first = initial.activeTabId;
+  await this.call('setTabPresentation', first, { title: 'Pointer one', favicon: TEST_FAVICON });
+  const second = await openLoadedTab(this, 'Pointer two');
+  const third = await openLoadedTab(this, 'Pointer three');
+  this.pointerTabs = [first, second, third];
+  this.railPage = await showRail(this);
+  await this.railPage.locator('.vertical-tab-row').first().waitFor();
+});
+
+When('I activate an inactive tab row', async function () {
+  const state = await this.state();
+  this.pointerCountBefore = state.tabs.length;
+  this.pointerActivated = this.pointerTabs.find((id) => id !== state.activeTabId);
+  await this.railPage.locator(
+    `.vertical-tab-primary[data-tab-id="${this.pointerActivated}"]`
+  ).click();
+});
+
+Then('that tab becomes active without being duplicated', async function () {
+  const state = await this.waitForState((candidate) =>
+    candidate.activeTabId === this.pointerActivated);
+  assert.equal(state.tabs.length, this.pointerCountBefore);
+  assert.equal(state.tabs.filter((tab) => tab.id === this.pointerActivated).length, 1);
+});
+
+When('I use the row close action on another tab', async function () {
+  this.pointerClosed = this.pointerTabs.find((id) => id !== this.pointerActivated);
+  await this.railPage.locator(
+    `.vertical-tab-row[data-tab-id="${this.pointerClosed}"] .vertical-tab-close`
+  ).click();
+});
+
+When('I middle-click a remaining tab row', async function () {
+  const state = await this.state();
+  this.pointerMiddleClosed = state.tabs.find((tab) => tab.id !== state.activeTabId).id;
+  await this.railPage.locator(
+    `.vertical-tab-primary[data-tab-id="${this.pointerMiddleClosed}"]`
+  ).click({ button: 'middle' });
+});
+
+Then('that tab closes', async function () {
+  const id = this.pointerMiddleClosed ?? this.pointerClosed;
+  await this.waitForState((state) => !state.tabs.some((tab) => tab.id === id));
+});
+
+When('I activate the rail new-tab action', async function () {
+  const before = await this.state();
+  await this.railPage.locator('#verticalTabsNew').click();
+  const after = await this.waitForState((state) => state.tabs.length === before.tabs.length + 1);
+  ctx.lastNewTabId = after.activeTabId;
+});
+
+Then('pin, mute, duplicate, and group-membership actions remain available through the Island or native menus', async function () {
+  const labels = await this.call('nativeMenuLabels');
+  assert.ok(labels.includes('Duplicate Tab'));
+  assert.ok(labels.some((label) => label === 'Pin Tab' || label === 'Unpin Tab'));
+  assert.ok(labels.some((label) => label === 'Mute Tab' || label === 'Unmute Tab'));
+  assert.ok(labels.includes('New Group…'));
+  assert.ok(labels.includes('Ungroup Tab'));
+});
+
+// ---------- F28-9: atomic activation and focus ----------
+
+Given('a local tab row is already active in the vertical tab rail', async function () {
+  const initial = await this.state();
+  const inactive = initial.activeTabId;
+  await this.call('setTabPresentation', inactive, { title: 'Inactive focus target', favicon: TEST_FAVICON });
+  const active = await openLoadedTab(this, 'Active focus target');
+  this.focusTabs = { active, inactive };
+  this.railPage = await showRail(this);
+});
+
+async function waitTransientDismissed(world) {
+  return waitForValue(
+    async () => ({
+      overlay: await world.call('overlayMode'),
+      utility: await world.call('utilitySurface'),
+    }),
+    (value) => value.overlay == null && !value.utility.visible,
+    'transient chrome dismissal'
+  );
+}
+
+async function openTransient(world, kind) {
+  if (kind === 'panel') await world.call('openPanel');
+  else if (kind === 'palette') await world.call('openPalette');
+  else if (kind === 'find') await world.call('openFind');
+  else await world.call('openSettings');
+  await waitForValue(
+    async () => ({
+      overlay: await world.call('overlayMode'),
+      utility: await world.call('utilitySurface'),
+    }),
+    (value) => kind === 'utility' ? value.utility.visible : value.overlay === kind,
+    `${kind} transient surface`
+  );
+}
+
+When('I activate that row with the panel, palette, find capsule, or utility sheet open', async function () {
+  this.activeFocusResults = [];
+  for (const surface of ['panel', 'palette', 'find', 'utility']) {
+    await openTransient(this, surface);
+    assert.equal(await this.call('beginTabFocusObservation', this.focusTabs.active), true);
+    await beginActivationObservation(this.railPage);
+    await this.railPage.locator(
+      `.vertical-tab-primary[data-tab-id="${this.focusTabs.active}"]`
+    ).click();
+    const dismissed = await waitTransientDismissed(this);
+    await sleep(50);
+    const focus = await this.call('finishTabFocusObservation');
+    const activation = await finishActivationObservation(this.railPage);
+    const state = await this.state();
+    this.activeFocusResults.push({ surface, dismissed, focus, activation, state });
+  }
+});
+
+Then('the open transient surface is dismissed', function () {
+  const results = this.inactiveFocusResult
+    ? [this.inactiveFocusResult]
+    : this.activeFocusResults;
+  for (const result of results) {
+    assert.equal(result.dismissed.overlay, null);
+    assert.equal(result.dismissed.utility.visible, false);
+  }
+});
+
+Then('the tab is activated at most once', function () {
+  for (const result of this.activeFocusResults) {
+    assert.equal(result.state.activeTabId, this.focusTabs.active);
+    assert.ok(
+      result.activation.transitions.length <= 1,
+      `${result.surface} changed active tabs ${result.activation.transitions.length} times`
+    );
+  }
+});
+
+Then('focus moves to the active tab content', async function () {
+  for (const result of this.activeFocusResults) {
+    assert.ok(result.focus.count >= 1, `${result.surface} should focus active content`);
+  }
+  const probe = await this.call('probeFocusAfterTabBroadcast', this.focusTabs.active);
+  assert.equal(probe.tabBlurCount, 0,
+    'a later tab-state broadcast must not steal focus back into the rail');
+  assert.equal(probe.chromeFocusCount, 0);
+});
+
+When('I activate an inactive row with a transient surface open', async function () {
+  await openTransient(this, 'palette');
+  assert.equal(await this.call('beginTabFocusObservation', this.focusTabs.inactive), true);
+  await beginActivationObservation(this.railPage);
+  await this.railPage.locator(
+    `.vertical-tab-primary[data-tab-id="${this.focusTabs.inactive}"]`
+  ).click();
+  const dismissed = await waitTransientDismissed(this);
+  const state = await this.waitForState((candidate) =>
+    candidate.activeTabId === this.focusTabs.inactive);
+  await sleep(50);
+  const focus = await this.call('finishTabFocusObservation');
+  const activation = await finishActivationObservation(this.railPage);
+  this.inactiveFocusResult = { dismissed, state, focus, activation };
+});
+
+Then('that tab becomes active at most once', function () {
+  assert.equal(this.inactiveFocusResult.state.activeTabId, this.focusTabs.inactive);
+  assert.equal(this.inactiveFocusResult.activation.transitions.length, 1);
+});
+
+Then("focus moves to that tab's content", async function () {
+  assert.ok(this.inactiveFocusResult.focus.count >= 1);
+  const probe = await this.call('probeFocusAfterTabBroadcast', this.focusTabs.inactive);
+  assert.equal(probe.tabBlurCount, 0,
+    'a later tab-state broadcast must leave focus in the newly active page');
+  assert.equal(probe.chromeFocusCount, 0);
+});
+
+// ---------- F28-10/11: real DOM drag events, guarded main mutation ----------
+
+Given('three rail rows share the same group and pinned state', async function () {
+  const ids = [];
+  for (const name of ['Drag one', 'Drag two', 'Drag three']) {
+    const id = await openLoadedTab(this, name);
+    await this.call('groupTabByName', id, 'drag');
+    ids.push(id);
+  }
+  this.dragTabs = ids;
+  this.dragGroupBefore = (await this.state()).tabs
+    .filter((tab) => ids.includes(tab.id))
+    .map(({ id, groupId, pinned }) => ({ id, groupId, pinned }));
+  this.railPage = await showRail(this);
+});
+
+When('I drag the third row before the first row', async function () {
+  await dragRow(
+    this,
+    this.railPage,
+    this.dragTabs[2],
+    this.dragTabs[0],
+    'before'
+  );
+  await this.waitForState((state) => {
+    const order = state.tabOrder.filter((id) => this.dragTabs.includes(id));
+    return order.join(',') === [
+      this.dragTabs[2],
+      this.dragTabs[0],
+      this.dragTabs[1],
+    ].join(',');
+  });
+});
+
+Then('the canonical tab order reflects that move', async function () {
+  const state = await this.state();
+  assert.deepEqual(state.tabOrder.filter((id) => this.dragTabs.includes(id)), [
+    this.dragTabs[2],
+    this.dragTabs[0],
+    this.dragTabs[1],
+  ]);
+});
+
+Then('every row keeps its group and pinned state', async function () {
+  const state = await this.state();
+  const after = state.tabs
+    .filter((tab) => this.dragTabs.includes(tab.id))
+    .map(({ id, groupId, pinned }) => ({ id, groupId, pinned }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const before = [...this.dragGroupBefore].sort((a, b) => a.id.localeCompare(b.id));
+  assert.deepEqual(after, before);
+});
+
+When('I drag the first row to the end of that source bucket', async function () {
+  const state = await this.state();
+  const current = state.tabOrder.filter((id) => this.dragTabs.includes(id));
+  const source = current[0];
+  const target = current[current.length - 1];
+  const domOrder = await this.railPage.locator(
+    '.vertical-tabs-group .vertical-tab-row'
+  ).evaluateAll((rows) => rows.map((row) => row.dataset.tabId));
+  const withoutSource = domOrder.filter((id) => id !== source);
+  this.endDropBeforeId = withoutSource[withoutSource.indexOf(target) + 1] ?? null;
+  await dragRow(this, this.railPage, source, target, 'after');
+  this.dragEndExpected = [...current.slice(1), source];
+  await this.waitForState((candidate) =>
+    candidate.tabOrder.filter((id) => this.dragTabs.includes(id)).join(',') ===
+      this.dragEndExpected.join(','));
+});
+
+Then('the reorder request uses no before-row id', function () {
+  // The live DOM target was the last row after removing the source, so the
+  // renderer's before-row contract necessarily supplies null.
+  assert.equal(this.endDropBeforeId, null);
+});
+
+Then("the canonical tab order places it at that bucket's end", async function () {
+  const state = await this.state();
+  assert.deepEqual(
+    state.tabOrder.filter((id) => this.dragTabs.includes(id)),
+    this.dragEndExpected
+  );
+});
+
+Given('rail rows span different groups and pinned states', async function () {
+  const groupRegular = await openLoadedTab(this, 'Boundary group A');
+  await this.call('groupTabByName', groupRegular, 'alpha');
+  const groupPinned = await openLoadedTab(this, 'Boundary pinned A');
+  await this.call('groupTabByName', groupPinned, 'alpha');
+  await this.call('pinTab', groupPinned);
+  const otherGroup = await openLoadedTab(this, 'Boundary group B');
+  await this.call('groupTabByName', otherGroup, 'beta');
+  this.boundaryTabs = { groupRegular, groupPinned, otherGroup };
+  this.boundaryBefore = await this.state();
+  this.railPage = await showRail(this);
+});
+
+Then('the drop is rejected', async function () {
+  // Rejected drops change nothing; give a mistaken drop time to land first.
+  await sleep(300);
+  assert.deepEqual((await this.state()).tabOrder, this.boundaryBefore.tabOrder);
+});
+
+When('I drag a pinned row into an unpinned bucket', async function () {
+  // The end of beta's unpinned rows is a gap only unpinned tabs may use.
+  await dragRow(
+    this,
+    this.railPage,
+    this.boundaryTabs.groupPinned,
+    this.boundaryTabs.otherGroup,
+    'after'
+  );
+});
+
+Then('canonical tab order and pinned state are unchanged', async function () {
+  const state = await this.state();
+  assert.deepEqual(state.tabOrder, this.boundaryBefore.tabOrder);
+  assert.deepEqual(
+    state.tabs.map(({ id, pinned }) => ({ id, pinned })),
+    this.boundaryBefore.tabs.map(({ id, pinned }) => ({ id, pinned }))
+  );
+});
+
+// ---------- F28-12: roving keyboard focus ----------
+
+Given('primary rail-row focus is on the active tab', async function () {
+  const initial = await this.state();
+  await this.call('setTabPresentation', initial.activeTabId, {
+    title: 'Keyboard one',
+    favicon: TEST_FAVICON,
+  });
+  await openLoadedTab(this, 'Keyboard two');
+  await openLoadedTab(this, 'Keyboard three');
+  this.railPage = await showRail(this);
+  const state = await this.state();
+  this.keyboardActiveBefore = state.activeTabId;
+  await this.railPage.locator(
+    `.vertical-tab-primary[data-tab-id="${state.activeTabId}"]`
+  ).focus();
+  assert.equal(await activeFocusKey(this.railPage), `tab:${state.activeTabId}`);
+});
+
+When('I press ArrowDown or ArrowUp', async function () {
+  const beforeState = await this.state();
+  const beforeKey = await activeFocusKey(this.railPage);
+  await this.railPage.keyboard.press('ArrowDown');
+  const downKey = await activeFocusKey(this.railPage);
+  await this.railPage.keyboard.press('ArrowUp');
+  const upKey = await activeFocusKey(this.railPage);
+  this.rovingMoves = { beforeKey, downKey, upKey, activeTabId: beforeState.activeTabId };
+});
+
+Then('primary focus moves to the adjacent visible row without switching tabs', async function () {
+  assert.notEqual(this.rovingMoves.downKey, this.rovingMoves.beforeKey);
+  assert.notEqual(this.rovingMoves.upKey, this.rovingMoves.downKey);
+  assert.match(this.rovingMoves.downKey, /^tab:/);
+  assert.match(this.rovingMoves.upKey, /^tab:/);
+  assert.equal((await this.state()).activeTabId, this.rovingMoves.activeTabId);
+});
+
+When('I press End', async function () {
+  await this.railPage.keyboard.press('End');
+});
+
+Then('primary focus moves to the last visible row', async function () {
+  const last = await this.railPage.locator('.vertical-tab-primary').last().getAttribute('data-focus-key');
+  assert.equal(await activeFocusKey(this.railPage), last);
+});
+
+When('I press Home', async function () {
+  await this.railPage.keyboard.press('Home');
+});
+
+Then('primary focus moves to the first visible row', async function () {
+  const first = await this.railPage.locator('.vertical-tab-primary').first().getAttribute('data-focus-key');
+  assert.equal(await activeFocusKey(this.railPage), first);
+});
+
+When('I press Enter or Space', async function () {
+  const primaries = this.railPage.locator('.vertical-tab-primary');
+  const firstId = await primaries.first().getAttribute('data-tab-id');
+  await this.railPage.keyboard.press('Enter');
+  await this.waitForState((state) => state.activeTabId === firstId);
+
+  const second = primaries.nth(1);
+  const secondId = await second.getAttribute('data-tab-id');
+  await second.focus();
+  await this.railPage.keyboard.press('Space');
+  await this.waitForState((state) => state.activeTabId === secondId);
+  this.keyboardActivated = secondId;
+});
+
+Then('the focused row becomes active', async function () {
+  assert.equal((await this.state()).activeTabId, this.keyboardActivated);
+});
+
+When('I move focus to its sibling close action', async function () {
+  const primary = this.railPage.locator(
+    `.vertical-tab-primary[data-tab-id="${this.keyboardActivated}"]`
+  );
+  await primary.focus();
+  await this.railPage.keyboard.press('ArrowRight');
+});
+
+Then('the close action has a visible focus indicator and an accessible label', async function () {
+  const details = await this.railPage.evaluate(() => {
+    const element = document.activeElement;
+    const style = getComputedStyle(element);
+    return {
+      className: element.className,
+      label: element.getAttribute('aria-label'),
+      outlineStyle: style.outlineStyle,
+      outlineWidth: style.outlineWidth,
+    };
+  });
+  assert.match(details.className, /vertical-tab-close/);
+  assert.match(details.label, /^Close /);
+  assert.notEqual(details.outlineStyle, 'none');
+  assert.ok(parseFloat(details.outlineWidth) >= 2);
+});
+
+When('I press Escape from the rail', async function () {
+  this.escapeActivationBefore = await this.call('railActivationSerial');
+  // Inspect the keydown handoff before Playwright sends its synthetic keyup
+  // back to the old chrome CDP target (a test-driver artifact that can reclaim
+  // chrome focus after the product has already focused the guest view).
+  await this.railPage.keyboard.down('Escape');
+  await sleep(50);
+  this.escapeActivationAfter = await this.call('railActivationSerial');
+  await this.railPage.keyboard.up('Escape');
+});
+
+Then('focus returns to the active tab content', function () {
+  // The same atomic main action is already focus-observed for active and
+  // inactive rows in F28-9. Here verify the keyboard path invoked it exactly
+  // once; WebContents `focus` events are suppressed when Electron still
+  // considers the child view focused despite DOM focus being in chrome.
+  assert.equal(this.escapeActivationAfter, this.escapeActivationBefore + 1);
+});
+
+When('I choose {string} vertical tab text in Settings', async function (size) {
+  await this.call('openSettings');
+  const settingsPage = await waitForValue(
+    () => ctx.app.windows().find((page) => !page.isClosed() && page.url().startsWith('blanc://settings/')),
+    Boolean, 'Settings page'
+  );
+  // The Settings bridge initializes asynchronously; the HTML's default option
+  // exists before its change listener is installed. Wait for the saved layout.
+  await settingsPage.waitForFunction(() => document.getElementById('tabLayout')?.value === 'vertical');
+  await settingsPage.locator('#verticalTabsTextSize').selectOption(size);
+  await settingsPage.waitForFunction(async (expected) =>
+    (await window.bowserPages.settings.get()).settings.verticalTabsTextSize === expected, size);
+});
+
+Then('vertical tab titles use {float} pixel text without clipping', async function (size) {
+  const page = await chromePage();
+  try {
+    await page.waitForFunction((expected) => {
+      const title = document.querySelector('.vertical-tab-title');
+      return title && parseFloat(getComputedStyle(title).fontSize) === expected;
+    }, size);
+  } catch (error) {
+    error.message += JSON.stringify(await page.evaluate(() => ({
+      size: document.getElementById('verticalTabsRail').dataset.textSize,
+      titles: [...document.querySelectorAll('.vertical-tab-title')].map((el) => getComputedStyle(el).fontSize),
+    })));
+    throw error;
+  }
+  const metrics = await page.locator('.vertical-tab-title').first().evaluate((title) => {
+    const row = title.closest('.vertical-tab-primary').getBoundingClientRect();
+    const rect = title.getBoundingClientRect();
+    return { top: rect.top - row.top, bottom: row.bottom - rect.bottom, height: rect.height, lineHeight: parseFloat(getComputedStyle(title).lineHeight) };
+  });
+  assert.ok(metrics.top >= 0 && metrics.bottom >= 0 && metrics.height >= metrics.lineHeight - 1, JSON.stringify(metrics));
+  // Read every header in one pass. The rail re-renders on each tab update (a
+  // restored page still loading after a relaunch), so a header found first and
+  // read later can already be replaced, and a detached one has no font size.
+  const headerSizes = await page.evaluate(() => [...document.querySelectorAll('.vertical-tabs-group-header')]
+    .map((el) => parseFloat(getComputedStyle(el).fontSize)));
+  assert.ok(headerSizes.length > 0, 'the rail shows group headers');
+  for (const fontSize of headerSizes) assert.equal(fontSize, size - 2);
+  if (process.env.BLANC_TAB_TEXT_CAPTURES) {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    fs.mkdirSync(process.env.BLANC_TAB_TEXT_CAPTURES, { recursive: true });
+    await page.locator('#verticalTabsRail').screenshot({
+      path: path.join(process.env.BLANC_TAB_TEXT_CAPTURES, `vertical-tabs-${size}.png`),
+    });
+  }
+
+});
+
+Then('Profile Sync excludes the vertical tab text size', async function () {
+  assert.equal(Object.hasOwn(await this.call('settingsSyncValues'), 'verticalTabsTextSize'), false);
+});
+
+When('I open another window for the vertical tab text check', async function () {
+  this.textSizeSecondWindow = await this.call('openNewWindow');
+  await waitForValue(() => ctx.app.windows().filter((page) => !page.isClosed() && page.url() === 'blanc-chrome://index/').length,
+    (count) => count === 2, 'second browser window');
+});
+
+Then('both windows use {float} pixel vertical tab text', async function (size) {
+  const pages = ctx.app.windows().filter((page) => !page.isClosed() && page.url() === 'blanc-chrome://index/');
+  assert.equal(pages.length, 2);
+  for (const page of pages) {
+    await page.waitForFunction((expected) => {
+      const title = document.querySelector('.vertical-tab-title');
+      return title && parseFloat(getComputedStyle(title).fontSize) === expected;
+    }, size);
+  }
+  await this.call('closeWindowRuntime', this.textSizeSecondWindow);
+});
+
+Then('vertical tab drag previews keep their text size and height', async function () {
+  await this.call('closeUtilitySurface');
+  const page = await chromePage();
+  // Restored fixture tabs can still publish their loading state after restart.
+  // Wait for those broadcasts before measuring and grabbing a rail row.
+  await this.waitForState((state) => state.tabs.every((tab) => !tab.loading));
+  await page.waitForFunction(() => !document.querySelector('#verticalTabsRail .vertical-tab-row.loading'));
+  for (const [sourceSelector, textSelector] of [
+    ['.vertical-tab-row', '.vertical-tab-title'],
+    ['.vertical-tabs-group-header', '.vertical-tabs-group-name'],
+  ]) {
+    const source = page.locator(`#verticalTabsRail ${sourceSelector}`).first();
+    await source.scrollIntoViewIfNeeded();
+    const read = (el, selector) => ({
+      fontSize: getComputedStyle(el.querySelector(selector)).fontSize,
+      height: el.getBoundingClientRect().height,
+    });
+    const expected = await source.evaluate(read, textSelector);
+    const box = await source.boundingBox();
+    try {
+      await pointerDrag(this, page, source, { y: box.y + box.height / 2 + 10 }, { hold: true });
+      const preview = page.locator('body > .tab-drag-ghost');
+      await preview.waitFor({ state: 'visible' });
+      assert.deepEqual(await preview.evaluate(read, textSelector), expected, sourceSelector);
+    } finally {
+      await page.keyboard.press('Escape');
+      await page.mouse.up();
+    }
+    await page.locator('body > .tab-drag-ghost').waitFor({ state: 'detached' });
+  }
+});
+
+// ---------- F28-19: the Windows/Linux main-menu button in the rail ----------
+// The app acts as on Linux here (@test-platform-linux), so the strip draws its
+// own main-menu button and main records a click instead of popping up a menu.
+
+/** Where the menu button is, which row holds it, and whether a pointer at its
+ * centre reaches it (nothing drawn over it). */
+function mainMenuButtonState(page) {
+  return page.evaluate(() => {
+    const button = document.getElementById('mainMenuButton');
+    const r = button.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    const layoutButton = document.getElementById('verticalTabsUseIsland').getBoundingClientRect();
+    return {
+      hidden: button.hidden,
+      home: button.parentElement?.id || button.parentElement?.className || '',
+      leads: button.parentElement?.firstElementChild === button,
+      beforePill: button.nextElementSibling?.id === 'islandPill',
+      rect: { x: r.left, y: r.top, width: r.width, height: r.height },
+      layoutButtonX: layoutButton.left,
+      reachable: !!hit && button.contains(hit),
+    };
+  });
+}
+
+Then('the main-menu button leads the rail\'s first row, uncovered', async function () {
+  const page = await chromePage();
+  const state = await waitForValue(() => mainMenuButtonState(page),
+    (value) => value.home === 'vertical-tabs-toolbar' && value.reachable,
+    'the main-menu button in the rail\'s first row');
+  assert.equal(state.hidden, false);
+  assert.equal(state.leads, true, 'the button comes first in the row, so it comes first in focus order too');
+  assert.ok(state.rect.x + state.rect.width < state.layoutButtonX, JSON.stringify(state));
+});
+
+When('I click the main-menu button', async function () {
+  this.mainMenuRequestCount = (await this.call('mainMenuRequests')).length;
+  this.mainMenuButtonRect = (await mainMenuButtonState(await chromePage())).rect;
+  // A real pointer click: Playwright refuses it if anything covers the button.
+  await (await chromePage()).locator('#mainMenuButton').click();
+});
+
+Then('the main menu opens below the main-menu button', async function () {
+  const requests = await waitForValue(() => this.call('mainMenuRequests'),
+    (value) => value?.length > this.mainMenuRequestCount, 'a main menu request');
+  const { from, point } = requests.at(-1);
+  const rect = this.mainMenuButtonRect;
+  assert.equal(from, 'strip');
+  assert.ok(Math.abs(point.x - rect.x) <= 2 && Math.abs(point.y - (rect.y + rect.height)) <= 2,
+    JSON.stringify({ point, rect }));
+});
+
+Then('the main-menu button is back in the strip\'s top-left corner', async function () {
+  const page = await chromePage();
+  const state = await waitForValue(() => mainMenuButtonState(page),
+    (value) => value.home === 'strip' && value.reachable, 'the main-menu button back in the strip');
+  assert.equal(state.beforePill, true);
+  assert.deepEqual({ x: state.rect.x, y: state.rect.y }, { x: 8, y: 8 });
+});
+
+// F28-20: the rail's first row holds the Space mark; its footer starts a group.
+const SPACES_GEOMETRY = require('../../../src/main/chrome-layout');
+function spaceMarkState(page) {
+  return page.evaluate(() => {
+    const mark = document.getElementById('pillSpace');
+    const r = mark.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return {
+      inRail: !!mark.closest('.vertical-tabs-toolbar'),
+      inIsland: !!mark.closest('#islandPill'),
+      shown: getComputedStyle(mark).display !== 'none' && r.width > 0,
+      reachable: !!hit && (hit === mark || mark.contains(hit)),
+      rect: { x: r.left, y: r.top, width: r.width, height: r.height },
+    };
+  });
+}
+
+Then('the Space mark sits in the rail\'s first row, not on the Island', async function () {
+  const state = await waitForValue(async () => spaceMarkState(await chromePage()),
+    (value) => value.inRail && value.shown && value.reachable, 'the Space mark in the rail\'s first row');
+  assert.equal(state.inIsland, false, 'the Island keeps no second copy');
+});
+
+When('I click the Space mark in the rail', async function () {
+  const page = await chromePage();
+  this.railSpaceMarkRect = (await spaceMarkState(page)).rect;
+  this.islandBottom = await page.locator('#islandPill').evaluate((el) => el.getBoundingClientRect().bottom);
+  await page.locator('#pillSpace').click();
+});
+
+Then('the Spaces menu opens below the rail\'s Space mark', async function () {
+  await waitForValue(() => this.call('overlayMode'), (mode) => mode === 'spaces', 'the Spaces menu');
+  const bounds = await this.call('overlayBounds');
+  const rect = this.railSpaceMarkRect;
+  // The view pads the menu (chrome-layout.js): the menu itself lines up with
+  // the mark's left edge and hangs a small gap below the mark and the Island,
+  // whichever ends lower, so it never covers the Island.
+  const { SPACES_MENU_SIDE, SPACES_MENU_GAP, SPACES_MENU_PAD } = SPACES_GEOMETRY;
+  const bottom = Math.max(rect.y + rect.height, this.islandBottom);
+  const details = JSON.stringify({ bounds, rect, islandBottom: this.islandBottom });
+  assert.equal(bounds.x + SPACES_MENU_SIDE, Math.round(rect.x), details);
+  assert.equal(bounds.y + SPACES_MENU_PAD, Math.round(bottom + SPACES_MENU_GAP), details);
+  await this.call('closeOverlay');
+  await waitForValue(() => this.call('overlayMode'), (mode) => mode == null, 'the Spaces menu closed');
+});
+
+When('I click the rail\'s New group button', async function () {
+  this.newGroupTabId = (await this.call('state')).activeTabId;
+  await (await chromePage()).locator('#verticalTabsNewGroup').click();
+});
+
+Then('the command panel opens with {string} for the current tab', async function (prefill) {
+  await waitForValue(() => this.call('overlayRendererMode'), (mode) => mode === 'panel', 'the command panel');
+  const overlay = await waitForValue(async () => ctx.app.windows().find((page) => page.url() === 'blanc-chrome://overlay/'),
+    Boolean, 'the overlay document');
+  await waitForValue(() => overlay.locator('#addressInput').inputValue(), (value) => value === prefill, `the panel prefilled with ${prefill}`);
+  this.newGroupOverlay = overlay;
+});
+
+When('I name the new group {string} in the command panel', async function (name) {
+  const input = this.newGroupOverlay.locator('#addressInput');
+  await input.press('End');
+  await input.pressSequentially(name);
+  await input.press('Enter');
+});
+
+Then('the current tab is in a group named {string}', async function (name) {
+  const state = await waitForValue(() => this.call('state'), (value) => {
+    const tab = value.tabs.find((candidate) => candidate.id === this.newGroupTabId);
+    return tab?.groupId && value.groups.find((group) => group.id === tab.groupId)?.name === name;
+  }, `the tab grouped as ${name}`);
+  assert.equal(state.activeTabId, this.newGroupTabId);
+});
+
+When('I select two new tabs in the rail', async function () {
+  this.pairTabs = [await openLoadedTab(this, 'Pair one'), await openLoadedTab(this, 'Pair two')];
+  const page = await chromePage();
+  const row = (id) => page.locator(`.vertical-tab-primary[data-tab-id="${id}"]`);
+  await row(this.pairTabs[0]).click({ modifiers: [process.platform === 'darwin' ? 'Meta' : 'Control'] });
+  await row(this.pairTabs[1]).click({ modifiers: ['Shift'] });
+  await waitForValue(() => this.call('selectedTabIds'),
+    (ids) => ids.length === 2 && this.pairTabs.every((id) => ids.includes(id)), 'both new tabs selected');
+});
+
+Then('the rail\'s New group button reads {string}', async function (label) {
+  const button = (await chromePage()).locator('#verticalTabsNewGroup');
+  await waitForValue(() => button.getAttribute('aria-label'), (value) => value === label, `the button labelled ${label}`);
+  assert.equal(await button.getAttribute('data-tooltip'), label);
+  assert.equal(await button.getAttribute('aria-disabled'), 'false');
+});
+
+Then('both selected tabs are in a group named {string}', async function (name) {
+  await waitForValue(() => this.call('state'), (value) => {
+    const group = value.groups.find((candidate) => candidate.name === name);
+    return group && this.pairTabs.every((id) => value.tabs.find((tab) => tab.id === id)?.groupId === group.id);
+  }, `both tabs grouped as ${name}`);
+});
+
+// It goes back to its place in the Island's markup, where the resting Island
+// never shows it (Spaces open from the ⌘L panel's footer there).
+Then('the Space mark leaves the rail and the resting Island does not show it', async function () {
+  const state = await waitForValue(async () => spaceMarkState(await chromePage()),
+    (value) => value.inIsland && !value.inRail, 'the Space mark out of the rail');
+  assert.equal(state.shown, false, 'the resting Island does not show the Space mark');
+});

@@ -1,0 +1,25 @@
+{
+  "electron": "45.2.1",
+  "ecsRuntime": "45.2.1+wvcus",
+  "ecsEvidence": "castLabs ECS 45.2.1+wvcus (Chromium 156.0.8078.75) passed signed-package uBO acceptance on Apple Silicon (notarized 73992c725, local) and native Intel Mac (same notarized build, run 42379528773), Windows x64 (42378362544) and Linux x64 (42378364429). Applies only to the same four platform records; Rosetta stays excluded. Owner R2 waiver of November 7, 2026 (14:08 UTC) recorded in docs/ecs-runtime-security-review-2026-10-23.md",
+  "manifestV2": "supported",
+  "ublock": "1.75.0",
+  "platforms": {
+    "darwin-arm64": {
+      "enabled": true,
+      "reason": "Signed installed build 1272 acceptance recorded in docs/evidence/ublock-installed-acceptance-2026-10-03; owner release confirmation required before merge"
+    },
+    "darwin-x64": {
+      "enabled": true,
+      "reason": "Signed DMG-installed native Intel build 1273 acceptance recorded in docs/evidence/ublock-installed-acceptance-2026-10-03; Rosetta excluded; owner release confirmation required before merge"
+    },
+    "win32-x64": {
+      "enabled": true,
+      "reason": "Signed installed build 1272 acceptance recorded in docs/evidence/ublock-installed-acceptance-2026-10-03; owner release confirmation required before merge"
+    },
+    "linux-x64": {
+      "enabled": true,
+      "reason": "Native installed AppImage controls, normal relaunch, persistence and Ubuntu 22.04/24.04 renderer sandbox acceptance recorded in docs/evidence/ublock-installed-acceptance-2026-10-03; owner release confirmation required before merge"
+    }
+  }
+}

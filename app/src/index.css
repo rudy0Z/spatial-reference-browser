@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+/*
+ * SPEC.md §2 — dark-first tactical glass palette
+ * ("Apple Design Award winner × Linear × Raycast × Blanc")
+ * Exposed as Tailwind v4 theme tokens so they are emitted as CSS custom
+ * properties on :root AND usable as utilities (bg-void, border-hairline,
+ * text-accent, bg-sticky-glass, font-mono, tracking-ui, …).
+ */
+@theme {
+  /* Canvas void background */
+  --color-void: #090a0c;
+  /* Radial dot-matrix grid (fading out at low zoom) */
+  --color-grid: #1c1f26;
+
+  /* Elevated surface / card base (pair with backdrop-blur-xl) */
+  --color-surface: #12141a;
+  --color-surface-glass: rgba(20, 23, 30, 0.78);
+
+  /* Hairline borders + active glow */
+  --color-hairline: rgba(255, 255, 255, 0.08);
+  --color-glow: rgba(110, 231, 183, 0.45);
+
+  /* Primary accent — pine/sage signal (active indicator, live audio wave,
+     connected pulses) */
+  --color-accent: #34d399;
+
+  /* Ghost Echo accent — spectral, dashed glowing borders */
+  --color-ghost: #a78bfa;
+
+  /* Sticky note warmth on muted dark amber glass */
+  --color-sticky: #fde047;
+  --color-sticky-soft: #fef08a;
+  --color-sticky-glass: rgba(250, 204, 21, 0.12);
+
+  /* Typography: Inter for UI (tracking -0.02em), JetBrains Mono for URLs,
+     domains, RAM badges, timestamps, slash commands */
+  --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace;
+
+  /* SPEC §2 UI-label tracking */
+  --tracking-ui: -0.02em;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-void);
+  color: rgb(255 255 255 / 92%);
+  font-family: var(--font-sans);
+  letter-spacing: var(--tracking-ui);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}

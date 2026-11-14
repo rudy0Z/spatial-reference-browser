@@ -1,0 +1,257 @@
+'use strict';
+
+// The only writer of profile-local workspace files. Critical operations are
+// durable before success. Background captures remain queued until durable;
+// recovery state here contains only the normal session columns, never pages.
+const crypto = require('crypto');
+const fs = require('fs');
+const { isDeepStrictEqual } = require('util');
+const { JsonStore } = require('./store');
+const { activeLocalProfileId, withLocalProfile } = require('./local-profile-context');
+const model = require('./workspaces-model');
+
+function createRepository({ store = new JsonStore('workspaces', model.EMPTY_FILE(), { scope: 'profile', quietErrors: true }), io = fs, clock = Date.now, makeId = crypto.randomUUID } = {}) {
+  const profiles = new Map();
+  let onStatus = () => {};
+  function state() {
+    const profileId = activeLocalProfileId();
+    if (profiles.has(profileId)) return profiles.get(profileId);
+    const current = { status: 'saved', pending: new Map(), timer: null, attempts: 0, epoch: 0, draining: null, disposed: false };
+    profiles.set(profileId, current);
+    let bytes;
+    try { bytes = io.readFileSync(store.file, 'utf8'); }
+    catch (error) {
+      if (error.code !== 'ENOENT') current.status = 'read-failed';
+      return current;
+    }
+    let raw;
+    try { raw = JSON.parse(bytes); } catch { raw = null; }
+    const loaded = model.loadFile(raw);
+    if (loaded.status === 'future-format') {
+      current.status = 'future-format';
+      return current;
+    }
+    const repaired = loaded.file;
+    repaired.workspaces = repaired.workspaces.filter((w) => w.profileId === profileId);
+    repaired.deleted = repaired.deleted.filter((d) => d.workspace.profileId === profileId);
+    if (JSON.stringify(repaired) !== JSON.stringify(raw)) {
+      // Preserve the exact original before any supported-format repair/migration.
+      // A fresh unique name avoids replacing a previous recovery copy.
+      let fd;
+      try {
+        fd = io.openSync(`${store.file}.before-repair-${makeId()}.bak`, 'wx', 0o600);
+        io.writeFileSync(fd, bytes, 'utf8');
+        io.fsyncSync(fd);
+        io.closeSync(fd); fd = null;
+        if (!store.updateAndFlush((data) => { for (const key of Object.keys(data)) delete data[key]; Object.assign(data, repaired); })) throw new Error('write');
+      } catch {
+        if (fd != null) { try { io.closeSync(fd); } catch {} }
+        current.status = 'repair-failed';
+      }
+    }
+    return current;
+  }
+  const unavailable = (s) => ['future-format', 'repair-failed', 'read-failed'].includes(s.status);
+  function status() { return state().status; }
+  function list() {
+    const s = state();
+    if (unavailable(s)) return [];
+    return store.data.workspaces.filter((w) => w.profileId === activeLocalProfileId());
+  }
+  const get = (id) => list().find((w) => w.id === id) ?? null;
+  function write(result, capturedId = null) {
+    const s = state();
+    if (unavailable(s)) return { ok: false, error: s.status };
+    if (result.error) return { ok: false, error: result.error };
+    if (!result.file) return { ok: false, error: 'not-found' };
+    // "Unchanged in memory" is not "saved": the async drain may have applied
+    // this capture without it reaching disk yet.
+    const persisted = result.unchanged
+      ? (!store.dirty || store.flush())
+      : store.updateAndFlush((data) => Object.assign(data, result.file));
+    s.epoch++; // any synchronous attempt supersedes an in-flight drain
+    if (!persisted) {
+      s.status = 'storage-failed'; onStatus();
+      return { ok: false, error: 'storage-failed' };
+    }
+    // A checkpoint settles its own queued capture before the status is
+    // computed: a drain it superseded no longer reports `saved` afterwards.
+    if (capturedId != null) s.pending.delete(capturedId);
+    s.status = s.pending.size ? 'pending' : 'saved'; s.attempts = 0; onStatus();
+    return {
+      ok: true,
+      ...(result.workspace ? { workspace: result.workspace } : {}),
+      ...(result.workspaces ? { workspaces: result.workspaces } : {}),
+    };
+  }
+  function mutate(operation, capturedId) {
+    const s = state();
+    return unavailable(s) ? { ok: false, error: s.status } : write(operation(store.data), capturedId);
+  }
+  function saveCapture(id, capture) {
+    return mutate((data) => { const changed = model.updateCapture(data, id, capture, clock()); return changed.workspace ? changed : { error: 'not-found' }; }, id);
+  }
+  function flushPending() {
+    const s = state();
+    clearTimeout(s.timer); s.timer = null;
+    for (const [id, capture] of s.pending) {
+      const result = saveCapture(id, capture);
+      if (!result.ok && result.error !== 'not-found') {
+        scheduleRetry(s); return result;
+      }
+      s.pending.delete(id);
+    }
+    s.status = unavailable(s) ? s.status : 'saved'; onStatus();
+    return { ok: true };
+  }
+  function scheduleRetry(s) {
+    if (s.timer || s.disposed || unavailable(s)) return;
+    const profileId = activeLocalProfileId();
+    const delay = Math.min(30000, 250 * 2 ** Math.min(s.attempts++, 7));
+    s.timer = setTimeout(() => withLocalProfile(profileId, () => { drain(s); }), delay);
+    s.timer.unref?.();
+  }
+  // The timer path: one asynchronous drain per profile. The pass starts a
+  // microtask later, so `draining` is always assigned before it runs and is
+  // cleared after it ends, even when the pass never awaits. A timer that fires
+  // during a drain starts nothing: the running pass rereads `pending`.
+  function drain(s) {
+    s.timer = null;
+    if (s.disposed || unavailable(s)) return Promise.resolve();
+    if (s.draining) return s.draining;
+    const current = Promise.resolve()
+      .then(() => drainPass(s))
+      .catch((error) => { console.warn('[workspaces] autosave failed:', error?.message); })
+      .then(() => {
+        if (s.draining === current) s.draining = null;
+        // A superseded or failed pass can leave captures queued with no timer
+        // (a checkpoint of one workspace while another waits): arm a fresh
+        // pass under the new epoch. scheduleRetry refuses disposed and
+        // unavailable profiles and an already armed timer.
+        if (s.pending.size) scheduleRetry(s);
+      });
+    s.draining = current;
+    return current;
+  }
+  // A completion acts only while it still owns the state: the same epoch, and
+  // the profile not disposed. An obsolete pass changes no status.
+  async function drainPass(s) {
+    const epoch = s.epoch;
+    const owns = () => !s.disposed && s.epoch === epoch;
+    while (owns() && s.pending.size) {
+      const [id, capture] = s.pending.entries().next().value;
+      const result = model.updateCapture(store.data, id, capture, clock());
+      if (!result.workspace) { s.pending.delete(id); continue; }
+      const ok = result.unchanged
+        ? await store.commitPending()
+        : await store.updateAndCommit((data) => Object.assign(data, result.file));
+      if (!owns()) return;
+      if (!ok) { s.status = 'storage-failed'; onStatus(); return; } // the end of drain() arms the backoff retry
+      if (s.pending.get(id) === capture) s.pending.delete(id);
+    }
+    if (owns()) { s.status = 'saved'; s.attempts = 0; onStatus(); }
+  }
+  function queueCapture(id, capture) {
+    const s = state();
+    if (unavailable(s)) return { ok: false, error: s.status };
+    const current = get(id);
+    if (!current) return { ok: false, error: 'not-found' };
+    const columns = model.captureColumns(capture);
+    if (!s.pending.has(id) && JSON.stringify(model.captureColumns(current)) === JSON.stringify(columns)) return { ok: true };
+    s.pending.set(id, columns);
+    if (s.status !== 'storage-failed' && s.status !== 'pending') { s.status = 'pending'; onStatus(); }
+    scheduleRetry(s);
+    return { ok: true };
+  }
+  return {
+    list, get, status, saveCapture, queueCapture, flushPending,
+    setStatusObserver(fn) { onStatus = typeof fn === 'function' ? fn : () => {}; },
+    validateCreate(name) {
+      const s = state(); if (unavailable(s)) return { ok: false, error: s.status };
+      const result = model.createWorkspace(store.data, { name, capture: {}, now: clock(), id: makeId(), profileId: activeLocalProfileId() });
+      return result.error ? { ok: false, error: result.error } : { ok: true };
+    },
+    create({ name, capture, color, symbol }) { return mutate((data) => model.createWorkspace(data, { name, capture, color, symbol, now: clock(), id: makeId(), profileId: activeLocalProfileId() })); },
+    /** F45: several spaces in one durable write — every one or none. */
+    createMany(entries) {
+      return mutate((data) => {
+        let file = data;
+        const workspaces = [];
+        for (const { name, capture, color, symbol } of Array.isArray(entries) ? entries : []) {
+          const result = model.createWorkspace(file, { name, capture, color, symbol, now: clock(), id: makeId(), profileId: activeLocalProfileId() });
+          if (result.error) return { error: result.error };
+          file = result.file;
+          workspaces.push(result.workspace);
+        }
+        return workspaces.length ? { file, workspaces } : { error: 'invalid-name' };
+      });
+    },
+    /** Any subset of { name, color, symbol }; see model.updateWorkspace. */
+    update(id, patch) { return mutate((data) => model.updateWorkspace(data, id, patch, clock())); },
+    setSharedLink(id, patch) {
+      return mutate(data=>{
+        const current=data.workspaces.find(workspace=>workspace.id===id);if(!current)return {error:'not-found'};
+        const workspace=model.normalizeWorkspace({...current,...patch,updatedAt:clock(),revision:current.revision+1});
+        if(!workspace)return {error:'not-found'};
+        return {file:{...data,workspaces:data.workspaces.map(row=>row.id===id?workspace:row)},workspace};
+      });
+    },
+    upsertShared({sharedId,recoveredFrom,name,color,symbol,capture}) {
+      return mutate(data=>{
+        if(!/^[0-9a-f]{32}$/.test(sharedId??recoveredFrom??''))return {error:'not-found'};
+        const current=data.workspaces.find(row=>sharedId?row.sharedId===sharedId:row.recoveredFrom===recoveredFrom);
+        const workspace=model.normalizeWorkspace({...current,...structuredClone(capture),id:current?.id??makeId(),profileId:activeLocalProfileId(),
+          name,color,symbol,createdAt:current?.createdAt??clock(),updatedAt:clock(),revision:(current?.revision??-1)+1,
+          ...(sharedId?{sharedId,sharedLink:'active'}:{recoveredFrom})});
+        if(!workspace)return {error:'not-found'};
+        // Every sync pass reconciles each closed shared Space: one that didn't
+        // change keeps its record, revision and file untouched.
+        const stored=row=>JSON.parse(JSON.stringify({...row,updatedAt:0,revision:0}));
+        if(current&&isDeepStrictEqual(stored(workspace),stored(model.normalizeWorkspace(current))))return {workspace:current,file:data,unchanged:true};
+        return {workspace,file:{...data,workspaces:current?data.workspaces.map(row=>row.id===current.id?workspace:row):[...data.workspaces,workspace]}};
+      });
+    },
+    reorderShared(ids) {
+      return mutate(data=>{
+        const rank=new Map(ids.map((id,index)=>[id,index]));
+        const shared=data.workspaces.filter(row=>rank.has(row.sharedId)).sort((a,b)=>rank.get(a.sharedId)-rank.get(b.sharedId));let at=0;
+        const workspaces=data.workspaces.map(row=>rank.has(row.sharedId)?shared[at++]:row);
+        if(workspaces.every((row,index)=>row===data.workspaces[index]))return {file:data,unchanged:true};
+        return {file:{...data,workspaces}};
+      });
+    },
+    clearSharedLinks() {
+      return mutate(data=>({file:{...data,workspaces:data.workspaces.map(row=>{
+        if(!row.sharedId)return row;
+        const workspace={...row,preservedLocal:true};delete workspace.sharedId;delete workspace.sharedLink;delete workspace.tabIds;return workspace;
+      })}}));
+    },
+    remove(id) {
+      const s = state();
+      const result = mutate((data) => { const r = model.deleteWorkspace(data, id, clock()); return r.removed ? r : { error: 'not-found' }; });
+      if (result.ok) s.pending.delete(id);
+      return result;
+    },
+    deleted() {
+      const s = state();
+      if (unavailable(s)) return [];
+      const remaining = store.data.deleted.filter((d) => clock() - d.deletedAt < model.RECOVERY_TTL_MS);
+      if (remaining.length !== store.data.deleted.length && !store.updateAndFlush((data) => { data.deleted = remaining; })) s.status = 'storage-failed';
+      return remaining;
+    },
+    restore(id) { return mutate((data) => model.restoreWorkspace(data, id, clock())); },
+    moveTo(id, index) { return mutate((data) => model.moveWorkspaceTo(data, id, index)); },
+    forget(id) { return mutate((data) => data.deleted.some((d) => d.workspace.id === id) ? { file: { ...data, deleted: data.deleted.filter((d) => d.workspace.id !== id) } } : { error: 'not-found' }); },
+    disposeProfile(profileId) {
+      const s = profiles.get(profileId);
+      if (s) { s.disposed = true; s.epoch++; clearTimeout(s.timer); s.timer = null; }
+      profiles.delete(profileId);
+    },
+    /** Test support: resolves when the active profile has no drain running. */
+    drained() { return state().draining ?? Promise.resolve(); },
+    /** Test support: whether a retry timer is armed for a profile. */
+    timerArmed(profileId = activeLocalProfileId()) { return !!profiles.get(profileId)?.timer; },
+  };
+}
+const repository = createRepository();
+module.exports = { ...repository, createRepository };
