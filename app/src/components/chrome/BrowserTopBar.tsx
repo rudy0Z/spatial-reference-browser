@@ -1,15 +1,14 @@
 /**
  * app/src/components/chrome/BrowserTopBar.tsx — Mode A flagship chrome
- * ("Zen × Blanc", ZCODE_MASTER_PROMPT.md §Phase 1.5.2).
+ * ("Zen × Blanc", Phase 3.2 Stage C).
  *
  * A sleek matte top command bar (48px, glass over content) laid out as
- * `1fr · reserved island slot · 1fr` so the FloatingIslandPill floats
- * exactly in the middle of the bar and acts as the centered domain/title
- * palette trigger.
+ * `1fr · reserved island slot · 1fr`. Per SPEC ADDENDUM B §B.1 the
+ * navigation cluster (Back / Forward / Reload / security lock) now lives on
+ * the FloatingIslandPill itself (Stage 0 resting island), so this bar keeps
+ * only the secondary utility cluster:
  *
- *   left   — tab-rail toggle · Back / Forward / Reload (wired by App to the
- *            mock reader's per-node in-place history) · security indicator
- *            (quiet matte icon — a status, not a button)
+ *   left   — Zen-style ultra-slim tab-rail toggle (⌘/Ctrl+S)
  *   right  — Split View · Neighbourhood Glance · Extensions · theme ·
  *            shortcuts sheet (?) · Canvas toggle
  *
@@ -21,16 +20,12 @@
 import { Moon, Sun } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import {
-  ArrowLeft,
-  ArrowRight,
   CircleHelp,
   Columns2,
   LayoutGrid,
   PanelLeft,
   PanelRight,
   Puzzle,
-  RotateCw,
-  ShieldCheck,
 } from 'lucide-react'
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
@@ -40,12 +35,6 @@ function cn(...inputs: ClassValue[]): string {
 }
 
 export type BrowserTopBarProps = {
-  /** Per-node in-place history (App owns the stacks). */
-  canBack: boolean
-  canForward: boolean
-  onBack: () => void
-  onForward: () => void
-  onReload: () => void
   /** Zen-style ultra-slim left rail (⌘/Ctrl+S). */
   railOpen: boolean
   onToggleRail: () => void
@@ -106,11 +95,6 @@ function BarDivider() {
 }
 
 export function BrowserTopBar({
-  canBack,
-  canForward,
-  onBack,
-  onForward,
-  onReload,
   railOpen,
   onToggleRail,
   splitOpen,
@@ -130,21 +114,9 @@ export function BrowserTopBar({
       className={cn('fixed inset-x-0 top-0 z-40 grid h-12 grid-cols-[1fr_auto_1fr] items-center border-b border-hairline px-2', className)}
       style={{ background: 'var(--bg-glass)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)' }}
     >
-      {/* ---- left: rail · history · security ---- */}
+      {/* ---- left: rail toggle (Back/Forward/Reload live on the island, §B.1) ---- */}
       <div className="flex items-center justify-self-start">
         <BarButton icon={PanelLeft} label="Toggle tab rail (⌘/Ctrl+S)" onClick={onToggleRail} active={railOpen} />
-        <BarDivider />
-        <BarButton icon={ArrowLeft} label="Back — active tab history" onClick={onBack} disabled={!canBack} />
-        <BarButton icon={ArrowRight} label="Forward — active tab history" onClick={onForward} disabled={!canForward} />
-        <BarButton icon={RotateCw} label="Reload page" onClick={onReload} />
-        <BarDivider />
-        {/* Security indicator — quiet matte status, intentionally not a button */}
-        <span
-          title="Mock connection — pages are simulated in this preview"
-          className="flex size-7 shrink-0 items-center justify-center text-[color:var(--ink-muted)]"
-        >
-          <ShieldCheck size={14} strokeWidth={1.75} aria-hidden />
-        </span>
       </div>
 
       {/* ---- centre: reserved slot the FloatingIslandPill island floats in ---- */}

@@ -43,8 +43,13 @@ export type ViewMode = 'reading' | 'canvas'
 /** §4 semantic zoom levels (LOD for the 600-node stress test). */
 export type SemanticZoomLevel = 'macro' | 'compact' | 'rich'
 
-/** §6 neighbor-dot semantics on the Floating Island Pill (max 6 dots). */
-export type PillNeighborDotState = 'active' | 'loading' | 'live' | 'hibernated' | 'ghost'
+/**
+ * §B.1 neighbor-dot semantics on the resting pill (max 6 dots). The active
+ * tab is the pill's center trigger, not a dot — so there is no 'active'
+ * state here. Silent state grammar: pulsing = loading, filled = live,
+ * hollow = asleep, frosted wash = Ghost Echo.
+ */
+export type PillNeighborDotState = 'loading' | 'live' | 'hibernated' | 'ghost'
 
 /* ------------------------------------------------------------------ */
 /* Phase 1.5 — deterministic preview specs                             */
@@ -214,11 +219,44 @@ export type VoiceMemo = {
 /* Derived / view-model types                                          */
 /* ------------------------------------------------------------------ */
 
-/** §6 — one pill dot: accent=active, pulsing=loading, hollow=hibernated, violet=ghost. */
+/**
+ * §B.1 — one Smart Relational Dot on the resting pill: WHY it is related
+ * (came-from parent, live sibling, high-confidence Ghost Echo ≥ 0.78), not
+ * just WHAT it is. The Visual Peek Card composes `relationshipLabel` with a
+ * status line (`Live` / `Sleeping · 0 MB`) in `var(--ink-muted)`.
+ */
 export type PillNeighborDot = {
   uuid: NodeUuid
   title: string
   state: PillNeighborDotState
+  /** e.g. `Branched from Are.na`, `Sibling of Are.na`, `Ghost echo`, `Visited from` */
+  relationshipLabel: string
+  /** Domain of the relationship anchor (parent / hub), for peek-card lines. */
+  anchorDomain: string | null
+  /** True when this dot is the came-from parent (rank 1 dot). */
+  cameFrom: boolean
+}
+
+/** §B.5 — one Satellite Flow Notch flanking the resting island. */
+export type FlowNotch = {
+  regionId: RegionId
+  name: string
+  color: string
+  /** Non-ghost nodes in the flow tree. */
+  nodeCount: number
+  /** Awake nodes in the flow right now. */
+  liveCount: number
+  /** Flow holds a pinned anchor (pinning replaces bookmarks, §B.5). */
+  hasPinned: boolean
+  /** Root/anchor node — prefer live, then pinned, then most recent. */
+  anchorUuid: NodeUuid | null
+}
+
+/** Mini-tree row for the notch popover (§B.5): root anchor + branched children. */
+export type FlowTreeRow = {
+  node: SpatialTabNodeRecord
+  /** Depth within the popover tree (0 = flow anchor, 1 = branched child). */
+  depth: 0 | 1
 }
 
 /** One hop level of the neighbourhood BFS (§3 Neighbourhood Glance). */
@@ -286,10 +324,10 @@ export type SpatialDragPayload = {
 /** MIME type both MockWebReader (drag source) and FloatingIslandPill (drop zone) agree on. */
 export const SPATIAL_DRAG_MIME = 'application/x-spatial-tab-seed'
 
-/** §3 slash commands rendered by the expanded palette. Per the Fresh-State
- * Browser Law (master spec §0.2) no test/stress generator is user-facing —
- * the 700-node fixture lives behind `window.__devStressSeed`. */
-export type SlashCommandId = 'canvas' | 'hibernate-all' | 'new' | 'note' | 'cluster'
+/** §B.2 header-omnibox slash commands. Per the Fresh-State Browser Law
+ * (master spec §0.2) no test/stress generator is user-facing — the 700-node
+ * fixture lives behind `window.__devStressSeed`. */
+export type SlashCommandId = 'canvas' | 'park' | 'new' | 'note' | 'cluster' | 'sandbox' | 'mods'
 
 export type SlashCommand = {
   id: SlashCommandId
@@ -299,11 +337,80 @@ export type SlashCommand = {
 
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { id: 'canvas', label: '/canvas', description: 'Toggle reading viewport ⇄ spatial canvas' },
-  { id: 'hibernate-all', label: '/hibernate-all', description: 'Hibernate every non-immune live tab' },
+  { id: 'park', label: '/park', description: 'Park every non-immune live tab to the 0 MB archive' },
   { id: 'new', label: '/new', description: 'Spawn a fresh live tab near the active node' },
   { id: 'note', label: '/note', description: 'Quick sticky note on the active node' },
   { id: 'cluster', label: '/cluster', description: 'Wrap the active 1-hop neighbourhood into a region' },
+  { id: 'sandbox', label: '/sandbox', description: 'Isolated sandbox tab for logged-out client testing' },
+  { id: 'mods', label: '/mods', description: 'Studio Plugins & Mods drawer' },
 ]
+
+/* ------------------------------------------------------------------ */
+/* §B.2 omnibox — URL / search / !bang / /command resolution            */
+/* ------------------------------------------------------------------ */
+
+/** A duck-duck-go-style `!bang` shortcut in the Stage 1 omnibox. */
+export type OmniboxBang = {
+  /** The token typed after `!` (case-insensitive). */
+  bang: string
+  label: string
+  /** `%s` is replaced with the URL-encoded query. */
+  template: string
+}
+
+export const OMNIBOX_BANGS: readonly OmniboxBang[] = [
+  { bang: 'g', label: 'Google', template: 'https://www.google.com/search?q=%s' },
+  { bang: 'd', label: 'DuckDuckGo', template: 'https://duckduckgo.com/?q=%s' },
+  { bang: 'w', label: 'Wikipedia', template: 'https://en.wikipedia.org/w/index.php?search=%s' },
+  { bang: 'a', label: 'Are.na', template: 'https://www.are.na/search/%s' },
+]
+
+/** What the Stage 1 omnibox resolved the current input to. */
+export type OmniboxEntry =
+  | { kind: 'empty' }
+  | { kind: 'command'; filter: string }
+  | { kind: 'url'; url: string; title: string }
+  | { kind: 'search'; query: string }
+  | { kind: 'bang'; bang: OmniboxBang; query: string; url: string; title: string }
+
+/** True when the string plausibly addresses a page directly (no engine hop). */
+function looksLikeUrl(text: string): boolean {
+  if (/^https?:\/\//i.test(text)) return true
+  if (/\s/.test(text)) return false
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?(\/\S*)?$/i.test(text)
+}
+
+/**
+ * §B.2 — resolve one omnibox line, in priority order: empty → slash command
+ * → `!bang query` → direct URL → plain search. Pure and exported so tests
+ * pin the grammar.
+ */
+export function resolveOmniboxEntry(rawInput: string): OmniboxEntry {
+  const input = rawInput.trim()
+  if (input === '') return { kind: 'empty' }
+
+  if (input.startsWith('/')) return { kind: 'command', filter: input.slice(1).trim().toLowerCase() }
+
+  if (input.startsWith('!')) {
+    const body = input.slice(1)
+    const spaceAt = body.indexOf(' ')
+    const token = (spaceAt === -1 ? body : body.slice(0, spaceAt)).toLowerCase()
+    const query = spaceAt === -1 ? '' : body.slice(spaceAt + 1).trim()
+    const bang = OMNIBOX_BANGS.find((entry) => entry.bang === token)
+    if (bang) {
+      const url = bang.template.replace('%s', encodeURIComponent(query))
+      return { kind: 'bang', bang, query, url, title: query === '' ? bang.label : `${bang.label} — ${query}` }
+    }
+    // Unknown bang falls through to a plain search of the raw text.
+  }
+
+  if (looksLikeUrl(input)) {
+    const url = /^https?:\/\//i.test(input) ? input : `https://${input}`
+    return { kind: 'url', url, title: domainOf(url) }
+  }
+
+  return { kind: 'search', query: input }
+}
 
 /* ------------------------------------------------------------------ */
 /* Domain constants + pure helpers                                     */
@@ -478,13 +585,33 @@ export type SpatialEdgeData = {
 export type SpatialFlowEdge = Edge<SpatialEdgeData>
 
 /**
- * Contract for `src/components/chrome/FloatingIslandPill.tsx`.
- * Fully store-driven: it reads the active node, neighbour dots
- * (`selectPillNeighbours`), palette/glance flags and ghost dots from
- * `useGraphStore`, so the app shell composes it with no wiring props.
+ * Contract for `src/components/chrome/FloatingIslandPill.tsx` (§B.1–B.5).
+ * Core state (active node, neighbour dots, pool, flows, deck stage) is fully
+ * store-driven; the props below are the App-owned surfaces the pill cannot
+ * see in the store — per-node history stacks, split view, the extensions
+ * drawer, and the real adblock counter. Every prop is optional: the pill
+ * degrades to pure-store behavior when absent (nav buttons hide, the Shield
+ * renders without a count rather than a fabricated one).
  */
 export type FloatingIslandPillProps = {
   className?: string
+  /** App-owned per-node in-place history (§10). */
+  canBack?: boolean
+  canForward?: boolean
+  onBack?: () => void
+  onForward?: () => void
+  /** Reload the active tab (App owns the reader nonce). */
+  onReload?: () => void
+  /** App-owned Split View toggle. */
+  onToggleSplit?: () => void
+  /** App-owned Extensions / Studio Plugins & Mods drawer toggle (§B.0). */
+  onToggleExtensions?: () => void
+  /**
+   * Real blocked-request counter from the desktop shell's adblocker
+   * (Phase 3 plumbing). `undefined`/null = unknown in this preview —
+   * the Shield renders as a quiet status without a number.
+   */
+  shieldBlockedCount?: number | null
 }
 
 /**

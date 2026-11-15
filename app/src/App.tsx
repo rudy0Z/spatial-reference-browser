@@ -5,20 +5,22 @@
  *
  * Composition (everything else is fully store-driven, per the builder
  * contracts in lib/types.ts):
- *  - Mode A (reading): BrowserTopBar (Back/Forward/Reload on the mock
- *    reader's per-node in-place history · matte security indicator ·
- *    Split View · Glance · Extensions · theme · shortcuts · Canvas) with
- *    the FloatingIslandPill island floating in its reserved centre slot;
- *    the Zen-style ultra-slim left rail (⌘/Ctrl+S) listing live tabs under
- *    region marks; the MockWebReader viewport — optionally SPLIT into two
- *    reader panes side by side with a clean 1px divider (click a pane to
- *    focus it, ⇄ button swaps them).
+ *  - Mode A (reading): BrowserTopBar (rail · Split View · Glance ·
+ *    Extensions · theme · shortcuts · Canvas — §B.1 moved Back/Forward/
+ *    Reload/security onto the island itself) with the FloatingIslandPill
+ *    island floating in its reserved centre slot; the Zen-style ultra-slim
+ *    left rail (⌘/Ctrl+S) listing live tabs under region marks; the
+ *    MockWebReader viewport — optionally SPLIT into two reader panes side
+ *    by side with a clean 1px divider (click a pane to focus it, ⇄ button
+ *    swaps them).
  *  - Mode B (canvas): SpatialCanvas — mounts itself as a fixed layer and
  *    gates on `viewMode` internally (its own AnimatePresence cross-fade),
  *    so it stays mounted here unconditionally.
- *  - FloatingIslandPill — always-mounted z-50 chrome (resting geometry
- *    kept, RAM/debug badges stripped, silent neighbour dots; pill ⇄
- *    palette morph, drag-to-anchor drop zone).
+ *  - FloatingIslandPill — always-mounted z-50 chrome: the §B.1–B.5
+ *    3-Stage Island Continuum (Stage 0 resting pill with dot-morph peek ·
+ *    Stage 1 dual-horizon deck · Stage 2 canvas hand-off), satellite Flow
+ *    notches, drag-to-anchor drop zone. App-owned surfaces (per-node
+ *    history, split view, extensions drawer) pass in as props.
  *  - NeighbourhoodGlance — right-edge overlay below the top bar; self-gates
  *    on `glanceOpen` with its own AnimatePresence exit.
  *  - ShortcutsSheet — the ? / ⌘/Ctrl+/ modal sheet that REPLACED the
@@ -56,7 +58,7 @@ import ToastStack from './components/chrome/ToastStack'
 import ZenRail, { ZEN_RAIL_WIDTH } from './components/chrome/ZenRail'
 import SpatialCanvas from './components/canvas/SpatialCanvas'
 import MockWebReader from './components/viewport/MockWebReader'
-import { LIVE_POOL_LIMIT } from './lib/livePool'
+import { DEFAULT_PERFORMANCE_GUARDRAIL } from './lib/livePool'
 import { initSpatialBridge, spatialEnabled } from './lib/spatialBridge'
 import { useGraphStore } from './store/useGraphStore'
 import type { GraphStore } from './store/useGraphStore'
@@ -128,7 +130,7 @@ function useGraphEventBridge(enabled: boolean) {
         pushToast({
           kind: 'auto-hibernate',
           title: `Slept — ${eviction.title}`,
-          body: `0 MB · live pool limit (${LIVE_POOL_LIMIT})`,
+          body: `0 MB · live pool guardrail (${DEFAULT_PERFORMANCE_GUARDRAIL.maxLiveSessionTabs})`,
         })
       }
 
@@ -503,11 +505,6 @@ function App() {
             transition={CROSSFADE_SPRING}
           >
             <BrowserTopBar
-              canBack={canBack}
-              canForward={canForward}
-              onBack={goBack}
-              onForward={goForward}
-              onReload={handleReload}
               railOpen={railOpen}
               onToggleRail={() => setRailOpen((open) => !open)}
               splitOpen={splitOpen}
@@ -614,10 +611,20 @@ function App() {
       {/* ---- Mode B: infinite spatial canvas (self-gates on viewMode, fixed z-10) ---- */}
       <SpatialCanvas />
 
-      {/* ---- global chrome: the island floats in the top bar's centre slot
-              (resting geometry kept · RAM/debug badges stripped · silent dots),
-              visible in both view modes ---- */}
-      <FloatingIslandPill />
+      {/* ---- global chrome: the 3-Stage Island Continuum floats in the top
+              bar's centre slot (Stage 0 pill ⇄ Stage 1 deck ⇄ Stage 2 canvas),
+              visible in both view modes. App-owned surfaces — per-node
+              history, split view, the extensions drawer — pass in as props;
+              everything else is store-driven. ---- */}
+      <FloatingIslandPill
+        canBack={canBack}
+        canForward={canForward}
+        onBack={goBack}
+        onForward={goForward}
+        onReload={handleReload}
+        onToggleSplit={handleToggleSplit}
+        onToggleExtensions={() => setExtensionsOpen((open) => !open)}
+      />
       {/* toasts sit clear of the rail when it is open (its fixed left-3 default
           is overridden via twMerge in ToastStack) */}
       <ToastStack className={railOpen ? 'left-[236px]' : 'left-3'} />

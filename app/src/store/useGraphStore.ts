@@ -3,8 +3,10 @@
  * graph (SPEC §1, §4, §5, §6, §7).
  *
  * Model: `node_uuid` (unique instance) vs `url_hash` (canonical, shared by
- * duplicates; sticky notes attach to it — §7.6). LRU live pool of 5 with
- * audible / pinned / recording immunity (§5.2, §5.3, §7.7). Ghost Echo
+ * duplicates; sticky notes attach to it — §7.6). §B.6 performance-guardrail
+ * live pool (default 25, user-tunable 5..100 | 'unlimited', idle hibernation
+ * 15/30/60 | 'never', optional RAM ceiling) with audible (2.5 s pause
+ * debounce) / pinned / recording immunity (§5.2, §5.3, §7.7). Ghost Echo
  * matcher: relevance = 0.55·cosine + 0.30·normalizedCoVisitation +
  * 0.15·recencyDecay, threshold 0.78 (§6). Macro-stack collapse/fan (§4.5).
  * Palette actions incl. /seed-700 → 700 designer nodes across 7 clusters (§5.4).
@@ -23,7 +25,15 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { PersistStorage, StorageValue } from 'zustand/middleware'
 import { cosineSimilarity, embedText, tokenize } from '../lib/embed'
-import { enforceLivePool, isNodeImmune } from '../lib/livePool'
+import {
+  DEFAULT_PERFORMANCE_GUARDRAIL,
+  enforceLivePool,
+  enforceRamCeiling,
+  hibernateIdleNodes,
+  isNodeImmune,
+  normalizeGuardrail,
+} from '../lib/livePool'
+import type { PerformanceGuardrail } from '../lib/livePool'
 import { MOODBOARD_CARD_HEIGHT, MOODBOARD_CARD_WIDTH } from '../lib/moodboard'
 import {
   batchFuzzySearch,
@@ -54,6 +64,8 @@ import {
 import type {
   EdgeId,
   EvictionNotice,
+  FlowNotch,
+  FlowTreeRow,
   GhostEchoCandidate,
   GhostEchoScoreBreakdown,
   GraphEdgeRecord,
@@ -62,7 +74,6 @@ import type {
   NoteId,
   NodeUuid,
   PillNeighborDot,
-  PillNeighborDotState,
   Region,
   RegionId,
   SearchResult,
@@ -87,6 +98,9 @@ export const GHOST_SCORE_WEIGHTS = { cosine: 0.55, coVisit: 0.3, recency: 0.15 }
 
 /** §6 — switching directly A→B within ~10s increments their edge weight. */
 export const CO_VISITATION_WINDOW_MS = 10_000
+
+/** How often the idle-hibernation guardrail sweep runs while the shell lives (§B.6). */
+export const IDLE_SWEEP_INTERVAL_MS = 60_000
 
 /** Max ghost echoes materialized per active node. */
 export const GHOST_MAX_SUGGESTIONS = 3
@@ -141,6 +155,23 @@ export type GraphState = {
   lastEviction: EvictionNotice | null
   /** Ghost url_hashes dismissed this session ("fade away on context switch"). */
   suppressedGhostHashes: UrlHash[]
+  /**
+   * §B.6 Working-Session Guardrails — replaces the old hard LIVE_POOL_LIMIT
+   * of 5. Persisted: the user's own promise about memory, never a surprise.
+   */
+  performanceGuardrail: PerformanceGuardrail
+  /**
+   * §B.6 — uuid → wall-clock timestamp the tab's audio PAUSED. Immunity
+   * lingers 2.5 s past a pause so a track gap never hibernates a tab
+   * mid-listen. Runtime-only.
+   */
+  audiblePausedAt: Record<NodeUuid, number>
+  /**
+   * §B.5 — consumed by the canvas to pan (`fitView`) to a Flow's bounding
+   * box. `nonce` makes repeated requests to the same flow fire. Runtime-only;
+   * SpatialCanvas consumes it opportunistically.
+   */
+  canvasFitRequest: { regionId: RegionId; nonce: number } | null
 }
 
 export type GraphActions = {
@@ -179,6 +210,38 @@ export type GraphActions = {
   hibernateNode(uuid: NodeUuid): boolean
   /** §3 /hibernate-all — hibernates every live tab that isn't immune or active. Returns the count. */
   hibernateAll(): number
+  /**
+   * §B.6 — park ONE live tab to the 0 MB archive (Horizon 1 per-pill moon):
+   * hibernate + drop it from the Active Workbench MRU. Blocked while the
+   * node records a voice memo (§5.3); pinned/audible tabs are the user's
+   * explicit anchors, but parking is a deliberate user gesture so it is
+   * allowed on them.
+   */
+  parkNodeToArchive(uuid: NodeUuid): boolean
+  /**
+   * §B.6 — 'Park session' / 'Sleep session': park every live tab that is
+   * neither active nor immune to 0 MB. Returns the count parked.
+   */
+  parkSessionToArchive(): number
+  /** §B.6 — merge a guardrail patch (values normalized: clamps, 'unlimited', 'never'). */
+  setPerformanceGuardrail(patch: Partial<PerformanceGuardrail>): void
+  /**
+   * §B.6 — periodic guardrail sweep: idle hibernation per
+   * `idleHibernateMinutes` + optional RAM-ceiling enforcement. Returns the
+   * number of tabs parked by the idle sweep (0 when 'never').
+   */
+  sweepIdleHibernation(): number
+  /**
+   * Close a tab for real: deletes the node, prunes dangling edges, hands
+   * recording/active anchors to a sensible neighbour. Deliberate user
+   * gesture — allowed on pinned nodes (Stage 0 `×`).
+   */
+  closeNode(uuid: NodeUuid): void
+  /**
+   * §B.5 — pan Mode B to a Flow: activates the flow's anchor node, switches
+   * to canvas, and issues a `canvasFitRequest` for the flow's bounding box.
+   */
+  focusRegionOnCanvas(regionId: RegionId): void
   /** §5.3 — mock "playing audio" toggle. */
   toggleAudible(uuid: NodeUuid): void
   /** Internal: clears the simulated navigation loading pulse flag. */
@@ -229,6 +292,11 @@ export type GraphActions = {
   setHasHydrated(hasHydrated: boolean): void
   /** Post-rehydrate cleanup: clears loading flags, recording lock, transient overlays. */
   clearEphemeralFlags(): void
+  /**
+   * §B.6 startup restoration — persisted tabs boot hibernated (0 MB) with
+   * the active anchor left live. Called once from `onRehydrateStorage`.
+   */
+  restoreSessionHibernated(): void
   setViewMode(mode: ViewMode): void
   /** §10 Cmd/Ctrl+Space / Alt+Space — canvas ⇄ reading. */
   toggleCanvas(): void
@@ -261,6 +329,7 @@ export type PersistedGraphState = Pick<
   | 'collapsedStacks'
   | 'seededVersion'
   | 'viewMode'
+  | 'performanceGuardrail'
 >
 
 /* ------------------------------------------------------------------ */
@@ -520,6 +589,9 @@ const initialState: GraphState = {
   workbenchUuids: [],
   lastEviction: null,
   suppressedGhostHashes: [],
+  performanceGuardrail: DEFAULT_PERFORMANCE_GUARDRAIL,
+  audiblePausedAt: {},
+  canvasFitRequest: null,
 }
 
 /* ------------------------------------------------------------------ */
@@ -645,6 +717,7 @@ function createDebouncedPersistStorage(): PersistStorage<PersistedGraphState> {
         `"activeNodeUuid":${JSON.stringify(persisted.activeNodeUuid)}`,
         `"seededVersion":${JSON.stringify(persisted.seededVersion)}`,
         `"viewMode":${JSON.stringify(persisted.viewMode)}`,
+        `"performanceGuardrail":${cachedSliceJson('guardrail', persisted.performanceGuardrail)}`,
         `}`,
       ]
       pendingPayload = fragments.join('')
@@ -681,6 +754,25 @@ export const useGraphStore = create<GraphStore>()(
             return { nodes: { ...state.nodes, [uuid]: { ...node, isLoading: false } } }
           })
         }, LOADING_PULSE_MS)
+      }
+
+      /**
+       * §B.6 — pool enforcement always carries the user's performance
+       * guardrail plus the 2.5 s audio-pause debounce map. One seam so no
+       * call site can forget the guardrail.
+       */
+      const enforcePool = (
+        nodes: Record<NodeUuid, SpatialTabNodeRecord>,
+        activeUuid: NodeUuid | null,
+      ) => {
+        const state = get()
+        return enforceLivePool(
+          nodes,
+          state.recordingNodeId,
+          activeUuid,
+          state.performanceGuardrail,
+          state.audiblePausedAt,
+        )
       }
 
       const applySeed = (seed: ReturnType<typeof buildCleanFirstRunState>, version: number, viewMode: ViewMode, zoom: number) => {
@@ -790,7 +882,7 @@ export const useGraphStore = create<GraphStore>()(
           }
 
           const ghosted = materializeGhosts(nextNodes[uuid], nextNodes, nextEdges, state.suppressedGhostHashes, now)
-          const pool = enforceLivePool(ghosted.nodes, state.recordingNodeId, uuid)
+          const pool = enforcePool(ghosted.nodes, uuid)
 
           set({
             nodes: pool.nodes,
@@ -885,7 +977,7 @@ export const useGraphStore = create<GraphStore>()(
             ...state.edges,
             [edgeId]: { id: edgeId, source: parentUuid, target: uuid, weight: 1, kind: 'spawn', createdAt: now },
           }
-          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid)
+          const pool = enforcePool(nextNodes, state.activeNodeUuid)
           scheduleLoadingPulse(uuid)
           set({
             nodes: pool.nodes,
@@ -935,7 +1027,7 @@ export const useGraphStore = create<GraphStore>()(
             fy: null,
           }
           const nextNodes: Record<NodeUuid, SpatialTabNodeRecord> = { ...state.nodes, [uuid]: created }
-          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid)
+          const pool = enforcePool(nextNodes, state.activeNodeUuid)
           set({
             nodes: pool.nodes,
             activeNodeUuid: uuid,
@@ -954,7 +1046,7 @@ export const useGraphStore = create<GraphStore>()(
             ...state.nodes,
             [uuid]: { ...node, ramState: 'live', ramMb: ramMbFor(uuid), lastVisitedAt: now },
           }
-          const pool = enforceLivePool(nextNodes, state.recordingNodeId, state.activeNodeUuid)
+          const pool = enforcePool(nextNodes, state.activeNodeUuid)
           set({
             nodes: pool.nodes,
             lastEviction: pool.evicted ? makeEvictionNotice(pool.evicted, now) : state.lastEviction,
@@ -979,7 +1071,7 @@ export const useGraphStore = create<GraphStore>()(
           for (const node of Object.values(state.nodes)) {
             if (node.ramState !== 'live') continue
             if (node.uuid === state.activeNodeUuid) continue
-            if (isNodeImmune(node, state.recordingNodeId)) continue
+            if (isNodeImmune(node, state.recordingNodeId, state.audiblePausedAt)) continue
             nextNodes[node.uuid] = { ...node, ramState: 'hibernated', ramMb: 0, isLoading: false }
             count += 1
           }
@@ -987,10 +1079,150 @@ export const useGraphStore = create<GraphStore>()(
           return count
         },
 
+        parkNodeToArchive: (uuid) => {
+          const state = get()
+          const node = state.nodes[uuid]
+          if (!node || node.ramState !== 'live') return false
+          if (node.uuid === state.recordingNodeId) return false // §5.3 — never behind the user's back
+          set({
+            nodes: { ...state.nodes, [uuid]: { ...node, ramState: 'hibernated', ramMb: 0, isLoading: false } },
+            workbenchUuids: state.workbenchUuids.filter((id) => id !== uuid),
+          })
+          return true
+        },
+
+        parkSessionToArchive: () => {
+          const state = get()
+          let count = 0
+          const nextNodes: Record<NodeUuid, SpatialTabNodeRecord> = { ...state.nodes }
+          for (const node of Object.values(state.nodes)) {
+            if (node.ramState !== 'live') continue
+            if (node.uuid === state.activeNodeUuid) continue
+            if (isNodeImmune(node, state.recordingNodeId, state.audiblePausedAt)) continue
+            nextNodes[node.uuid] = { ...node, ramState: 'hibernated', ramMb: 0, isLoading: false }
+            count += 1
+          }
+          if (count > 0) {
+            const parkedUuids = new Set(
+              Object.keys(state.nodes).filter((id) => nextNodes[id]?.ramState === 'hibernated' && state.nodes[id]?.ramState === 'live'),
+            )
+            set({
+              nodes: nextNodes,
+              workbenchUuids: state.workbenchUuids.filter((id) => !parkedUuids.has(id)),
+            })
+          }
+          return count
+        },
+
+        setPerformanceGuardrail: (patch) => {
+          set((state) => ({ performanceGuardrail: normalizeGuardrail({ ...state.performanceGuardrail, ...patch }) }))
+        },
+
+        sweepIdleHibernation: () => {
+          const state = get()
+          const now = Date.now()
+          // §B.6 idle sweep — a live tab untouched past `idleHibernateMinutes`
+          // parks itself to 0 MB (the system pays; the user never watches a
+          // tab vanish behind an active gesture).
+          const idle = hibernateIdleNodes(
+            state.nodes,
+            state.performanceGuardrail.idleHibernateMinutes,
+            now,
+            state.activeNodeUuid,
+            state.recordingNodeId,
+            state.audiblePausedAt,
+          )
+          let nodes = idle.nodes
+          if (nodes === state.nodes && idle.parked === 0) {
+            // Idle sweep parked nothing — still honor the optional RAM ceiling.
+            const ceiling = state.performanceGuardrail.ramCeilingMb
+            if (typeof ceiling === 'number') {
+              const capped = enforceRamCeiling(nodes, state.recordingNodeId, state.activeNodeUuid, ceiling, state.audiblePausedAt)
+              if (capped.evicted) set({ nodes: capped.nodes, lastEviction: makeEvictionNotice(capped.evicted, now) })
+            }
+            return 0
+          }
+          const ceiling = state.performanceGuardrail.ramCeilingMb
+          if (typeof ceiling === 'number') {
+            nodes = enforceRamCeiling(nodes, state.recordingNodeId, state.activeNodeUuid, ceiling, state.audiblePausedAt).nodes
+          }
+          set({ nodes })
+          return idle.parked
+        },
+
+        closeNode: (uuid) => {
+          const state = get()
+          const node = state.nodes[uuid]
+          if (!node) return
+          const nextNodes = { ...state.nodes }
+          delete nextNodes[uuid]
+          // Ghosts tethered beside the closed node lose their anchor — dissolve.
+          for (const [id, other] of Object.entries(nextNodes)) {
+            if (other.nodeType === 'ghost-echo' && (other.ghostTetherUuid === uuid || other.ghostOfUuid === uuid)) {
+              delete nextNodes[id]
+            }
+          }
+          const nextEdges = pruneDanglingEdges(state.edges, nextNodes)
+          const nextRecording = state.recordingNodeId === uuid ? null : state.recordingNodeId
+          let nextActive = state.activeNodeUuid === uuid ? null : state.activeNodeUuid
+          if (nextActive === null) {
+            // Hand the session to a sensible neighbour: parent, then a child,
+            // then the most recent remaining live tab, then anything.
+            const fallback =
+              (node.parentUuid && nextNodes[node.parentUuid]) ||
+              Object.values(nextNodes).find((candidate) => candidate.parentUuid === uuid) ||
+              Object.values(nextNodes)
+                .filter((candidate) => candidate.nodeType !== 'ghost-echo')
+                .sort((a, b) => b.lastVisitedAt - a.lastVisitedAt)[0] ||
+              null
+            nextActive = fallback?.uuid ?? null
+          }
+          const nextWorkbench = state.workbenchUuids.filter((id) => nextNodes[id])
+          set({
+            nodes: nextNodes,
+            edges: nextEdges,
+            recordingNodeId: nextRecording,
+            activeNodeUuid: nextActive,
+            workbenchUuids: nextActive && !nextWorkbench.includes(nextActive)
+              ? [nextActive, ...nextWorkbench].slice(0, WORKBENCH_SIZE)
+              : nextWorkbench,
+          })
+        },
+
+        focusRegionOnCanvas: (regionId) => {
+          const state = get()
+          const members = Object.values(state.nodes).filter(
+            (candidate) => candidate.regionId === regionId && candidate.nodeType !== 'ghost-echo',
+          )
+          if (members.length === 0) return
+          // Anchor preference: a live member (no wake cost), else pinned,
+          // else the most recently visited — then issue the §B.5 fit request.
+          const anchor =
+            members.find((candidate) => candidate.ramState === 'live') ??
+            members.find((candidate) => candidate.isPinned) ??
+            [...members].sort((a, b) => b.lastVisitedAt - a.lastVisitedAt)[0]
+          set((current) => ({
+            canvasFitRequest: { regionId, nonce: (current.canvasFitRequest?.nonce ?? 0) + 1 },
+          }))
+          get().activateNode(anchor.uuid)
+          set({ viewMode: 'canvas' })
+        },
+
         toggleAudible: (uuid) => {
           const node = get().nodes[uuid]
           if (!node) return
-          set({ nodes: { ...get().nodes, [uuid]: { ...node, isAudible: !node.isAudible } } })
+          const nextPaused = { ...get().audiblePausedAt }
+          if (node.isAudible) {
+            // Audio is pausing: start the §B.6 2.5 s immunity debounce so a
+            // track gap never gets the tab hibernated mid-listen.
+            nextPaused[uuid] = Date.now()
+          } else {
+            delete nextPaused[uuid]
+          }
+          set({
+            nodes: { ...get().nodes, [uuid]: { ...node, isAudible: !node.isAudible } },
+            audiblePausedAt: nextPaused,
+          })
         },
 
         setNodeLoading: (uuid, loading) => {
@@ -1309,6 +1541,8 @@ export const useGraphStore = create<GraphStore>()(
             paletteOpen: false,
             glanceOpen: false,
             physicsFrozen: false,
+            audiblePausedAt: {},
+            canvasFitRequest: null,
             // `semanticZoomOverride` (the LOD lock) is deliberately NOT
             // cleared here: it is a user preference, not an ephemeral
             // glitch flag, and must survive canvas ⇄ reading round trips.
@@ -1316,6 +1550,24 @@ export const useGraphStore = create<GraphStore>()(
               Object.entries(state.nodes).map(([id, node]) => [id, node.isLoading ? { ...node, isLoading: false } : node]),
             ),
           }))
+        },
+
+        restoreSessionHibernated: () => {
+          set((state) => {
+            const livePersisted = Object.values(state.nodes).some((node) => node.ramState === 'live' && node.nodeType !== 'ghost-echo')
+            if (!livePersisted) return state
+            return {
+              nodes: Object.fromEntries(
+                Object.entries(state.nodes).map(([id, node]) => {
+                  if (node.ramState !== 'live' || node.nodeType === 'ghost-echo') return [id, node]
+                  // The active anchor stays live: one warm center on the pill,
+                  // one wake gesture resumes everything around it.
+                  if (id === state.activeNodeUuid) return [id, node]
+                  return [id, { ...node, ramState: 'hibernated', ramMb: 0, isLoading: false }]
+                }),
+              ),
+            }
+          })
         },
 
         setViewMode: (mode) => set({ viewMode: mode }),
@@ -1359,10 +1611,17 @@ export const useGraphStore = create<GraphStore>()(
         collapsedStacks: state.collapsedStacks,
         seededVersion: state.seededVersion,
         viewMode: state.viewMode,
+        performanceGuardrail: state.performanceGuardrail,
       }),
       onRehydrateStorage: () => (state) => {
         if (!state) return
         state.clearEphemeralFlags()
+        // §B.6 startup restoration: persisted tabs boot HIBERNATED (0 MB,
+        // cached WebPs in Stage 1/2) — the session's shape is restored, its
+        // RAM is not. The active anchor stays live so the pill shows a warm
+        // center and one clean wake gesture resumes the session. First run
+        // stays 1 clean New Tab (no persisted state → nothing to restore).
+        state.restoreSessionHibernated()
         state.setHasHydrated(true)
       },
       migrate: () => {
@@ -1395,15 +1654,41 @@ export function selectLiveCount(state: GraphStore): number {
   return count
 }
 
+/** §B.4 elastic disclosure — every persisted node except ephemeral ghosts. */
+export function selectTotalNodeCount(state: GraphStore): number {
+  let count = 0
+  for (const node of Object.values(state.nodes)) if (node.nodeType !== 'ghost-echo') count += 1
+  return count
+}
+
 /**
- * §6 pill dots — the active node first (accent), then 1-hop neighbours:
- * ghosts first, then loading, then the page you came from + siblings of the
- * same link cluster, then the rest by edge weight. Max 6 dots total.
+ * §B.4 elastic disclosure — real tabs asleep in the 0 MB archive. Ephemeral
+ * Ghost Echoes are predictions, not archive members: they surface through
+ * the archive's Ghost Echoes chip and the canvas, and never force the
+ * compact layout into the expanded deck.
+ */
+export function selectHibernatedCount(state: GraphStore): number {
+  let count = 0
+  for (const node of Object.values(state.nodes)) {
+    if (node.nodeType === 'ghost-echo') continue
+    if (node.ramState === 'hibernated') count += 1
+  }
+  return count
+}
+
+/**
+ * §B.1 Smart Relational Dots — up to 6, WHY-driven, active node EXCLUDED
+ * (the active tab is the pill's center trigger). Rank order: the page you
+ * came from (came-from parent edge or `parentUuid`), loading children, live
+ * siblings of the same link cluster, high-confidence Ghost Echoes
+ * (materialized ghosts are ≥ 0.78 by construction), then the rest by edge
+ * weight. Silent state grammar: filled = live, hollow = asleep, frosted
+ * wash = Ghost Echo.
  */
 export function selectPillNeighbours(state: GraphStore, uuid: NodeUuid): PillNeighborDot[] {
   const active = state.nodes[uuid]
   if (!active) return []
-  const dotFor = (node: SpatialTabNodeRecord): PillNeighborDotState =>
+  const dotFor = (node: SpatialTabNodeRecord): PillNeighborDot['state'] =>
     node.nodeType === 'ghost-echo'
       ? 'ghost'
       : node.isLoading
@@ -1411,8 +1696,14 @@ export function selectPillNeighbours(state: GraphStore, uuid: NodeUuid): PillNei
         : node.ramState === 'hibernated'
           ? 'hibernated'
           : 'live'
-  const dots: PillNeighborDot[] = [{ uuid: active.uuid, title: active.title, state: 'active' }]
-  const neighbourEntries: Array<{ node: SpatialTabNodeRecord; weight: number; cameFrom: boolean; sibling: boolean }> = []
+  const parent = active.parentUuid ? state.nodes[active.parentUuid] : null
+  const neighbourEntries: Array<{
+    node: SpatialTabNodeRecord
+    weight: number
+    cameFrom: boolean
+    sibling: boolean
+    viaSpawn: boolean
+  }> = []
   for (const edgeRecord of Object.values(state.edges)) {
     const neighborUuid =
       edgeRecord.source === active.uuid ? edgeRecord.target : edgeRecord.target === active.uuid ? edgeRecord.source : null
@@ -1424,24 +1715,112 @@ export function selectPillNeighbours(state: GraphStore, uuid: NodeUuid): PillNei
       weight: edgeRecord.weight,
       cameFrom: edgeRecord.target === active.uuid || active.parentUuid === neighborUuid,
       sibling: active.parentUuid !== null && neighbor.parentUuid === active.parentUuid,
+      viaSpawn: edgeRecord.kind === 'spawn',
     })
   }
+  // The came-from parent may have no edge record (restored session) — make
+  // sure it still anchors dot 1.
+  if (parent && !neighbourEntries.some((entry) => entry.node.uuid === parent.uuid)) {
+    neighbourEntries.push({ node: parent, weight: Number.MAX_SAFE_INTEGER / 2, cameFrom: true, sibling: false, viaSpawn: false })
+  }
   neighbourEntries.sort((a, b) => {
-    const rank = (entry: { node: SpatialTabNodeRecord; cameFrom: boolean; sibling: boolean }): number => {
-      if (entry.node.nodeType === 'ghost-echo') return 0
-      if (entry.node.isLoading) return 1
-      if (entry.cameFrom) return 2
+    const rank = (entry: (typeof neighbourEntries)[number]): number => {
+      if (entry.cameFrom) return 0
+      if (entry.node.nodeType === 'ghost-echo') return 1
+      if (entry.node.isLoading) return 2
       if (entry.sibling) return 3
       return 4
     }
     const rankDelta = rank(a) - rank(b)
     return rankDelta !== 0 ? rankDelta : b.weight - a.weight
   })
+  const dots: PillNeighborDot[] = []
   for (const entry of neighbourEntries) {
     if (dots.length >= 6) break
-    dots.push({ uuid: entry.node.uuid, title: entry.node.title, state: dotFor(entry.node) })
+    const node = entry.node
+    let relationshipLabel: string
+    let anchorDomain: string | null = null
+    if (node.nodeType === 'ghost-echo') {
+      relationshipLabel = `Ghost echo · ${Math.round((node.ghostMatch ?? 0) * 100)}%`
+      anchorDomain = node.domain
+    } else if (entry.cameFrom) {
+      relationshipLabel = node.parentUuid === active.uuid ? 'Branched into' : `Branched from ${parent?.domain ?? node.domain}`
+      anchorDomain = parent?.domain ?? node.domain
+    } else if (entry.sibling) {
+      relationshipLabel = `Sibling of ${parent?.domain ?? active.domain}`
+      anchorDomain = parent?.domain ?? null
+    } else {
+      relationshipLabel = entry.viaSpawn ? 'Spawned alongside' : 'Visited alongside'
+      anchorDomain = node.domain
+    }
+    dots.push({
+      uuid: node.uuid,
+      title: node.title,
+      state: dotFor(node),
+      relationshipLabel,
+      anchorDomain,
+      cameFrom: entry.cameFrom,
+    })
   }
   return dots
+}
+
+/* ------------------------------------------------------------------ */
+/* §B.5 Flows — non-exclusive rooted tab trees; notches + mini-trees    */
+/* ------------------------------------------------------------------ */
+
+function flowMembersOf(state: GraphStore, regionId: RegionId): SpatialTabNodeRecord[] {
+  return Object.values(state.nodes).filter((node) => node.regionId === regionId && node.nodeType !== 'ghost-echo')
+}
+
+/**
+ * §B.5 Satellite Flow Notches view-model. A flow is "active" when it holds
+ * at least one live node or a pinned anchor (pinning replaces bookmarks).
+ * The flow hosting the active node IS the main island — notches flank it
+ * with the other active flows.
+ */
+export function selectFlowNotches(state: GraphStore): FlowNotch[] {
+  const activeNode = state.activeNodeUuid ? state.nodes[state.activeNodeUuid] : null
+  const notches: FlowNotch[] = []
+  for (const region of selectRegionList(state)) {
+    const members = flowMembersOf(state, region.id)
+    if (members.length === 0) continue
+    const liveCount = members.filter((member) => member.ramState === 'live').length
+    const hasPinned = members.some((member) => member.isPinned)
+    if (liveCount === 0 && !hasPinned) continue
+    if (activeNode && region.id === activeNode.regionId) continue
+    const anchor =
+      members.find((member) => member.ramState === 'live') ??
+      members.find((member) => member.isPinned) ??
+      [...members].sort((a, b) => b.lastVisitedAt - a.lastVisitedAt)[0]
+    notches.push({
+      regionId: region.id,
+      name: region.name,
+      color: region.color,
+      nodeCount: members.length,
+      liveCount,
+      hasPinned,
+      anchorUuid: anchor?.uuid ?? null,
+    })
+  }
+  return notches
+}
+
+/** §B.5 mini-tree popover rows: the flow anchor + its branched children (depth 1). */
+export function selectFlowTreeRows(state: GraphStore, regionId: RegionId): FlowTreeRow[] {
+  const members = flowMembersOf(state, regionId)
+  if (members.length === 0) return []
+  const anchor =
+    members.find((member) => member.ramState === 'live') ??
+    members.find((member) => member.isPinned) ??
+    [...members].sort((a, b) => b.lastVisitedAt - a.lastVisitedAt)[0]
+  if (!anchor) return []
+  const rows: FlowTreeRow[] = [{ node: anchor, depth: 0 }]
+  const children = members
+    .filter((member) => member.parentUuid === anchor.uuid || (member.uuid !== anchor.uuid && member.parentUuid !== null && members.some((root) => root.uuid === member.parentUuid && root.parentUuid === null)))
+    .sort((a, b) => b.lastVisitedAt - a.lastVisitedAt)
+  for (const child of children.slice(0, 7)) rows.push({ node: child, depth: 1 })
+  return rows
 }
 
 /**
