@@ -82,6 +82,12 @@ contextBridge.exposeInMainWorld('spatialAPI', {
   onXrayCapture: on('spatial:xray:capture'),
   pluginsEmulate: (uuid, width) => ipcRenderer.invoke('spatial:plugins:emulate', { uuid, width }),
   pluginsCapturePane: (uuid) => ipcRenderer.invoke('spatial:plugins:capture-pane', { uuid }),
+  // §3.7 Local MCP bridge — the shell store is the notes/regions home, so it
+  // pushes snapshots to main and applies main's MCP write commands through
+  // the same store actions the UI uses. Memory-only on main's side.
+  mcpNotesSync: (notes, regions) => ipcRenderer.send('spatial:mcp:notes:sync', { notes, regions }),
+  mcpCommandAck: (id, ok, noteId) => ipcRenderer.send('spatial:mcp:command:ack', { id, ok, noteId }),
+  onMcpCommand: on('spatial:mcp:command'),
   // Window controls (existing trust-gated channels)
   win: {
     minimize: send('window:minimize'),

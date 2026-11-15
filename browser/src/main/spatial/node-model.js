@@ -111,6 +111,10 @@ function normalizeNode(input) {
     // whether it stands for a collapsed OAuth/SSO/payment chain.
     branchKind: input.branchKind === 'link' || input.branchKind === 'auth' ? input.branchKind : null,
     viaAuth: input.viaAuth === true,
+    // §3.7 MCP bridge — birth state of agent-branched satellites: a
+    // 'ghost-echo' child is a soft echo record, everything else is a tab.
+    // Unknown values drop to null (a plain tab), never trusted.
+    nodeType: input.nodeType === 'ghost-echo' ? 'ghost-echo' : null,
     // §B.7.1 — how the spawn happened: provenance from the recorded link
     // activation. Unknown shapes drop to null, never trusted.
     provenance: normalizeProvenance(input.provenance),

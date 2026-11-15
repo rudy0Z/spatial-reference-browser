@@ -128,6 +128,8 @@ const {
   setupChromeProtocol,
 } = require('./chrome-protocol');
 const spatialRuntime = require('./spatial/spatial-runtime');
+// §3.7 Local MCP bridge — bearer-gated 127.0.0.1 server + stdio wrapper.
+const spatialMcp = require('./mcp-server');
 // §B.8.4 — partition-field normalization for tab records (pure policy).
 const spatialPartitions = require('./spatial/session-partitions');
 const { tooltipRequest, tooltipBounds } = require('./tooltip-geometry');
@@ -11992,6 +11994,12 @@ function registerIpcHandlers() {
       },
     },
   });
+  // §3.7 Local MCP bridge — one start call; every effect stays inside
+  // spatial-runtime, the token never leaves the mcp-server module.
+  spatialMcp.startMcpBridge({
+    ...spatialRuntime.mcpBridgeEffects(),
+    app,
+  }).catch(() => { /* a refused port must never block startup */ });
   chromeHandle('tabs:create', (_e, url, opts) => {
     const isPrivate = !!opts?.private;
     // A plain new tab is deliberately ungrouped — createTab defaults groupId

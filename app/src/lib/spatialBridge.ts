@@ -20,7 +20,7 @@
  */
 import { domainOf, urlHashOf } from './types'
 import { useGraphStore } from '../store/useGraphStore'
-import type { EdgeId, GraphEdgeRecord, MediaClipRef, NodeUuid, SpatialTabNodeRecord } from './types'
+import type { EdgeId, GraphEdgeRecord, MediaClipRef, NodeUuid, RegionId, SpatialTabNodeRecord, StickyNote, UrlHash } from './types'
 
 export type SpatialNodeRecord = {
   uuid: string
@@ -41,6 +41,8 @@ export type SpatialNodeRecord = {
   provenance?: { anchorText: string | null; contextSnippet: string | null; scrollYAtSpawn: number | null } | null
   /** §B.10 — media clip record as main's node-model normalized it. */
   mediaClip?: { kind: string; clipId: string; src: string; sourcePageUrl: string | null; bytes: number; mime: string; ext: string } | null
+  /** §3.7 — birth state of agent-branched satellites ('ghost-echo' | tab). */
+  nodeType?: string | null
   thumb: string | null
   lastActiveAt: number
 }
@@ -202,6 +204,18 @@ type SpatialAPI = {
   // §B.10 Plugin D — breakpoint emulation + pane snapshot for the split view.
   pluginsEmulate: (uuid: string, width: number | null) => Promise<{ ok: boolean; error?: string }>
   pluginsCapturePane: (uuid: string) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>
+  // §3.7 MCP bridge — the shell store is the notes/regions home in Phase 3,
+  // so main's local MCP server reads them from this sync and routes its
+  // write tools back here (applied through the SAME store actions the UI
+  // uses). Memory-only on main's side; never persisted there.
+  mcpNotesSync: (
+    notes: StickyNote[],
+    regions: Array<{ id: RegionId; name: string; color: string | null }>,
+  ) => void
+  mcpCommandAck: (id: string, ok: boolean, noteId?: string | null) => void
+  onMcpCommand: (
+    cb: (payload: { id: string; action: string; args: Record<string, unknown> | null }) => void,
+  ) => () => void
 }
 
 declare global {
@@ -233,7 +247,9 @@ function makeStoreRecord(main: SpatialNodeRecord, now: number): SpatialTabNodeRe
     domain: domainOf(main.url),
     title: main.title || domainOf(main.url),
     regionId: null,
-    nodeType: 'tab',
+    // §3.7 — an agent-branched ghost echo keeps its birth state; every other
+    // main-owned node is a plain tab.
+    nodeType: main.nodeType === 'ghost-echo' ? 'ghost-echo' : 'tab',
     ramState: 'hibernated',
     ramMb: 0,
     isAudible: false,
@@ -492,6 +508,60 @@ export function initSpatialBridge(): {
     if (result?.ok && result.graph) applyGraphToStore(result.graph)
     reportLayout()
   })
+
+  // 1.5 §3.7 MCP bridge — push the notes/regions snapshot to main (after
+  //     hydration and on every change, debounced) and apply main's MCP
+  //     write commands through the SAME store actions the UI uses, so
+  //     persistence and undo semantics are exactly the UI's own. Main keeps
+  //     this in memory only; nothing here writes to disk twice.
+  let mcpSyncTimer: ReturnType<typeof setTimeout> | null = null
+  const pushMcpState = () => {
+    if (!spatialApi) return
+    const state = useGraphStore.getState()
+    spatialApi.mcpNotesSync(
+      Object.values(state.notes),
+      Object.values(state.regions).map((region) => ({ id: region.id, name: region.name, color: region.color })),
+    )
+  }
+  unsubs.push(useGraphStore.subscribe(() => {
+    if (mcpSyncTimer) return
+    mcpSyncTimer = setTimeout(() => {
+      mcpSyncTimer = null
+      pushMcpState()
+    }, 400)
+  }))
+  unsubs.push(spatialApi.onMcpCommand((payload) => {
+    void (async () => {
+      const state = useGraphStore.getState()
+      const args = payload.args ?? {}
+      if (payload.action === 'addStickyNote') {
+        const urlHash = typeof args.urlHash === 'string' ? args.urlHash : ''
+        if (!urlHash) {
+          spatialApi?.mcpCommandAck(payload.id, false)
+          return
+        }
+        const noteId = state.addStickyNote(
+          urlHash as UrlHash,
+          typeof args.text === 'string' ? args.text.slice(0, 4000) : '',
+        )
+        spatialApi?.mcpCommandAck(payload.id, true, noteId)
+        return
+      }
+      if (payload.action === 'tidyToMoodboard') {
+        const regionId = typeof args.regionId === 'string' ? args.regionId : ''
+        if (!regionId) {
+          spatialApi?.mcpCommandAck(payload.id, false)
+          return
+        }
+        // Same store action as the UI's moodboard tidy: pinned anchors and
+        // every graph edge are preserved by the action itself.
+        state.tidyToMoodboard(regionId as RegionId)
+        spatialApi?.mcpCommandAck(payload.id, true)
+        return
+      }
+      spatialApi?.mcpCommandAck(payload.id, false)
+    })()
+  }))
   unsubs.push(spatialApi.onGraphUpdated((graph) => {
     applyGraphToStore(graph)
     schedulePush()

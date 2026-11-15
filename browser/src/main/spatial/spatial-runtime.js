@@ -976,6 +976,108 @@ function broadcastSpatialDownloads() {
   try { shellBridge?.broadcastDownloads(); } catch { /* a dying window is not fatal */ }
 }
 
+/* ------------------------------------------------------------------ */
+/* §3.7 Local MCP bridge — effect surface                              */
+/*                                                                     */
+/* mcp-server.js owns the transport (bearer-gated 127.0.0.1 HTTP +     */
+/* stdio wrapper); THIS module owns every effect, so the write tools   */
+/* ride the exact same command paths the UI's graph:mutate uses —      */
+/* applyOps, persist, broadcast — and never spawn a live view.         */
+/* ------------------------------------------------------------------ */
+
+/** Full graph snapshot for MCP reads. Thumbnails are stripped at the
+ *  source: 700 × up-to-512 KB WebP strings must never cross a local port. */
+function mcpGraphSnapshot() {
+  if (!model) return { nodes: [], liveUuids: new Set(), activeUuid: null, excerpts: new Map() };
+  const liveUuids = new Set();
+  let activeUuid = null;
+  for (const runtime of deps.allRuntimes()) {
+    if (!runtime.spatialChrome) continue;
+    for (const [uuid, entry] of liveMap(runtime)) {
+      if (entry && entry.tabId != null && deps.tabs.get(entry.tabId)) liveUuids.add(uuid);
+    }
+    if (!activeUuid && runtime.spatialActiveUuid) activeUuid = runtime.spatialActiveUuid;
+  }
+  const focused = deps.rt();
+  if (focused && focused.spatialChrome && focused.spatialActiveUuid) {
+    activeUuid = focused.spatialActiveUuid;
+  }
+  const nodes = model.serialize().map((node) => ({ ...node, thumb: null }));
+  const excerpts = new Map();
+  for (const [uuid, state] of hibernationByUuid) {
+    if (state && typeof state.excerpt === 'string' && state.excerpt) excerpts.set(uuid, state.excerpt);
+  }
+  return { nodes, liveUuids, activeUuid, excerpts };
+}
+
+/** The branch_hibernated_nodes command path. Children arrive pre-planned by
+ *  mcp-server.js (url_hash dedupe done, positions chosen, parentUuid set);
+ *  here they become the SAME add ops the UI's graph:mutate applies.
+ *  Deliberately NO tab is created and NO live view is ensured: born
+ *  hibernated = graph record only (0 MB), so an external agent can never
+ *  evict the user's live warm pool. */
+function mcpBranchHibernated({ children } = {}) {
+  if (!model) return { ok: false, reason: 'not-ready' };
+  if (!Array.isArray(children) || children.length === 0) return { ok: false, reason: 'children' };
+  const now = Date.now();
+  const uuids = children.map(() => require('node:crypto').randomUUID());
+  const ops = children.map((child, index) => ({
+    type: 'add',
+    node: {
+      uuid: uuids[index],
+      url: child.url,
+      title: child.title,
+      x: child.x,
+      y: child.y,
+      parentUuid: child.parentUuid ?? null,
+      edges: [],
+      mode: 'reading',
+      pinned: false,
+      private: false,
+      nodeType: child.nodeType === 'ghost-echo' ? 'ghost-echo' : null,
+      createdAt: now,
+    },
+  }));
+  const result = model.applyOps(ops);
+  if (!result.ok) return { ok: false, reason: result.reason ?? 'apply-failed' };
+  persistGraph();
+  broadcastGraph();
+  const runtime = deps.rt();
+  if (runtime) resizeNodes(runtime);
+  return {
+    ok: true,
+    created: ops.map((op) => {
+      const node = model.nodes.get(op.node.uuid);
+      return node ? { ...node, edges: [...node.edges] } : null;
+    }).filter(Boolean),
+  };
+}
+
+/** Effect surface for startMcpBridge (main.js wires the two together). */
+function mcpBridgeEffects() {
+  return {
+    graphSnapshot: mcpGraphSnapshot,
+    branchHibernated: mcpBranchHibernated,
+    chromeHandle: deps?.chromeHandle,
+    chromeOn: deps?.chromeOn,
+    shellBroadcast: (channel, payload) => {
+      for (const runtime of deps.allRuntimes()) {
+        if (runtime.spatialChrome && runtime.window && !runtime.window.isDestroyed()) {
+          runtime.window.webContents.send(channel, payload);
+        }
+      }
+    },
+    shellsAlive: () => {
+      let count = 0;
+      for (const runtime of deps.allRuntimes()) {
+        if (runtime.spatialChrome && runtime.window && !runtime.window.isDestroyed()) count += 1;
+      }
+      return count;
+    },
+    userDataPath: deps?.userDataPath,
+  };
+}
+
 module.exports = {
   CHROME_SPATIAL_URL,
   SANDBOX_NODE_URL,
@@ -984,6 +1086,7 @@ module.exports = {
   initSpatial,
   spatialShellBridge,
   broadcastSpatialDownloads,
+  mcpBridgeEffects,
   resizeNodes,
   onOverlayChanged,
   engageZOrderGuard,
