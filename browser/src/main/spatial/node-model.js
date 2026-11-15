@@ -54,6 +54,33 @@ function normalizeProvenance(input) {
   return { anchorText, contextSnippet, scrollYAtSpawn };
 }
 
+/** §B.10 media clip kinds (mirrors app/src/lib/types.ts MediaClipKind). */
+const MEDIA_CLIP_KINDS = new Set(['image', 'video', 'svg']);
+/** Clip ids are media-directory stems written by studio-plugins.js. */
+const MEDIA_CLIP_ID_PATTERN = /^[\w][\w.-]{0,79}$/;
+const MEDIA_CLIP_EXT_PATTERN = /^[a-z0-9]{1,8}$/i;
+const MEDIA_CLIP_MIME_MAX = 160;
+
+/** A validated §B.10 media clip record, or null when the shape is hostile. */
+function normalizeMediaClipRef(input) {
+  if (!input || typeof input !== 'object') return null;
+  const kind = typeof input.kind === 'string' && MEDIA_CLIP_KINDS.has(input.kind) ? input.kind : null;
+  const clipId = typeof input.clipId === 'string' && MEDIA_CLIP_ID_PATTERN.test(input.clipId) ? input.clipId : null;
+  if (!kind || !clipId) return null;
+  const src = typeof input.src === 'string' && input.src.length <= 4096 ? input.src : '';
+  const sourcePageUrl =
+    typeof input.sourcePageUrl === 'string' && input.sourcePageUrl.length <= 4096 ? input.sourcePageUrl : null;
+  return {
+    kind,
+    clipId,
+    src,
+    sourcePageUrl,
+    bytes: isFiniteNumber(input.bytes) ? Math.max(0, Math.min(1_000_000_000, Math.round(input.bytes))) : 0,
+    mime: typeof input.mime === 'string' && input.mime.length <= MEDIA_CLIP_MIME_MAX ? input.mime : '',
+    ext: typeof input.ext === 'string' && MEDIA_CLIP_EXT_PATTERN.test(input.ext) ? input.ext : '',
+  };
+}
+
 /** A validated graph node. Unknown fields are dropped, never trusted. */
 function normalizeNode(input) {
   if (!input || typeof input !== 'object') return null;
@@ -97,6 +124,10 @@ function normalizeNode(input) {
     thumb: typeof input.thumb === 'string' && input.thumb.length <= 512 * 1024
       ? input.thumb
       : null,
+    // §B.10 — media clip attachment (Drag-to-Clip cards / 5s motion loops).
+    // The shell owns clip semantics; main only carries a validated record so
+    // the persisted graph round-trips. Anything off-shape drops to null.
+    mediaClip: normalizeMediaClipRef(input.mediaClip),
     lastActiveAt: isFiniteNumber(input.lastActiveAt) ? input.lastActiveAt : 0,
   };
 }
@@ -161,6 +192,8 @@ function createGraphModel(initialNodes = []) {
             .slice(-MAX_SUB_PAGES)
             .map((page) => ({ url: page.url, at: isFiniteNumber(page.at) ? page.at : 0 }));
         }
+        // §B.10 — attach (or clear with null) a media clip record.
+        if (op.patch.mediaClip !== undefined) node.mediaClip = normalizeMediaClipRef(op.patch.mediaClip);
         return { ok: true, changed: true };
       }
       case 'remove': {

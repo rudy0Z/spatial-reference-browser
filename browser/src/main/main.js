@@ -11952,6 +11952,8 @@ function registerIpcHandlers() {
     chromeHandle,
     chromeOn,
     rt,
+    // §B.10 — root for studio-plugins.js's userData/media/ clip cache.
+    userDataPath: app.getPath('userData'),
     allRuntimes: () => windowRuntimes.all(),
     tabs,
     createTab,

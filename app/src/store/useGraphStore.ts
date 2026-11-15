@@ -60,6 +60,7 @@ import {
   isColdArchive,
   lodForZoom,
   looksLikeAuthOrPaymentUrl,
+  mediaClipTitle,
   ramMbFor,
   urlHashOf,
 } from '../lib/types'
@@ -71,6 +72,7 @@ import type {
   GhostEchoCandidate,
   GhostEchoScoreBreakdown,
   GraphEdgeRecord,
+  MediaClipRef,
   MemoId,
   NeighbourhoodResult,
   NoteId,
@@ -222,6 +224,14 @@ export type GraphActions = {
   toggleTrailFocus(uuid: NodeUuid): void
   /** §5.1 Cmd/Ctrl+Click — spawns a live child satellite near its parent with a directional spawn edge. */
   spawnChildNode(parentUuid: NodeUuid, seed: { url: string; title: string; searchQuery?: string; provenance?: SpawnProvenance | null }): NodeUuid
+  /** §B.10 Plugin B — spawn a node tagged `mediaClip` connected to its parent
+   *  via a spawn edge. `url`/`urlHash` follow the SOURCE PAGE (provenance:
+   *  waking the card opens where the media came from); RichCard renders the
+   *  clip edge-to-edge from the locally cached bytes. */
+  spawnMediaClipNode(parentUuid: NodeUuid, clip: MediaClipRef): NodeUuid
+  /** §B.10 Plugin B/C — attach (or replace) a media clip record on an existing node
+   *  (the 5-second compositor preview attaches directly to the active node). */
+  patchMediaClip(uuid: NodeUuid, clip: MediaClipRef | null): void
   /** §3 /new — fresh live tab near the active node, then activates it.
    *  §B.8.4 — `partition: 'sandbox'` marks the node for the isolated
    *  temp:sandbox session when the desktop build wakes its live view. */
@@ -1081,6 +1091,34 @@ export const useGraphStore = create<GraphStore>()(
             lastEviction: pool.evicted ? makeEvictionNotice(pool.evicted, now) : state.lastEviction,
           })
           return uuid
+        },
+
+        /* ------------- §B.10 media clips (Plugins B/C) ------------- */
+
+        spawnMediaClipNode: (parentUuid, clip) => {
+          const state = get()
+          const parent = state.nodes[parentUuid]
+          if (!parent) return ''
+          // The node's identity follows the SOURCE PAGE (waking the card
+          // opens where the media came from); the clip record carries the
+          // media URL + the locally cached copy handle.
+          const pageUrl = clip.sourcePageUrl || clip.src
+          const title = mediaClipTitle(clip)
+          const uuid = get().spawnChildNode(parentUuid, { url: pageUrl, title })
+          if (!uuid) return ''
+          get().patchMediaClip(uuid, clip)
+          return uuid
+        },
+
+        patchMediaClip: (uuid, clip) => {
+          const node = get().nodes[uuid]
+          if (!node) return
+          set({
+            nodes: {
+              ...get().nodes,
+              [uuid]: { ...node, mediaClip: clip },
+            },
+          })
         },
 
         createNewTab: (init) => {

@@ -93,8 +93,10 @@ import { clsx } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import { barProfileFor, LIVE_LEVEL_BARS, useVoiceRecorder } from '../../../hooks/useVoiceRecorder'
 import { selectMemosForNode, selectNotesForNode, useGraphStore } from '../../../store/useGraphStore'
-import { formatDurationMs, isColdArchive } from '../../../lib/types'
+import { getMediaClipUrl } from '../../../lib/plugins'
+import { domainOf, formatDurationMs, isColdArchive } from '../../../lib/types'
 import type {
+  MediaClipRef,
   SpatialTabNodeProps,
   SpatialTabNodeRecord,
   StickyNote as StickyNoteRecord,
@@ -995,6 +997,68 @@ function GhostEchoCard({ node, interactions }: { node: SpatialTabNodeRecord; int
 /* RICH tier — the 260px editorial reference card (§4.3, zoom ≥ 0.65)  */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* §B.10 media clip art (Drag-to-Clip cards + 5s motion loop previews)  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Edge-to-edge media from the locally cached clip (main's `userData/media/`
+ * copy, fetched through the trust-gated read path). Images/svg load when the
+ * card renders; videos load on hover only — a sleeping card keeps 0 MB of
+ * media bytes, and playback never leaves the matte card.
+ */
+function MediaClipArt({ clip, hovered }: { clip: MediaClipRef; hovered: boolean }) {
+  const [stillSrc, setStillSrc] = useState<string | null>(null)
+  const [videoSrc, setVideoSrc] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (clip.kind === 'video') return
+    let cancelled = false
+    void getMediaClipUrl(clip.clipId).then((url) => {
+      if (!cancelled) setStillSrc(url)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [clip.clipId, clip.kind])
+
+  useEffect(() => {
+    if (clip.kind !== 'video' || !hovered || videoSrc) return
+    let cancelled = false
+    void getMediaClipUrl(clip.clipId).then((url) => {
+      if (!cancelled) setVideoSrc(url)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [clip.kind, hovered, clip.clipId, videoSrc])
+
+  if (clip.kind === 'video') {
+    if (!hovered || !videoSrc) {
+      return (
+        <div className="absolute inset-0 flex items-center justify-center" style={{ backgroundColor: 'var(--bg-elevated)' }}>
+          <span className="text-[10px] text-[color:var(--ink-muted)]">{hovered ? 'Loading loop…' : 'Motion loop'}</span>
+        </div>
+      )
+    }
+    return (
+      <video
+        src={videoSrc}
+        autoPlay
+        loop
+        muted
+        playsInline
+        className="absolute inset-0 h-full w-full object-cover"
+      />
+    )
+  }
+
+  if (!stillSrc) {
+    return <div className="absolute inset-0" style={{ backgroundColor: 'var(--bg-elevated)' }} />
+  }
+  return <img src={stillSrc} alt={clip.src || 'clipped media'} className="absolute inset-0 h-full w-full object-cover" />
+}
+
 function RichCard({
   node,
   isActive,
@@ -1106,8 +1170,22 @@ function RichCard({
             >
               <CameraOff size={20} className="text-[color:var(--ink-muted)]" />
             </div>
+          ) : node.mediaClip ? (
+            /* §B.10 — a media clip replaces the generated preview art entirely */
+            <MediaClipArt clip={node.mediaClip} hovered={hovered} />
           ) : (
             <PreviewArt spec={spec} className={cn('absolute inset-0', cold && 'saturate-[0.72]')} />
+          )}
+
+          {/* §B.10 — tiny source-domain attribution, hover only */}
+          {node.mediaClip && hovered && node.mediaClip.sourcePageUrl && (
+            <span
+              className="absolute bottom-1.5 right-1.5 z-10 rounded-md px-1.5 py-0.5 text-[9.5px] text-[color:var(--ink-secondary)] backdrop-blur-md"
+              style={{ backgroundColor: 'var(--bg-glass)' }}
+              title={`Clipped from ${node.mediaClip.sourcePageUrl}`}
+            >
+              {domainOf(node.mediaClip.sourcePageUrl)}
+            </span>
           )}
 
           {/* loading — a quiet shimmer sweep; the footer dot pulses (silent) */}

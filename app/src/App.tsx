@@ -62,7 +62,9 @@ import DownloadsPanel, { noteDownloadToasts, type DownloadItem } from './compone
 import ZenRail, { ZEN_RAIL_WIDTH } from './components/chrome/ZenRail'
 import SpatialCanvas from './components/canvas/SpatialCanvas'
 import MockWebReader from './components/viewport/MockWebReader'
+import SplitCompareHeader from './components/viewport/SplitCompareHeader'
 import { DEFAULT_PERFORMANCE_GUARDRAIL } from './lib/livePool'
+import { formatXrayMarkdown, installStudioPluginSync, isPluginActive, useStudioPluginStore } from './lib/plugins'
 import { initSpatialBridge, spatialApi, spatialEnabled } from './lib/spatialBridge'
 import { useGraphStore } from './store/useGraphStore'
 import type { GraphStore } from './store/useGraphStore'
@@ -241,6 +243,8 @@ function App() {
   /* --- overlays (top-bar buttons + ⌘/Ctrl+/ + layered Esc) --- */
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [extensionsOpen, setExtensionsOpen] = useState(false)
+  // §B.0 — which drawer section is showing ('plugins' = studio plugin toggles).
+  const [extensionsTab, setExtensionsTab] = useState<'extensions' | 'mods' | 'plugins'>('extensions')
   /* --- §B.8.1/§B.8.5 — matte find bar (⌘/Ctrl+F) + downloads (⌘/Ctrl+J) ---
    * Declared here: the z-order guard effect below needs them. */
   const [findOpen, setFindOpen] = useState(false)
@@ -259,9 +263,6 @@ function App() {
       spatialHandleRef.current = null
     }
   }, [])
-  useEffect(() => {
-    spatialHandleRef.current?.setShellOverlaysOpen(shortcutsOpen || extensionsOpen)
-  }, [shortcutsOpen, extensionsOpen])
   /** §B.8 z-order honesty — plumbing surfaces that must paint OVER a live
    *  view (⌘J panel, permission card, external-handoff toast) count as shell
    *  overlays: main captures + hides the view so DOM can show above it. The
@@ -336,12 +337,55 @@ function App() {
     }
   }, [spatialEnabled, dismissShellLayers])
 
+  /* --- §B.10 studio plugins: adopt main's authoritative active set --- */
+  useEffect(() => installStudioPluginSync(), [])
+
+  /* --- §B.10 Plugin A — X-Ray click-to-capture lands the tokens in the
+      active node's StickyNote (url_hash attachment, §7.6) --- */
+  useEffect(() => {
+    if (!spatialApi || !spatialEnabled) return
+    const off = spatialApi.onXrayCapture(({ snapshot }) => {
+      const state = useGraphStore.getState()
+      const node = state.activeNodeUuid ? state.nodes[state.activeNodeUuid] : null
+      if (!node) return
+      const markdown = formatXrayMarkdown({
+        selector: snapshot.selector ?? 'element',
+        fontFamily: snapshot.fontFamily ?? 'unknown',
+        resolvedFamily: snapshot.resolvedFamily ?? null,
+        fontWeight: snapshot.fontWeight ?? 'normal',
+        fontSize: snapshot.fontSize ?? '—',
+        lineHeight: snapshot.lineHeight ?? '—',
+        letterSpacing: snapshot.letterSpacing ?? 'normal',
+        color: snapshot.color ?? 'rgb(0, 0, 0)',
+        backgroundColor: snapshot.backgroundColor ?? 'rgba(0, 0, 0, 0)',
+        transition: snapshot.transition ?? 'none',
+        easing: snapshot.easing ?? null,
+        url: snapshot.url ?? node.url,
+      })
+      state.addStickyNote(node.urlHash, markdown)
+      useToastStore.getState().pushToast({
+        kind: 'ghost-echo',
+        title: 'Tokens captured',
+        body: `Sticky note on ${node.domain}`,
+      })
+    })
+    return off
+  }, [spatialEnabled])
+
   /* --- Split View (two reader panes, 1px divider) --- */
   const [splitOpen, setSplitOpen] = useState(false)
   const [splitLeftUuid, setSplitLeftUuid] = useState<NodeUuid | null>(null)
   const [splitRightUuid, setSplitRightUuid] = useState<NodeUuid | null>(null)
   const splitLeftNode = useGraphStore((state) => (splitLeftUuid ? (state.nodes[splitLeftUuid] ?? null) : null))
   const splitRightNode = useGraphStore((state) => (splitRightUuid ? (state.nodes[splitRightUuid] ?? null) : null))
+
+  /* --- §B.10 Plugin D — the split-compare header is a DOM overlay over a
+      live view too: while it is mounted, the z-order guard captures + hides
+      the view so the onion-skin snapshot can blend against the pane backdrop. --- */
+  const splitCompareActive = useStudioPluginStore((state) => state.active['split-compare'])
+  useEffect(() => {
+    spatialHandleRef.current?.setShellOverlaysOpen(shortcutsOpen || extensionsOpen || (splitCompareActive && splitOpen))
+  }, [shortcutsOpen, extensionsOpen, splitCompareActive, splitOpen])
 
   /* --- per-node in-place history for Back/Forward (mock reader wiring) --- */
   const historyRef = useRef<Map<NodeUuid, PaneHistory>>(new Map())
@@ -676,14 +720,21 @@ function App() {
                     </button>
                   </div>
 
-                  <div className="min-w-0 flex-1" onPointerDown={() => focusPane(splitRightNode.uuid)}>
-                    <MockWebReader
-                      key={`split-right-${reloadNonce}`}
-                      node={splitRightNode}
-                      onNavigate={(target) => navigateInPane(splitRightNode.uuid, target)}
-                      onBranch={(target) => branchFrom(splitRightNode.uuid, target)}
-                      onSubNavigate={(sub) => subNavigateIn(splitRightNode.uuid, sub)}
-                    />
+                  <div className="relative flex min-w-0 flex-1 flex-col" onPointerDown={() => focusPane(splitRightNode.uuid)}>
+                    {/* §B.10 Plugin D — breakpoint presets + onion-skin header,
+                        mounted only while the split-compare plugin is active */}
+                    {isPluginActive('split-compare') ? (
+                      <SplitCompareHeader leftUuid={splitLeftNode.uuid} rightUuid={splitRightNode.uuid} />
+                    ) : null}
+                    <div className="min-h-0 flex-1">
+                      <MockWebReader
+                        key={`split-right-${reloadNonce}`}
+                        node={splitRightNode}
+                        onNavigate={(target) => navigateInPane(splitRightNode.uuid, target)}
+                        onBranch={(target) => branchFrom(splitRightNode.uuid, target)}
+                        onSubNavigate={(sub) => subNavigateIn(splitRightNode.uuid, sub)}
+                      />
+                    </div>
                   </div>
                 </div>
               ) : activeNode ? (
@@ -710,7 +761,12 @@ function App() {
             </div>
 
             {/* informative overlays (extensions drawer + shortcuts sheet) */}
-            <ExtensionsDrawer open={extensionsOpen} onClose={() => setExtensionsOpen(false)} />
+            <ExtensionsDrawer
+              open={extensionsOpen}
+              onClose={() => setExtensionsOpen(false)}
+              activeTab={extensionsTab}
+              onTabChange={setExtensionsTab}
+            />
             <ShortcutsSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
           </motion.div>
         ) : null}
@@ -732,6 +788,10 @@ function App() {
         onReload={handleReload}
         onToggleSplit={handleToggleSplit}
         onToggleExtensions={() => setExtensionsOpen((open) => !open)}
+        onOpenPlugins={() => {
+          setExtensionsTab('plugins')
+          setExtensionsOpen(true)
+        }}
       />
       {/* toasts sit clear of the rail when it is open (its fixed left-3 default
           is overridden via twMerge in ToastStack) */}

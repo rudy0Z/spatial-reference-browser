@@ -75,9 +75,11 @@ import {
   Plus,
   Puzzle,
   RotateCw,
+  Scan,
   Search,
   ShieldCheck,
   StickyNote,
+  Waves,
   X,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
@@ -85,6 +87,8 @@ import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import { PreviewArt, previewSpecForNode } from '../canvas/nodes/PreviewArt'
 import { spatialApi } from '../../lib/spatialBridge'
+import { cacheMediaDrop, detectMediaDrop, isPluginActive, toggleStudioPlugin } from '../../lib/plugins'
+import type { StudioPluginId } from '../../lib/plugins'
 import {
   SLASH_COMMANDS,
   SPATIAL_DRAG_MIME,
@@ -103,6 +107,8 @@ import type {
   SlashCommand,
   SlashCommandId,
   SpatialDragPayload,
+  SpatialDropResult,
+  SpatialMediaDrop,
   SpatialTabNodeRecord,
 } from '../../lib/types'
 import {
@@ -383,6 +389,9 @@ const COMMAND_ICONS: Record<SlashCommandId, LucideIcon> = {
   sandbox: ShieldCheck,
   mods: Puzzle,
   zap: Eraser,
+  plugins: Puzzle,
+  xray: Scan,
+  'shader-hud': Waves,
 }
 
 /** Quiet sentence-case result categories — no uppercase mono chips. */
@@ -450,8 +459,15 @@ type ShellDragHandlers = {
   onDrop: (event: ReactDragEvent) => void
 }
 
-/** Prefers the typed `SPATIAL_DRAG_MIME` JSON payload; falls back to native link/text drags. */
-function parseSpatialDrop(dataTransfer: DataTransfer): SpatialDragPayload | null {
+/**
+ * Prefers the typed `SPATIAL_DRAG_MIME` JSON payload; falls back to native
+ * link/text drags. §B.10 Plugin B — an img/svg/video drag off a live page
+ * resolves to a `media-clip` payload (detection is pure logic in
+ * `lib/plugins.ts`); the DROP ZONES decide whether to take the media path,
+ * which they only do while the plugin is active — off means the payload
+ * degrades to the plain seed behavior below.
+ */
+function parseSpatialDrop(dataTransfer: DataTransfer, fallbackPageUrl: string | null): SpatialDropResult | null {
   const raw = dataTransfer.getData(SPATIAL_DRAG_MIME)
   if (raw !== '') {
     try {
@@ -468,6 +484,8 @@ function parseSpatialDrop(dataTransfer: DataTransfer): SpatialDragPayload | null
       // Malformed JSON payload — fall through to plain-text link handling (§6).
     }
   }
+  const media = detectMediaDrop(dataTransfer, fallbackPageUrl)
+  if (media) return media
   for (const text of [dataTransfer.getData('text/uri-list'), dataTransfer.getData('text/plain')]) {
     const candidate = text
       .split('\n')
@@ -497,6 +515,8 @@ type DeckNav = {
   onReload: () => void
   onToggleSplit: (() => void) | null
   onToggleExtensions: (() => void) | null
+  /** §B.0 — open the drawer straight onto the Studio Plugins quick-toggles. */
+  onOpenPlugins: (() => void) | null
 }
 
 function runSlashCommand(
@@ -510,6 +530,8 @@ function runSlashCommand(
     createNewTab: (init?: { title?: string; url?: string; partition?: 'default' | 'sandbox' }) => string
     createClusterFromActive: () => unknown
     zapToggle: () => void
+    /** §B.10 — studio plugin toggles (/xray, /shader-hud). */
+    pluginToggle: (id: StudioPluginId) => void
   },
 ) {
   switch (id) {
@@ -546,6 +568,21 @@ function runSlashCommand(
       // §B.9 — arm/disarm the Element Zapper on the active live view
       // (Alt+Shift+Click hides; the selector persists on the domain).
       actions.zapToggle()
+      actions.setPaletteOpen(false)
+      break
+    case 'plugins':
+      // §B.0 — quick-toggles drawer for the studio plugins.
+      nav.onOpenPlugins?.()
+      actions.setPaletteOpen(false)
+      break
+    case 'xray':
+      // §B.10 Plugin A — toggle the X-Ray instrumentation on the live views.
+      actions.pluginToggle('xray')
+      actions.setPaletteOpen(false)
+      break
+    case 'shader-hud':
+      // §B.10 Plugin C — toggle the shader & motion HUD.
+      actions.pluginToggle('shader-hud')
       actions.setPaletteOpen(false)
       break
   }
@@ -590,9 +627,12 @@ function OmniboxResults({
     void (zapArmed ? spatialApi?.zapDisarm() : spatialApi?.zapArm())
   }, [zapArmed])
 
+  // §B.10 — the studio plugin commands toggle through the plugins registry.
+  const pluginToggle = useCallback((id: StudioPluginId) => toggleStudioPlugin(id), [])
+
   const actions = useMemo(
-    () => ({ setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive, zapToggle }),
-    [setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive, zapToggle],
+    () => ({ setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive, zapToggle, pluginToggle }),
+    [setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive, zapToggle, pluginToggle],
   )
 
   const filteredCommands = useMemo(() => {
@@ -1568,6 +1608,7 @@ export function FloatingIslandPill({
   onReload,
   onToggleSplit,
   onToggleExtensions,
+  onOpenPlugins,
   shieldBlockedCount,
 }: FloatingIslandPillProps) {
   /* --- store state (narrow selectors; records/maps keep identity until changed) --- */
@@ -1629,8 +1670,9 @@ export function FloatingIslandPill({
       }),
       onToggleSplit: onToggleSplit ?? null,
       onToggleExtensions: onToggleExtensions ?? null,
+      onOpenPlugins: onOpenPlugins ?? null,
     }),
-    [canBack, canForward, onBack, onForward, onReload, onToggleSplit, onToggleExtensions, activeNode, navigateActiveNode],
+    [canBack, canForward, onBack, onForward, onReload, onToggleSplit, onToggleExtensions, onOpenPlugins, activeNode, navigateActiveNode],
   )
 
   /* --- §B.6 guardrail sweep — the idle clock ticks while the shell lives --- */
@@ -1652,6 +1694,13 @@ export function FloatingIslandPill({
 
   const acceptsDrag = (event: ReactDragEvent): boolean => {
     const types = event.dataTransfer.types
+    // §B.10 Plugin B — media drags highlight the drop zone only while the
+    // plugin is active (off = the plain §6 behavior, no extra affordances).
+    if (isPluginActive('media-clip')) {
+      if (types.includes('text/html') || Array.from(types).some((t) => t.startsWith('image/') || t.startsWith('video/'))) {
+        return true
+      }
+    }
     return types.includes(SPATIAL_DRAG_MIME) || types.includes('text/uri-list') || types.includes('text/plain')
   }
 
@@ -1675,13 +1724,33 @@ export function FloatingIslandPill({
     if (dragDepth.current === 0) setIsDragOver(false)
   }
 
+  /** §B.10 Plugin B — cache the dropped media and spawn a connected clip card. */
+  const spawnMediaClipDrop = async (drop: SpatialMediaDrop) => {
+    if (!activeNode) return
+    const clip = await cacheMediaDrop(drop)
+    if (!clip) return
+    useGraphStore.getState().spawnMediaClipNode(activeNode.uuid, clip)
+    setSpawnPulse((count) => count + 1)
+  }
+
   const handleDrop = (event: ReactDragEvent) => {
     event.preventDefault()
     dragDepth.current = 0
     setIsDragOver(false)
     if (!activeNode) return
-    const payload = parseSpatialDrop(event.dataTransfer)
+    const payload = parseSpatialDrop(event.dataTransfer, activeNode.url)
     if (!payload) return
+    // §B.10 Plugin B — media clips only materialize while the plugin is on.
+    if ('kind' in payload) {
+      if (isPluginActive('media-clip')) void spawnMediaClipDrop(payload)
+      else {
+        // Degraded path (zero-footprint): treat the media URL as a plain seed.
+        const fallbackUrl = payload.src || payload.sourcePageUrl
+        if (fallbackUrl) spawnChildNode(activeNode.uuid, { url: fallbackUrl, title: domainOf(fallbackUrl) })
+        setSpawnPulse((count) => count + 1)
+      }
+      return
+    }
     spawnChildNode(activeNode.uuid, payload)
     setSpawnPulse((count) => count + 1)
   }

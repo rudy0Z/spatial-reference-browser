@@ -54,7 +54,7 @@
  * (stiffness 380 / damping 30), lucide-react icons, clsx + tailwind-merge.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode, RefObject } from 'react'
+import type { CSSProperties, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, ReactNode, RefObject } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import type { Transition } from 'framer-motion'
 import { LayoutGrid, Map as MapIcon, Plus, ScanEye, Snowflake, StickyNote, Volume2, Waves, X } from 'lucide-react'
@@ -92,6 +92,7 @@ import type {
   ViewMode,
 } from '../../lib/types'
 import { collectTrailChain } from '../../lib/trails'
+import { cacheMediaDrop, detectMediaDrop, isPluginActive } from '../../lib/plugins'
 import SpatialTabNode from './nodes/SpatialTabNode'
 import { createSpatialCuller, getSpatialCoreBackend } from '../../lib/spatialCore'
 import type { SpatialCullerHandle, SpatialCoreBackend } from '../../lib/spatialCore'
@@ -1436,6 +1437,34 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
 
   const handleQuickNote = useCallback((): boolean => useGraphStore.getState().quickNoteOnActive() !== null, [])
 
+  /* §B.10 Plugin B — dropping media from a live page onto the canvas spawns
+     a connected media-clip node. Gated on the plugin being active: off means
+     the canvas ignores media drags entirely (0 px, 0 MB). */
+  const handleCanvasDragOver = useCallback((event: ReactDragEvent) => {
+    if (!isPluginActive('media-clip')) return
+    const types = event.dataTransfer.types
+    const mediaish = types.includes('text/html') || Array.from(types).some((t) => t.startsWith('image/') || t.startsWith('video/'))
+    if (!mediaish) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }, [])
+
+  const handleCanvasDrop = useCallback((event: ReactDragEvent) => {
+    if (!isPluginActive('media-clip')) return
+    const state = useGraphStore.getState()
+    const parentUuid = state.activeNodeUuid
+    const parentNode = parentUuid ? state.nodes[parentUuid] : null
+    if (!parentUuid || !parentNode) return
+    const payload = detectMediaDrop(event.dataTransfer, parentNode.url)
+    if (!payload) return
+    event.preventDefault()
+    void (async () => {
+      const clip = await cacheMediaDrop(payload)
+      if (!clip) return
+      useGraphStore.getState().spawnMediaClipNode(parentUuid, clip)
+    })()
+  }, [])
+
   const handleCreateRegion = useCallback(
     (name: string) => {
       const center = screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
@@ -1578,6 +1607,9 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
                 // §B.7.1 — hovering a spawn edge surfaces its provenance.
                 onEdgeMouseEnter={handleEdgeMouseEnter}
                 onEdgeMouseLeave={handleEdgeMouseLeave}
+                // §B.10 Plugin B — media drops spawn connected clip cards.
+                onDragOver={handleCanvasDragOver}
+                onDrop={handleCanvasDrop}
                 elementsSelectable={false}
                 nodesConnectable={false}
                 zoomOnDoubleClick={false}

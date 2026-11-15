@@ -67,6 +67,21 @@ contextBridge.exposeInMainWorld('spatialAPI', {
   zapDisarm: () => ipcRenderer.invoke('spatial:zap:disarm'),
   onModsUpdated: on('spatial:mods:updated'),
   onZapChanged: on('spatial:zap:changed'),
+  // §B.10 Studio Plugins — activation + media cache, all trust-gated
+  // spatial:* channels (injection only while a plugin is active).
+  pluginsList: () => ipcRenderer.invoke('spatial:plugins:list'),
+  pluginsSetActive: (id, active) => ipcRenderer.invoke('spatial:plugins:set-active', { id, active }),
+  onPluginsUpdated: on('spatial:plugins:updated'),
+  mediaCacheClip: (src, sourcePageUrl, mediaKind, markup) =>
+    ipcRenderer.invoke('spatial:media:cache', { src, sourcePageUrl, mediaKind, markup }),
+  mediaReadClip: (clipId) => ipcRenderer.invoke('spatial:media:read', { clipId }),
+  mediaStoreWebm: (bytes, sourcePageUrl) => ipcRenderer.invoke('spatial:media:store-webm', { bytes, sourcePageUrl }),
+  shaderHudCapturePreview: () => ipcRenderer.invoke('spatial:plugin-hud:capture-preview'),
+  onShaderHudFrame: on('spatial:plugin-hud:frame'),
+  onShaderHudCaptureDone: on('spatial:plugin-hud:capture-done'),
+  onXrayCapture: on('spatial:xray:capture'),
+  pluginsEmulate: (uuid, width) => ipcRenderer.invoke('spatial:plugins:emulate', { uuid, width }),
+  pluginsCapturePane: (uuid) => ipcRenderer.invoke('spatial:plugins:capture-pane', { uuid }),
   // Window controls (existing trust-gated channels)
   win: {
     minimize: send('window:minimize'),

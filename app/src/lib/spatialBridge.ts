@@ -20,7 +20,7 @@
  */
 import { domainOf, urlHashOf } from './types'
 import { useGraphStore } from '../store/useGraphStore'
-import type { EdgeId, GraphEdgeRecord, NodeUuid, SpatialTabNodeRecord } from './types'
+import type { EdgeId, GraphEdgeRecord, MediaClipRef, NodeUuid, SpatialTabNodeRecord } from './types'
 
 export type SpatialNodeRecord = {
   uuid: string
@@ -39,6 +39,8 @@ export type SpatialNodeRecord = {
   partition?: 'default' | 'sandbox' | string | null
   /** §B.7.1 — spawn-edge provenance normalized by main's node-model. */
   provenance?: { anchorText: string | null; contextSnippet: string | null; scrollYAtSpawn: number | null } | null
+  /** §B.10 — media clip record as main's node-model normalized it. */
+  mediaClip?: { kind: string; clipId: string; src: string; sourcePageUrl: string | null; bytes: number; mime: string; ext: string } | null
   thumb: string | null
   lastActiveAt: number
 }
@@ -150,6 +152,56 @@ type SpatialAPI = {
   zapDisarm: () => Promise<{ ok: boolean; armed?: boolean }>
   onModsUpdated: (cb: (payload: { mods: LiveModRecord[]; zapArmed: boolean }) => void) => () => void
   onZapChanged: (cb: (payload: { armed: boolean }) => void) => () => void
+  // §B.10 Studio Plugins — activation + media cache, all trust-gated.
+  // `id` is a StudioPluginId; main validates and holds the authoritative set.
+  pluginsList: () => Promise<{ ok: boolean; plugins?: { id: string; active: boolean }[] }>
+  pluginsSetActive: (id: string, active: boolean) => Promise<{ ok: boolean; active?: boolean; error?: string }>
+  onPluginsUpdated: (cb: (payload: { plugins: { id: string; active: boolean }[] }) => void) => () => void
+  /** CachedMediaClip — main's validated shape, exactly `MediaClipRef` minus the kind (caller knows it). */
+  mediaCacheClip: (
+    src: string,
+    sourcePageUrl: string | null,
+    mediaKind: string,
+    markup?: string,
+  ) => Promise<{
+    ok: boolean
+    clip?: { kind: string; clipId: string; src: string; sourcePageUrl: string | null; bytes: number; mime: string; ext: string }
+    error?: string
+  }>
+  mediaReadClip: (clipId: string) => Promise<{ ok: boolean; dataUrl?: string; mime?: string; error?: string }>
+  mediaStoreWebm: (
+    base64: string,
+    sourcePageUrl: string | null,
+  ) => Promise<{
+    ok: boolean
+    clip?: { kind: string; clipId: string; src: string; sourcePageUrl: string | null; bytes: number; mime: string; ext: string }
+    error?: string
+  }>
+  // §B.10 Plugin C — compositor frame stream for the 5s card preview.
+  shaderHudCapturePreview: () => Promise<{ ok: boolean; error?: string }>
+  onShaderHudFrame: (cb: (payload: { frame: string; index: number }) => void) => () => void
+  onShaderHudCaptureDone: (cb: (payload: { ok: boolean; error?: string }) => void) => () => void
+  // §B.10 Plugin A — X-Ray click-to-capture lands in the shell here as the
+  // raw token snapshot; the shell formats the Markdown (formatXrayMarkdown).
+  onXrayCapture: (
+    cb: (payload: { snapshot: Partial<{
+      selector: string
+      fontFamily: string
+      resolvedFamily: string | null
+      fontWeight: string
+      fontSize: string
+      lineHeight: string
+      letterSpacing: string
+      color: string
+      backgroundColor: string
+      transition: string
+      easing: string | null
+      url: string | null
+    }> }) => void,
+  ) => () => void
+  // §B.10 Plugin D — breakpoint emulation + pane snapshot for the split view.
+  pluginsEmulate: (uuid: string, width: number | null) => Promise<{ ok: boolean; error?: string }>
+  pluginsCapturePane: (uuid: string) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>
 }
 
 declare global {
@@ -167,7 +219,7 @@ const PUSH_DEBOUNCE_MS = 120
 type GraphOp =
   | { type: 'add'; node: Record<string, unknown> }
   | { type: 'move'; uuid: string; x: number; y: number }
-  | { type: 'patch'; uuid: string; patch: { title?: string; url?: string; pinned?: boolean } }
+  | { type: 'patch'; uuid: string; patch: { title?: string; url?: string; pinned?: boolean; mediaClip?: MediaClipRef | null } }
   | { type: 'remove'; uuid: string }
   | { type: 'connect'; parentUuid: string; childUuid: string }
   | { type: 'activate'; uuid: string; at: number }
@@ -243,7 +295,17 @@ function edgesForMain(main: SpatialNodeRecord, now: number): Record<EdgeId, Grap
 }
 
 let lastSyncedPositions = new Map<NodeUuid, { x: number; y: number }>()
+/** §B.10 — last-pushed clip id per node, so a 5s preview attach patches out. */
+let lastSyncedClips = new Map<NodeUuid, string | null>()
 let pushTimer: ReturnType<typeof setTimeout> | null = null
+
+const MEDIA_CLIP_KINDS = new Set(['image', 'video', 'svg'])
+
+/** Narrow main's `kind: string` clip record into the shell's MediaClipRef. */
+function mediaClipFromMain(raw: SpatialNodeRecord['mediaClip']): MediaClipRef | null {
+  if (!raw || typeof raw.clipId !== 'string' || !MEDIA_CLIP_KINDS.has(raw.kind)) return null
+  return { ...raw, kind: raw.kind as MediaClipRef['kind'] }
+}
 let applyingRemote = false
 let shellOverlaysOpen = false
 let thumbCanvas: HTMLCanvasElement | null = null
@@ -284,9 +346,12 @@ function pushDiff() {
           // §B.8.4 — the sandbox label rides the add op; main's
           // normalizeNode drops anything it does not recognize.
           partition: node.partition === 'sandbox' ? 'sandbox' : undefined,
+          // §B.10 — media clips ride both add (spawn) and patch (preview attach).
+          mediaClip: node.mediaClip ?? undefined,
         },
       })
       lastSyncedPositions.set(node.uuid, { x: Math.round(node.x), y: Math.round(node.y) })
+      lastSyncedClips.set(node.uuid, node.mediaClip?.clipId ?? null)
       continue
     }
     const x = Math.round(node.x)
@@ -295,11 +360,18 @@ function pushDiff() {
       ops.push({ type: 'move', uuid: node.uuid, x, y })
       lastSyncedPositions.set(node.uuid, { x, y })
     }
+    // §B.10 — a clip attached to an ALREADY-SYNCED node (5s preview) goes out
+    // as a patch; null clears it.
+    if ((node.mediaClip?.clipId ?? null) !== (lastSyncedClips.get(node.uuid) ?? null)) {
+      ops.push({ type: 'patch', uuid: node.uuid, patch: { mediaClip: node.mediaClip ?? null } })
+      lastSyncedClips.set(node.uuid, node.mediaClip?.clipId ?? null)
+    }
   }
   for (const uuid of lastSyncedPositions.keys()) {
     if (!state.nodes[uuid] && uuid !== '') {
       ops.push({ type: 'remove', uuid })
       lastSyncedPositions.delete(uuid)
+      lastSyncedClips.delete(uuid)
     }
   }
   void now
@@ -329,9 +401,13 @@ function applyGraphToStore(graph: SpatialGraphPayload) {
           y: main.y,
           isPinned: main.pinned,
           noCapture: main.private,
+          // §B.10 — main is authoritative for persisted clip records too.
+          mediaClip: mediaClipFromMain(main.mediaClip),
         }
       } else {
         nextNodes[main.uuid] = makeStoreRecord(main, now)
+        const clip = mediaClipFromMain(main.mediaClip)
+        if (clip) nextNodes[main.uuid] = { ...nextNodes[main.uuid], mediaClip: clip }
       }
       Object.assign(nextEdges, edgesForMain(main, now))
       if (main.thumb) {

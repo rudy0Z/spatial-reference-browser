@@ -188,6 +188,13 @@ export type SpatialTabNodeRecord = {
    * (deterministic from domain + uuid), never to a random value.
    */
   preview?: PreviewSpec
+  /**
+   * §B.10 — Plugin B media clip (Drag-to-Clip) or Plugin C motion loop
+   * (5-second compositor capture), attached to this node. Absent on every
+   * ordinary tab; RichCard renders the clip edge-to-edge (video plays on
+   * hover in Mode B) instead of the generated preview art.
+   */
+  mediaClip?: MediaClipRef | null
 }
 
 /** Directional edge between two nodes; id is `${source}->${target}`. */
@@ -352,13 +359,73 @@ export type SpatialDragPayload = {
   searchQuery?: string
 }
 
+/**
+ * §B.10 Plugin B — Drag-to-Clip media kinds. `svg` covers both inline `<svg>`
+ * drags (serialized as an SVG document) and `.svg` URL drags.
+ */
+export type MediaClipKind = 'image' | 'video' | 'svg'
+
+/**
+ * A cached media clip: the source bytes live in main's `userData/media/`
+ * directory (trust-gated IPC writes them; the shell never touches disk).
+ * `clipId` is the on-disk stem — the only handle the shell is allowed to
+ * reference. `src` keeps the original remote URL for re-fetching/provenance.
+ */
+export type MediaClipRef = {
+  kind: MediaClipKind
+  /** Media directory stem (validated `[\w-]{1,80}`); no path, no extension tricks. */
+  clipId: string
+  /** Original remote source URL (http/https). */
+  src: string
+  /** Page the media was clipped from (drives the hover attribution). */
+  sourcePageUrl: string | null
+  /** On-disk byte size (0 when unknown). */
+  bytes: number
+  mime: string
+  /** File extension written by main (`png|jpg|webp|gif|svg|webm|mp4`). */
+  ext: string
+}
+
+/**
+ * §B.10 Plugin B — a media element (`<img>`/`<svg>`/`<video>`) dragged off a
+ * live page into the pill/canvas drop zones. `parseSpatialDrop` returns this
+ * shape when the drag payload is media, the ordinary seed shape otherwise;
+ * drop handlers take the media path only while the `media-clip` plugin is
+ * active — toggled off, the payload degrades to the plain seed behavior
+ * (zero footprint).
+ */
+export type SpatialMediaDrop = {
+  kind: 'media-clip'
+  mediaKind: MediaClipKind
+  /** Absolute source URL of the media resource (http/https). */
+  src: string
+  /** Page the element was dragged from, when it can be established. */
+  sourcePageUrl: string | null
+  /** Inline `<svg>` document markup (svg drags carry no src; capped by main). */
+  markup?: string
+}
+
+/** Anything `parseSpatialDrop` can hand a drop zone. */
+export type SpatialDropResult = SpatialDragPayload | SpatialMediaDrop
+
 /** MIME type both MockWebReader (drag source) and FloatingIslandPill (drop zone) agree on. */
 export const SPATIAL_DRAG_MIME = 'application/x-spatial-tab-seed'
 
 /** §B.2 header-omnibox slash commands. Per the Fresh-State Browser Law
  * (master spec §0.2) no test/stress generator is user-facing — the 700-node
  * fixture lives behind `window.__devStressSeed`. */
-export type SlashCommandId = 'canvas' | 'park' | 'new' | 'note' | 'cluster' | 'sandbox' | 'mods' | 'zap'
+export type SlashCommandId =
+  | 'canvas'
+  | 'park'
+  | 'new'
+  | 'note'
+  | 'cluster'
+  | 'sandbox'
+  | 'mods'
+  | 'zap'
+  | 'plugins'
+  | 'xray'
+  | 'shader-hud'
 
 export type SlashCommand = {
   id: SlashCommandId
@@ -375,6 +442,9 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { id: 'sandbox', label: '/sandbox', description: 'Isolated sandbox tab for logged-out client testing' },
   { id: 'mods', label: '/mods', description: 'Studio Plugins & Mods drawer' },
   { id: 'zap', label: '/zap', description: 'Arm the element zapper — Alt+Shift+Click hides an element' },
+  { id: 'plugins', label: '/plugins', description: 'Studio plugins quick-toggles' },
+  { id: 'xray', label: '/xray', description: 'Toggle the token & typography X-Ray HUD on the live page' },
+  { id: 'shader-hud', label: '/shader-hud', description: 'Toggle the shader & motion HUD (canvas inspector)' },
 ]
 
 /* ------------------------------------------------------------------ */
@@ -529,6 +599,28 @@ export function ramMbFor(uuid: NodeUuid): number {
   return 48 + (fnv1a32(`ram:${uuid}`) % 173)
 }
 
+/**
+ * §B.10 — display title for a media-clip node: the source filename when the
+ * clip has one, otherwise a quiet `kind · domain` label. Never invented —
+ * falls back through filename → domain → kind.
+ */
+export function mediaClipTitle(clip: MediaClipRef): string {
+  const fromSrc = (path: string): string | null => {
+    try {
+      const parsed = new URL(path)
+      const last = parsed.pathname.split('/').filter(Boolean).pop()
+      return last ? decodeURIComponent(last).slice(0, 80) : null
+    } catch {
+      return null
+    }
+  }
+  const filename = clip.src ? fromSrc(clip.src) : null
+  if (filename) return filename
+  const pageDomain = clip.sourcePageUrl ? domainOf(clip.sourcePageUrl) : null
+  if (pageDomain) return `${clip.kind} · ${pageDomain}`
+  return `${clip.kind} clip`
+}
+
 /** Mono badge fragment: `138 MB` / `0 MB`. */
 export function formatRamMb(mb: number): string {
   return `${Math.max(0, Math.round(mb))} MB`
@@ -642,6 +734,8 @@ export type FloatingIslandPillProps = {
   onToggleSplit?: () => void
   /** App-owned Extensions / Studio Plugins & Mods drawer toggle (§B.0). */
   onToggleExtensions?: () => void
+  /** §B.0 — open the drawer directly on the Studio Plugins quick-toggles tab. */
+  onOpenPlugins?: () => void
   /**
    * Real blocked-request counter from the desktop shell's adblocker
    * (Phase 3 plumbing). `undefined`/null = unknown in this preview —

@@ -46,6 +46,7 @@ const { createGraphIpc } = require('./graph-ipc');
 const { createShellBridge } = require('./shell-bridge');
 const { isSandboxPartition } = require('./session-partitions');
 const { createLiveMods } = require('../live-mods');
+const { createStudioPlugins } = require('./studio-plugins');
 
 // uuid → live tab id. Tab ids are process-local; entries for dead tabs are
 // pruned lazily and never persist (the session column carries uuids only).
@@ -70,6 +71,9 @@ let shellBridge = null;
 // §B.9 Live Mods engine — persists with the graph store, injects into live
 // views, owns the armed Element Zapper. Null until initSpatial.
 let liveMods = null;
+// §B.10 Studio Plugins engine — the toggleable X-Ray / media-clip /
+// shader-HUD / split-compare instrumentation. Null until initSpatial.
+let studioPlugins = null;
 
 /* ------------------------------------------------------------------ */
 /* State (per runtime, on runtime.* so window teardown needs no map)    */
@@ -269,6 +273,8 @@ function wireGraphNodeSync(tabId, uuid) {
   if (!wc) return;
   // §B.9 — the fresh view joins Live-Mod injection + zap coverage.
   liveMods?.attachView(tabId, wc);
+  // §B.10 — and Studio-Plugin coverage (injection only while a plugin is active).
+  studioPlugins?.attachView(tabId, wc);
   wc.on('did-navigate', (_event, url) => {
     const node = model.nodes.get(uuid);
     if (!node || typeof url !== 'string' || !url) return;
@@ -835,6 +841,32 @@ function allLiveViews() {
   return out;
 }
 
+/** §B.10 — the live view owning a graph node uuid, across runtimes. */
+function viewForNodeUuid(uuid) {
+  if (typeof uuid !== 'string' || !UUID_PATTERN.test(uuid)) return null;
+  for (const runtime of deps.allRuntimes()) {
+    if (!runtime.spatialChrome) continue;
+    const entry = liveMap(runtime).get(uuid);
+    if (!entry) continue;
+    const tab = deps.tabs.get(entry.tabId);
+    const wc = tab ? deps.liveContents(tab) : null;
+    if (wc) return { tabId: entry.tabId, wc };
+  }
+  return null;
+}
+
+/** §B.10 — capturePage() of a node's live view (onion-skin snapshots). */
+async function captureViewForNode(uuid) {
+  const view = viewForNodeUuid(uuid);
+  if (!view) return null;
+  try {
+    const image = await view.wc.capturePage();
+    return image && !image.isEmpty() ? image : null;
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Init                                                                */
 /* ------------------------------------------------------------------ */
@@ -898,6 +930,27 @@ function initSpatial(injected) {
     },
   });
   liveMods.register();
+  // §B.10 Studio Plugins — activation-gated injection, the media cache in
+  // userData/media/, the 5s compositor preview stream and the breakpoint
+  // emulation/pane-snapshot surface for the split view. Zero-footprint when
+  // every plugin is off: only the dom-ready listeners remain.
+  studioPlugins = createStudioPlugins({
+    chromeHandle: deps.chromeHandle,
+    chromeOn: deps.chromeOn,
+    getActiveView: () => activeLiveView(deps.rt()),
+    iterViews: () => allLiveViews(),
+    notifyShell: (channel, payload) => {
+      for (const runtime of deps.allRuntimes()) {
+        if (runtime.spatialChrome && runtime.window && !runtime.window.isDestroyed()) {
+          runtime.window.webContents.send(channel, payload);
+        }
+      }
+    },
+    userDataPath: deps.userDataPath,
+    viewForNode: viewForNodeUuid,
+    captureView: captureViewForNode,
+  });
+  studioPlugins.register();
   // §B.8 plumbing bridge: shell shortcuts, external-app handoff toasts,
   // download progress, the matte find bar and permission prompts — all on
   // the same trust-gated registrars the graph seam uses.

@@ -27,7 +27,9 @@ import {
   type LiveModPreset,
   type LiveModRecord,
 } from '../../lib/spatialBridge'
+import { recordCardPreview, STUDIO_PLUGINS, toggleStudioPlugin, useStudioPluginStore } from '../../lib/plugins'
 import { useGraphStore } from '../../store/useGraphStore'
+import { useToastStore } from '../../store/useToastStore'
 
 function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs))
@@ -36,7 +38,7 @@ function cn(...inputs: ClassValue[]): string {
 /** §2 motion language — spring physics everywhere, never linear. */
 const SPRING = { type: 'spring', stiffness: 380, damping: 30 } as const
 
-type DrawerTab = 'extensions' | 'mods'
+type DrawerTab = 'extensions' | 'mods' | 'plugins'
 
 const PLANNED: ReadonlyArray<{ icon: LucideIcon; label: string }> = [
   { icon: Puzzle, label: 'Chrome Web Store installs — paste a URL or extension ID' },
@@ -45,8 +47,29 @@ const PLANNED: ReadonlyArray<{ icon: LucideIcon; label: string }> = [
   { icon: SlidersHorizontal, label: 'Toolbar action popovers and “Load unpacked” folders' },
 ]
 
-export function ExtensionsDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [tab, setTab] = useState<DrawerTab>('extensions')
+export function ExtensionsDrawer({
+  open,
+  onClose,
+  activeTab,
+  onTabChange,
+}: {
+  open: boolean
+  onClose: () => void
+  /** §B.0 — App-owned tab so /plugins and /mods can land on the right section. */
+  activeTab?: DrawerTab
+  onTabChange?: (tab: DrawerTab) => void
+}) {
+  const [tab, setTab] = useState<DrawerTab>(activeTab ?? 'extensions')
+  // Follow the App-owned tab (command-driven navigation) without stealing
+  // intra-drawer clicks: only sync when the prop actually moves.
+  useEffect(() => {
+    if (activeTab && activeTab !== tab) setTab(activeTab)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab])
+  const switchTab = (next: DrawerTab) => {
+    setTab(next)
+    onTabChange?.(next)
+  }
   return (
     <AnimatePresence>
       {open ? (
@@ -70,7 +93,7 @@ export function ExtensionsDrawer({ open, onClose }: { open: boolean; onClose: ()
                 type="button"
                 role="tab"
                 aria-selected={tab === 'extensions'}
-                onClick={() => setTab('extensions')}
+                onClick={() => switchTab('extensions')}
                 className="rounded-md px-2 py-1 text-[11px] font-medium transition-colors"
                 style={{ color: tab === 'extensions' ? 'var(--ink-primary)' : 'var(--ink-muted)', background: tab === 'extensions' ? 'var(--glass-soft)' : 'transparent' }}
               >
@@ -80,11 +103,21 @@ export function ExtensionsDrawer({ open, onClose }: { open: boolean; onClose: ()
                 type="button"
                 role="tab"
                 aria-selected={tab === 'mods'}
-                onClick={() => setTab('mods')}
+                onClick={() => switchTab('mods')}
                 className="rounded-md px-2 py-1 text-[11px] font-medium transition-colors"
                 style={{ color: tab === 'mods' ? 'var(--ink-primary)' : 'var(--ink-muted)', background: tab === 'mods' ? 'var(--glass-soft)' : 'transparent' }}
               >
                 Studio &amp; Mods
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={tab === 'plugins'}
+                onClick={() => switchTab('plugins')}
+                className="rounded-md px-2 py-1 text-[11px] font-medium transition-colors"
+                style={{ color: tab === 'plugins' ? 'var(--ink-primary)' : 'var(--ink-muted)', background: tab === 'plugins' ? 'var(--glass-soft)' : 'transparent' }}
+              >
+                Plugins
               </button>
             </div>
             <button
@@ -99,7 +132,7 @@ export function ExtensionsDrawer({ open, onClose }: { open: boolean; onClose: ()
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 [scrollbar-color:var(--border-hover)_transparent] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-[color:var(--border-hover)]">
-            {tab === 'extensions' ? <ExtensionsTab /> : <StudioModsTab />}
+            {tab === 'extensions' ? <ExtensionsTab /> : tab === 'mods' ? <StudioModsTab /> : <StudioPluginsTab />}
           </div>
         </motion.aside>
       ) : null}
@@ -479,6 +512,114 @@ function StudioModsTab() {
           </div>
         </>
       ) : null}
+    </>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* §B.10 Studio Plugins tab                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The four studio plugins, one quiet row each. Activation is session state
+ * (never persisted): on = main injects that plugin's instrumentation into
+ * the live views; off = 0 px / 0 MB, exactly as §B.0 promises. Plugin C's
+ * "Record 5s card preview" runs from its row because the compositor loop
+ * always targets the ACTIVE node.
+ */
+function StudioPluginsTab() {
+  const active = useStudioPluginStore((state) => state.active)
+  const [previewState, setPreviewState] = useState<'idle' | 'recording'>('idle')
+
+  const activeNode = useGraphStore((state) => (state.activeNodeUuid ? (state.nodes[state.activeNodeUuid] ?? null) : null))
+
+  const recordPreview = async () => {
+    if (!activeNode || previewState === 'recording') return
+    setPreviewState('recording')
+    const clip = await recordCardPreview(activeNode.url, {
+      onFrame: () => {},
+      onDone: (result) => {
+        setPreviewState('idle')
+        if (result) {
+          useGraphStore.getState().patchMediaClip(activeNode.uuid, result)
+          useToastStore.getState().pushToast({
+            kind: 'ghost-echo',
+            title: 'Motion loop captured',
+            body: '5s preview attached — hover the card in Mode B',
+          })
+        } else {
+          useToastStore.getState().pushToast({
+            kind: 'ghost-echo',
+            title: 'Capture failed',
+            body: 'No compositor frames — is a live view focused?',
+          })
+        }
+      },
+    })
+    void clip
+  }
+
+  return (
+    <>
+      <p className="pb-2 text-[11.5px] leading-relaxed text-[color:var(--ink-muted)]">
+        Designer instrumentation that lives only on the page you point it at. Toggled off means truly off — no
+        scripts, no overlays, no bytes.
+      </p>
+      <div className="overflow-hidden rounded-xl border border-hairline">
+        {STUDIO_PLUGINS.map((plugin) => {
+          const on = active[plugin.id]
+          return (
+            <div key={plugin.id} className="flex items-start gap-2.5 border-b border-hairline px-3 py-2.5 last:border-b-0">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[12px] font-medium text-[color:var(--ink-primary)]">{plugin.label}</span>
+                  {plugin.command ? (
+                    <code className="shrink-0 rounded border border-hairline px-1 py-px text-[9.5px] text-[color:var(--ink-muted)]" style={{ fontFamily: MONO_STACK }}>
+                      /{plugin.command}
+                    </code>
+                  ) : null}
+                </div>
+                <div className="mt-0.5 text-[10.5px] leading-relaxed text-[color:var(--ink-muted)]">{plugin.description}</div>
+                <div className="mt-0.5 text-[10.5px] leading-relaxed text-[color:var(--ink-muted)]">{plugin.zeroCost}</div>
+                {plugin.id === 'shader-hud' && on ? (
+                  <button
+                    type="button"
+                    onClick={() => void recordPreview()}
+                    disabled={previewState === 'recording'}
+                    className="mt-2 rounded-md border border-hairline px-2 py-1 text-[10.5px] text-[color:var(--ink-secondary)] transition-colors hover:border-[color:var(--border-hover)] hover:text-[color:var(--ink-primary)] disabled:opacity-50"
+                  >
+                    {previewState === 'recording' ? 'Recording 5s…' : 'Record 5s card preview'}
+                  </button>
+                ) : null}
+                {plugin.id === 'split-compare' && on ? (
+                  <div className="mt-1 text-[10.5px] leading-relaxed text-[color:var(--ink-muted)]">
+                    Controls live in the split view's right-pane header.
+                  </div>
+                ) : null}
+              </div>
+              {/* silent state grammar: filled = active, hollow = off */}
+              <button
+                type="button"
+                role="switch"
+                aria-checked={on}
+                aria-label={`${on ? 'Deactivate' : 'Activate'} ${plugin.label}`}
+                onClick={() => toggleStudioPlugin(plugin.id)}
+                className={cn(
+                  'mt-0.5 h-4 w-7 shrink-0 rounded-full border transition-colors',
+                  on ? 'border-transparent bg-[color:var(--ink-primary)]' : 'border-hairline bg-transparent',
+                )}
+              >
+                <span
+                  className={cn(
+                    'block size-2.5 rounded-full transition-transform',
+                    on ? 'translate-x-[15px] bg-[color:var(--bg-glass)]' : 'translate-x-[3px] bg-[color:var(--ink-muted)]',
+                  )}
+                />
+              </button>
+            </div>
+          )
+        })}
+      </div>
     </>
   )
 }
