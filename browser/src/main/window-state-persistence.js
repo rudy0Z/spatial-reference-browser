@@ -1,0 +1,71 @@
+// Pure naming/options seam for Electron's native window-state persistence,
+// plus the rule for what closing a window does to the saved session.
+// Main-window runtime ids already survive session restore, so the same native
+// window gets the same persistence key without putting platform geometry into
+// session.json (whose rollback mirror deliberately stays browser-data-only).
+
+const WINDOW_STATE_NAME_PREFIX = 'blanc-window-';
+
+function windowStateName(runtimeId) {
+  const id = String(runtimeId ?? '');
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) {
+    throw new Error(`Invalid window runtime id: ${id}`);
+  }
+  return `${WINDOW_STATE_NAME_PREFIX}${id}`;
+}
+
+function windowStatePersistenceOptions(runtimeId) {
+  return {
+    name: windowStateName(runtimeId),
+    windowStatePersistence: {
+      bounds: true,
+      displayMode: true,
+    },
+  };
+}
+
+/** What a user's close of one window does to Blanc's saved session, decided
+ * when the close begins. Quit and forced closes never ask.
+ * - 'dock': the macOS primary window. Its workspace survives for Dock reopen,
+ *   so the saved session is left as it is.
+ * - 'quit': the last open window on Windows or Linux. Closing it quits Blanc
+ *   (window-all-closed), so the window and its tabs stay saved, as Quit
+ *   keeps them.
+ * - 'remove': any other window. It leaves the saved session (F32-1).
+ * - 'mini': a mini window (#1138). It was never saved, so closing it writes
+ *   nothing; `otherOpenWindows` never counts one, so closing the last
+ *   ordinary Windows or Linux window still quits. */
+function windowCloseSessionEffect({ platform, isPrimaryWindow, otherOpenWindows, isMiniWindow = false }) {
+  if (isMiniWindow) return 'mini';
+  if (platform === 'darwin') return isPrimaryWindow ? 'dock' : 'remove';
+  return otherOpenWindows > 0 ? 'remove' : 'quit';
+}
+
+/** Persist live windows across a real app quit (and the primary macOS window
+ * across Dock close, and the last Windows/Linux window, whose close quits),
+ * but forget a window that the user explicitly removed from Blanc's saved
+ * session. On Windows and Linux that includes the primary: there is no Dock
+ * reopen to keep it for. Kept pure so the lifecycle policy is covered without
+ * loading Electron or matching main.js source text. */
+function shouldClearPersistedWindowState({ platform, isQuitting, isPrimaryWindow, closeEffect = null }) {
+  if (isQuitting || closeEffect === 'quit') return false;
+  return !(isPrimaryWindow && platform === 'darwin');
+}
+
+/** Whether a window runtime belongs in session.json: while its window is open,
+ * or while it still holds tabs (the macOS primary after Dock close). A
+ * windowless runtime with no tabs, such as a primary the launch never used,
+ * would only come back as an extra, empty window. */
+function savesSessionEntry(runtime) {
+  // A mini window (#1138) is never saved; "Open in Blanc" clears the flag.
+  return !runtime.resident && !runtime.mini && (Boolean(runtime.window) || runtime.tabOrder.length > 0);
+}
+
+module.exports = {
+  WINDOW_STATE_NAME_PREFIX,
+  savesSessionEntry,
+  shouldClearPersistedWindowState,
+  windowCloseSessionEffect,
+  windowStateName,
+  windowStatePersistenceOptions,
+};

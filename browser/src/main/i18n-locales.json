@@ -1,0 +1,44 @@
+[
+  {
+    "code": "en",
+    "endonym": "English",
+    "dir": "ltr",
+    "status": "selectable"
+  },
+  {
+    "code": "de",
+    "endonym": "Deutsch",
+    "dir": "ltr",
+    "status": "selectable"
+  },
+  {
+    "code": "es",
+    "endonym": "Español",
+    "dir": "ltr",
+    "status": "selectable"
+  },
+  {
+    "code": "fr",
+    "endonym": "Français",
+    "dir": "ltr",
+    "status": "selectable"
+  },
+  {
+    "code": "it",
+    "endonym": "Italiano",
+    "dir": "ltr",
+    "status": "selectable"
+  },
+  {
+    "code": "pt-BR",
+    "endonym": "Português do Brasil",
+    "dir": "ltr",
+    "status": "selectable"
+  },
+  {
+    "code": "en-XA",
+    "endonym": "Pseudo",
+    "dir": "ltr",
+    "status": "pseudo"
+  }
+]

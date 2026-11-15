@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 290.91 344">
+  <style>
+    .blanc-mark { fill: #0e0e0e; }
+    .blanc-cutout { fill: #000 !important; }
+    @media (prefers-color-scheme: dark) { .blanc-mark { fill: #f5f5f5; } }
+  </style>
+  <defs>
+    <mask id="blanc-mark" x="0" y="0" width="290.91" height="344" maskUnits="userSpaceOnUse" style="mask-type:luminance">
+      <g fill="#fff"><path d="M145.455,22 L275.359,97 L275.359,247 L145.455,322 L15.551,247 L15.551,97 Z"/>
+    <path class="blanc-cutout" d="M144.255,174.077 L19.547,102.077 L21.747,97.923 L146.655,169.923 Z"/>
+    <path class="blanc-cutout" d="M144.255,169.923 L268.963,97.923 L271.363,102.077 L146.655,174.077 Z"/>
+    <path class="blanc-cutout" d="M147.855,172 L147.855,316 L143.055,316 L143.055,172 Z"/>
+    <path class="blanc-cutout" d="M145.455,81 L161.455,97 L145.455,113 L129.455,97 Z"/></g>
+    </mask>
+  </defs>
+  <rect class="blanc-mark" width="290.91" height="344" mask="url(#blanc-mark)" />
+</svg>

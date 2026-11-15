@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      runtime-security:
+        dependency-type: production
+  - package-ecosystem: npm
+    directory: /site
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      # init and analyze must run the same CodeQL version; bumped separately,
+      # each PR fails with "Loaded a configuration file for version ..." (#366/#367).
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"

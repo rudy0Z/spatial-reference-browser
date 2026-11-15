@@ -1,0 +1,242 @@
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+const { developmentBrandAssetPath } = require('./development-brand-preview');
+const { captureRuntimeForPlatform } = require('./capture-platform');
+const { stringsScriptFor } = require('./i18n');
+
+const CHROME_SCHEME = 'blanc-chrome';
+// No `persist:` prefix: privileged UI state lives in an in-memory session that
+// ordinary and private browsing WebContents never share.
+const CHROME_PARTITION = 'blanc-chrome';
+const CHROME_INDEX_URL = `${CHROME_SCHEME}://index/`;
+const CHROME_OVERLAY_URL = `${CHROME_SCHEME}://overlay/`;
+// The floating Island's views (auto-hide, float style) run the strip document.
+const CHROME_FLOAT_URL = `${CHROME_SCHEME}://float/`;
+// The floating Glance card's chrome: the strip document again, showing only
+// the card (spec 2026-10-20-floating-glance-design.md).
+const CHROME_GLANCE_URL = `${CHROME_SCHEME}://glance/`;
+const CHROME_PERMISSION_URL = `${CHROME_SCHEME}://permission/`;
+const CHROME_FILL_STATUS_URL = `${CHROME_SCHEME}://fill-status/`;
+const CHROME_TOOLTIP_URL = `${CHROME_SCHEME}://tooltip/`;
+const CHROME_SPLIT_TAB_URL = `${CHROME_SCHEME}://split-tab/`;
+const CHROME_DISPLAY_CAPTURE_HELPER_URL = `${CHROME_SCHEME}://display-capture-helper/`;
+// The Spatial chrome document (Phase 3): the compiled app/ shell staged into
+// src/renderer/spatial/ by scripts/stage-spatial-shell.js. The window itself
+// loads this document when the spatial shell is enabled (SPATIAL_CHROME=0
+// rolls back to the strip).
+const CHROME_SPATIAL_URL = `${CHROME_SCHEME}://spatial/`;
+const RENDERER_DIR = path.join(__dirname, '../renderer');
+// The staged spatial bundle. Its hashed asset names change on every app/
+// build, so the host map is enumerated from the staged directory at load
+// time — but it is still an exact-path allowlist: only files that existed in
+// that directory when the app launched are served, paths are matched verbatim
+// (no traversal, no query strings, no credentials — chromeResourcePath
+// rejects all of those before this map is consulted), and a missing/staging
+// directory yields an empty map (every request 404s fail-closed).
+const SPATIAL_BUNDLE_DIR = path.join(RENDERER_DIR, 'spatial');
+
+function spatialHostAssets() {
+  const assets = new Map([['/', 'spatial/index.html']]);
+  let staged = [];
+  try {
+    staged = fs.readdirSync(SPATIAL_BUNDLE_DIR, { withFileTypes: true });
+  } catch {
+    return assets; // bundle not staged yet: only / is mapped, and it 404s
+  }
+  for (const entry of staged) {
+    if (entry.isFile()) {
+      assets.set(`/${entry.name}`, path.posix.join('spatial', entry.name));
+    } else if (entry.isDirectory()) {
+      // One level of directories (vite emits assets/); deeper trees stay
+      // unmapped until reviewed, like every other host.
+      let nested = [];
+      try {
+        nested = fs.readdirSync(path.join(SPATIAL_BUNDLE_DIR, entry.name), { withFileTypes: true });
+      } catch { continue; }
+      for (const nestedEntry of nested) {
+        if (nestedEntry.isFile()) {
+          assets.set(
+            `/${entry.name}/${nestedEntry.name}`,
+            path.posix.join('spatial', entry.name, nestedEntry.name),
+          );
+        }
+      }
+    }
+  }
+  return assets;
+}
+// Interface strings: /strings.js is virtual — the handler answers it with the
+// active language's generated catalog plus the runtime formatting locale. This
+// path must never exist on disk; /i18n.js is the shared formatter.
+const STRINGS_VIRTUAL_PATH = path.join(RENDERER_DIR, 'pages', 'strings.js');
+const SHARED_ALIASES = new Map([
+  ['/strings.js', STRINGS_VIRTUAL_PATH],
+  ['/i18n.js', path.join(RENDERER_DIR, 'pages', 'i18n.js')],
+]);
+const ENGLISH_STRINGS_PATH = path.join(RENDERER_DIR, 'pages', 'strings.en.js');
+
+// Chrome is intentionally much smaller than the internal-pages surface. Each
+// host receives only its own document/script plus the exact shared assets the
+// stylesheet references. Encoded paths, query strings, credentials, ports,
+// directories, and future files all fail closed until explicitly reviewed.
+const SHARED_ASSETS = new Set([
+  '/styles.css',
+  '/panel-left.svg',
+  '/pages/sunrise-favicon-mark.png',
+  '/pages/inter-latin.woff2',
+  '/pages/instrument-sans-latin-wdth-normal.woff2',
+  '/pages/jetbrains-mono-latin.woff2',
+  // Pure keyboard-gate logic, no IPC and no application data — the chrome
+  // strip and the start page share one copy so they cannot disagree.
+  '/pages/type-to-open.js',
+]);
+const STRIP_ASSETS = new Map([
+  ['/', 'index.html'],
+  ['/renderer.js', 'renderer.js'],
+  ['/vertical-tabs.js', 'vertical-tabs.js'],
+  // Pure drag-to-reorder controller shared by the rail and the island so the
+  // two surfaces cannot disagree. No IPC of its own and no application data.
+  ['/tab-drag.js', 'tab-drag.js'],
+  // Pure tab-order sections (groups and runs of ungrouped tabs), shared
+  // with main so the rail, the island and main draw one order. No IPC.
+  ['/tab-sections.js', 'tab-sections.js'],
+  // The floating Glance card's drag lifecycle. Pure; no IPC of its own.
+  ['/glance-card-drag.js', 'glance-card-drag.js'],
+  // Pure Blanc Spaces identity (presets, symbols, readability guard). No IPC
+  // and no application data; the strip mark and the Spaces menu share it.
+  ['/space-identity.js', 'space-identity.js'],
+]);
+const HOST_ASSETS = new Map([
+  ['index', STRIP_ASSETS],
+  ['float', STRIP_ASSETS],
+  ['glance', STRIP_ASSETS],
+  ['overlay', new Map([
+    ['/', 'overlay.html'],
+    ['/overlay.js', 'overlay.js'],
+    ['/workspace-ui.js', 'workspace-ui.js'],
+    ['/tab-sections.js', 'tab-sections.js'],
+    ['/tab-drag.js', 'tab-drag.js'],
+    // Pure Blanc Spaces identity (presets, symbols, readability guard). No IPC
+    // and no application data; the strip mark and the Spaces menu share it.
+    ['/space-identity.js', 'space-identity.js'],
+    // The Spaces editor's colour picker, drawn inside the overlay (a native
+    // colour panel would take focus and blur-dismiss the menu).
+    ['/space-picker.js', 'space-picker.js'],
+    // Bangs: the pure parser/matcher and the generated Kagi catalog (data
+    // only, no IPC). They live under pages/ so the Settings page, served by
+    // pages.js, loads the same two files.
+    ['/pages/bangs.js', 'pages/bangs.js'],
+    ['/pages/bangs-catalog.js', 'pages/bangs-catalog.js'],
+    ['/sunrise-hero-mark.png', 'sunrise-hero-mark.png'],
+    // Pure close-on-leave policy for a hover-opened panel. No IPC and no
+    // application data.
+    ['/hover-panel-leave.js', 'hover-panel-leave.js'],
+  ])],
+  ['permission', new Map([
+    ['/', 'permission.html'],
+    ['/permission.js', 'permission.js'],
+  ])],
+  ['fill-status', new Map([
+    ['/', 'fill-status.html'],
+    ['/fill-status.js', 'fill-status.js'],
+    ['/fill-status-copy.js', 'fill-status-copy.js'],
+  ])],
+  // The resting pill's tooltip: a document with no script and no preload.
+  // Main writes the text into it; it draws with the shared stylesheet.
+  ['tooltip', new Map([
+    ['/', 'tooltip.html'],
+  ])],
+  // A Split View pane's corner tab (spec D9): no script and no preload, like
+  // the tooltip. Main writes its site and reads its clicks from input events.
+  ['split-tab', new Map([
+    ['/', 'split-tab.html'],
+  ])],
+  ['display-capture-helper', new Map([
+    ['/', 'display-capture-helper.html'],
+    ['/display-capture-helper.js', 'display-capture-helper.js'],
+  ])],
+  // The Spatial chrome document (Phase 3): the compiled app/ shell. Exact
+  // per-file allowlist enumerated from the staged bundle — see
+  // spatialHostAssets() above for the fail-closed rules.
+  ['spatial', spatialHostAssets()],
+]);
+
+function chromeResourcePath(rawUrl, platform = process.platform) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== `${CHROME_SCHEME}:`
+    || parsed.username
+    || parsed.password
+    || parsed.port
+    || parsed.search
+    || parsed.hash
+  ) return null;
+
+  const hostAssets = HOST_ASSETS.get(parsed.hostname);
+  if (!hostAssets) return null;
+  const alias = SHARED_ALIASES.get(parsed.pathname);
+  if (alias) return alias;
+  const relative = hostAssets.get(parsed.pathname)
+    ?? (SHARED_ASSETS.has(parsed.pathname) ? parsed.pathname.slice(1) : null);
+  if (!relative) return null;
+  if (parsed.hostname === 'display-capture-helper' && relative === 'display-capture-helper.js') {
+    return path.join(RENDERER_DIR, captureRuntimeForPlatform(platform).helper);
+  }
+  return path.join(RENDERER_DIR, relative);
+}
+
+// Processes without the main-process language state (display-capture brokers) serve English.
+const englishStringsScript = () =>
+  stringsScriptFor({ source: fs.readFileSync(ENGLISH_STRINGS_PATH, 'utf8'), formatLocale: 'en', strict: false });
+
+function createChromeProtocolHandler({ net, developmentBrandMarkPath = null, stringsScript = englishStringsScript }) {
+  return (request) => {
+    const defaultPath = chromeResourcePath(request.url);
+    if (!defaultPath) return new Response('Not found', { status: 404 });
+    if (defaultPath === STRINGS_VIRTUAL_PATH) {
+      return new Response(stringsScript(), { headers: { 'content-type': 'text/javascript; charset=utf-8' } });
+    }
+    const resource = developmentBrandAssetPath({
+      name: path.basename(defaultPath),
+      defaultPath,
+      brandMarkPath: developmentBrandMarkPath,
+    });
+    return net.fetch(pathToFileURL(resource).href, { bypassCustomProtocolHandlers: true });
+  };
+}
+
+function setupChromeProtocol({ session, net, developmentBrandMarkPath = null, stringsScript }) {
+  session.protocol.handle(CHROME_SCHEME, createChromeProtocolHandler({
+    net,
+    developmentBrandMarkPath,
+    stringsScript,
+  }));
+}
+
+module.exports = {
+  CHROME_SCHEME,
+  CHROME_PARTITION,
+  CHROME_INDEX_URL,
+  CHROME_OVERLAY_URL,
+  CHROME_FLOAT_URL,
+  CHROME_GLANCE_URL,
+  CHROME_PERMISSION_URL,
+  CHROME_FILL_STATUS_URL,
+  CHROME_TOOLTIP_URL,
+  CHROME_SPLIT_TAB_URL,
+  CHROME_DISPLAY_CAPTURE_HELPER_URL,
+  CHROME_SPATIAL_URL,
+  spatialHostAssets,
+  STRINGS_VIRTUAL_PATH,
+  chromeResourcePath,
+  createChromeProtocolHandler,
+  setupChromeProtocol,
+};

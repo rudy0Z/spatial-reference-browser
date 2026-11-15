@@ -1,0 +1,4301 @@
+// Test-only main-process surface, installed ONLY when process.env.BLANC_TEST
+// is set (see main.js). It exposes a small, explicit set of state readers and
+// actions on globalThis.__blanc so the desktop acceptance harness can drive the
+// real tab/group/store logic via Playwright's electronApp.evaluate() — no
+// production code path depends on this, and it is never wired in a normal run.
+//
+// It deliberately reaches into the same functions the app itself uses
+// (createTab, groupTabByName, the settings/history/bookmarks stores), so the
+// scenarios exercise real behaviour rather than a reimplementation.
+
+const settings = require('./settings');
+const sync = require('./sync');
+const history = require('./history');
+const archive = require('./archive');
+const bookmarks = require('./bookmarks');
+const startPagePins = require('./start-page-pins');
+const path = require('node:path');
+const fs = require('node:fs');
+const { app, BrowserWindow, Menu, clipboard, nativeImage, powerMonitor, session, webContents } = require('electron');
+const siteZoom = require('./site-zoom');
+const { levelToPercent } = require('./page-zoom');
+// A 1×1 PNG the bang icon server stub answers with (stubBangIconServer).
+const TEST_BANG_ICON_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+const { buildAddressMenu } = require('./address-menu-model');
+const { sameGroupName } = require('./group-name-case');
+const { terminateRenderer } = require('./renderer-discard');
+const { resolveDeviceName } = require('./device-names');
+const { blockableHostname } = require('./adblock-exceptions');
+const { syncSnapshot } = require('./session-snapshot');
+const { installTestCallBridge } = require('./test-call-bridge');
+const {
+  runAddressMenuItem,
+  readAddressFieldText,
+  isAddressMenuAttached,
+  ADDRESS_INPUT_ID,
+} = require('./address-menu');
+
+const TAB_IMPORT_FIXTURES = Object.freeze({
+  'folder-fallback': Object.freeze({
+    sourceLabel: 'Google Chrome — Tab migration fixture',
+    candidateCount: 6,
+  }),
+  'merge-existing': Object.freeze({
+    sourceLabel: 'Google Chrome — Merge fixture',
+    candidateCount: 2,
+  }),
+  'stress-500': Object.freeze({
+    sourceLabel: 'Google Chrome — Stress 500',
+    candidateCount: 500,
+    timeout: 20_000,
+  }),
+  'quit-safety': Object.freeze({
+    sourceLabel: 'Google Chrome — Quit safety fixture',
+    candidateCount: 2,
+  }),
+});
+
+/**
+ * @param {object} refs - live references from main.js's module scope.
+ */
+function install(refs) {
+  const {
+    // Playwright's electronApp.evaluate() calls globalThis.__blanc.* straight
+    // into the main process, from OUTSIDE any bindWindowRuntime scope — this
+    // is the single most important root to bind. bindRoot is main.js's
+    // `(fn) => bindWindowRuntime(primaryRuntime, fn)`; every method below is
+    // wrapped with it, once, mechanically, at the end of this function.
+    bindRoot,
+    rearmLaunchSunrise,
+    miniWindowTest,
+    pairingProtectedWindow,
+    bangIcons,
+    clearRecentBangsAndIcons,
+    tabs,
+    liveContents,
+    getTabOrder,
+    getGroups,
+    getSplits,
+    getActiveTabId,
+    getIslandRect,
+    getIslandHoverRect,
+    getIslandHoverState,
+    setIslandHoverOpen,
+    setIslandAutoHide,
+    setIslandAutoHideStyle,
+    getFloatViewState,
+    getFloatWebContents,
+    getGlanceCardWebContents,
+    getGlanceCardViewVisible,
+    getSavedGlanceFrame,
+    getGlancePageViewVisible,
+    destroyGlanceCardViewForTest,
+    getTooltipViewState,
+    getFloatWebContentsIds,
+    isChromeSurfaceRegistered,
+    getChromeButtonRects,
+    getMainWindowState,
+    restoreMainWindow,
+    getMainMenuRequests,
+    holdIslandInWindow,
+    floatPillWebContentsId,
+    focusWindowRuntime,
+    floatPillDiagnostics,
+    getIslandAutoHideState,
+    getOverlayShowCount,
+    resetOverlayShowCount,
+    setTestCursorPoint,
+    setTestCursorSamplingUnavailable,
+    runBlockAdsCommand,
+    runAllowAdsCommand,
+    clusterSlots,
+    createTab,
+    setActiveTab,
+    closeTab,
+    duplicateTab,
+    toggleTabPinned,
+    toggleTabMuted,
+    goBack,
+    pinnedHomeActions,
+    chooseSessionRecovery,
+    getSessionRecoveryState,
+    setGlanceTab,
+    closeGlance: closeGlanceAction,
+    openGlanceAsTab: openGlanceAsTabAction,
+    resetGlanceCardFrame,
+    getGlanceTabId,
+    getFocusedPaneTabId,
+    getGlanceCard,
+    openLinkInGlance, runLinkSpaceMenuItem,
+    groupTabByName,
+    renameTab,
+    beginRenameTab,
+    beginRenameGroup,
+    beginRenameDevice,
+    ungroupGroup,
+    setGroupColor,
+    newTabBelow,
+    closeTabsBeside,
+    toggleSiteMute,
+    closeGroup,
+    toggleGroupCollapsed,
+    moveTabTo,
+    reorderGroupBefore,
+    getOverlayDragging,
+    selectTabAtIndex,
+    reopenClosedTab,
+    newTabUrl,
+    setTabLayout,
+    setVerticalTabsWidth,
+    getVerticalTabsMetrics,
+    broadcastTabs,
+    openNewWindow: openNewWindowAction,
+    windowRuntimeSnapshots,
+    closeWindowRuntime: closeWindowRuntimeAction,
+    openTabInWindow: openTabInWindowAction,
+    setGlanceTabInWindow,
+    closeGlanceInWindow,
+    closeTabInWindow: closeTabInWindowAction,
+    reopenClosedTabInWindow,
+    moveTabToNewWindow,
+    createNamedLocalProfileWindow,
+    renameNamedLocalProfile,
+    deleteNamedLocalProfile,
+    localProfileSnapshots,
+    profileBookmarkUrls,
+    saveProfileFavorite,
+    profileTabSessionSnapshot,
+    isSessionPersistenceReady,
+    getRailActivationSerial,
+    normalizeAddressInput,
+    probeOnePasswordPackage,
+    pasteAndGo,
+    classifyExternalNavigation,
+    openInternalPage,
+    openFindBar,
+    getOverlayMode,
+    getFindTargetTabId,
+    getOverlayViewBounds,
+    getOverlayViewAttached,
+    prepareDisplayCaptureHelper,
+    getResidentSpaces,
+    getRoomPass,
+    raceSwitchBackDuringQuiet,
+    isOverlayViewShowing,
+    showOverlay,
+    hideOverlay,
+    showUtilityPage,
+    hideUtilitySheet,
+    getUtilitySheetState,
+    getUtilitySheetWebContents,
+    zoomActiveTab,
+    getOverlayWebContents,
+    getChromeWebContents,
+    setWindowContentSize,
+    getWindowContentBounds,
+    focusMainWindow,
+    getUtilitySheetBounds,
+    getOverlayBounds,
+    setTestSearchSuggestionFixture,
+    clearTestSearchSuggestionFixture,
+    getTestSearchSuggestionRequests,
+    setTestSearchNavigationCapture,
+    getTestSearchSubmission,
+    getPrivateBrowsingSession,
+    attemptChromeNavigation,
+    getChromeUrl,
+    persistedSessionData,
+    serializedTabsPayload,
+    sleepTab,
+    quietRefusal,
+    wakeTab,
+    runSleepSweep,
+    createSplitFromTabs,
+    keepGlanceAsSplit,
+    moveGroupToNewWindowForTest,
+    moveGroupToSpaceForTest,
+    beginNewSpaceForGroupForTest,
+    straySplitIds,
+    windowChildViewCount,
+    menuContextActionsForTest,
+    tabMenuItemsForTest,
+    selectTabRows, runTabsAction, getSelectedTabIds,
+    closedEntrySummaries,
+    splitLayoutForTest,
+    splitCornerTabsForTest,
+    clickSplitCornerForTest,
+    raiseTabViewForTest,
+    attachedTabViewIds,
+    sleepBackgroundTabsNow,
+    runArchiveSweep,
+    restoreArchivedEntry,
+    setArchiveGraceUntil,
+    setArchiveProbeObserver,
+    runArchiveSweepInEveryWindow,
+    getPermissionPrompts,
+    showFillStatusForTest,
+    onePasswordTargetForTest,
+    fillStatusState,
+    readFillStatusDom,
+    setSleepThresholdOverride,
+    setRemoteDevicesSource,
+    setSendsSource,
+    getSleepSnapshots,
+    getClosedEntries,
+    clearClosedEntries,
+    testRuntimeId,
+    getTabImportSessionProjection,
+    applyTabImportFromRuntime,
+    getTabStateBroadcastCount,
+    getTabHandoffTestState,
+    queueTabHandoffForTest,
+    acceptTabHandoffForTest,
+    cancelTabHandoffForTest,
+  } = refs;
+
+  // The tab model's committed .url is the app's own source of truth (see
+  // openInternalPage) and is set synchronously, so it is more reliable in
+  // tests than webContents.getURL(), which lags until a navigation commits.
+  const urlOf = (t) => {
+    if (typeof t.url === 'string' && t.url) return t.url;
+    try { return t.view.webContents.getURL(); } catch { return ''; }
+  };
+  // The ACTUAL committed WebContents URL — not the model's stored .url, which
+  // can still read blanc://newtab after a load fails and the page is blank.
+  // Regression checks for "did this page really load" must use this.
+  const committedUrlOf = (t) => { try { return t.view.webContents.getURL(); } catch { return ''; } };
+  const isLoadingOf = (t) => { try { return t.view.webContents.isLoadingMainFrame(); } catch { return false; } };
+  const sessionPersistentOf = (t) => { try { return t.view.webContents.session.isPersistent(); } catch { return null; } };
+  const titleOf = (t) => { try { return t.view.webContents.getTitle(); } catch { return ''; } };
+  let focusObservation = null;
+  let activeTabImportFixtureName = null;
+  const projectRootTabImportSession = () =>
+    getTabImportSessionProjection(testRuntimeId);
+  const beforeUnloadProbes = new Map();
+  const remoteFixture = [{
+    deviceId: 'acceptance-remote-device',
+    name: 'Press Mac',
+    platform: 'darwin',
+    updatedAt: Date.now(),
+    groups: [],
+    tabs: [{
+      url: 'https://remote.example/press-needle',
+      title: 'Remote press needle',
+      groupId: null,
+      pinned: false,
+      // A REAL synced-icon payload: 32x32 (tabicons-model ICON_SIZE),
+      // produced by the production rasterizer (nativeImage.resize + toPNG,
+      // tabicons.js:143) and accepted by validIconData(). A smaller PNG is
+      // rejected there, so a hand-rolled 1x1 would exercise a payload sync
+      // could never deliver. Without any favicon, setFavicon takes its
+      // no-icon branch and a broken synced favicon looks identical to a
+      // working one.
+      favicon: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAABr0lEQVR4nLTWsUrDQBgH8O/7cmpr1aFj8Rmq+BSiaAdBqnZQfAlx8EnsIO1UcKhDfQkdbJd20EFBUKgFO0TTXM7vEhDR1ia55JZLLnC/u/93kBPKb57nSSkPj4+a9UZn5iQ3IhcUAYJxEzw7+k0IUT2vZmwcXvaXREG6nwrQXEBeu+5QPxASePC6feG0OpZYVK4EYwN5B9wpTyFpA7WJ/VLNbrUTMWivsm+POA1dBiJiTZHKNyvZjaJ0hygsHlAQv1kPnd5j935zp8TrRAVs6AkRsuWie/vi9J5IZEDHGHMfVnf2dLXjzd0McuUVfWq45okatOBYy1bho9V+K9VB11uHpQ39Ecyz4vPuOdLhetrpGIQ6F+TTkpKhp/CTTcugoEvPoO+nlAz6+ZKGQb/eEzfo71CyBo0dTdCgCeOJGROBpIz/gESMKYC5MR0wNEIBJkZYILYRAYhnRANiGJGBsMZVJbvOxnscIJSBmG8ezJfW8BnOIG7zz4niHDgNzoSTCWrKRnCTg6hFnr4Pxf94DGYPrtVGwBhjqwaOhOAuisY7GGNc3w12GzCS4C+fjS8AAAD///R8eLkAAAAGSURBVAMAqMIc5gOIAroAAAAASUVORK5CYII=',
+    }],
+  }];
+
+  function clearFocusObservation() {
+    if (!focusObservation) return;
+    focusObservation.wc.removeListener('focus', focusObservation.listener);
+    focusObservation = null;
+  }
+
+  // Injected devices go through the same name resolution as
+  // sync.listRemoteDevices; main re-pushes them when a name changes.
+  let injectedDevices = [];
+  const shownInjectedDevices = () => {
+    const names = settings.getDeviceNames();
+    return injectedDevices.map((device) => ({
+      ...device,
+      name: resolveDeviceName(names, device.deviceId, device.name),
+    }));
+  };
+  function pushRemoteDevices(devices) {
+    injectedDevices = devices;
+    // Main lists (and lets the drawer rename) exactly what was injected.
+    setRemoteDevicesSource(devices.length ? shownInjectedDevices : null);
+    const shown = shownInjectedDevices();
+    getOverlayWebContents()?.send('chrome:remote-tabs-updated', shown);
+    for (const tab of tabs.values()) {
+      if (urlOf(tab).startsWith('blanc://newtab')) {
+        tab.view?.webContents?.send('pages:start:remote-tabs', shown);
+      }
+    }
+  }
+
+  // Send to device (M7b): an in-memory stand-in for sync's sends store. The
+  // targets and inbox are what a scenario injects; sends are recorded and
+  // answered with the scenario's chosen status.
+  let injectedSends = null;
+  function injectSends({ targets = [], inbox = [], sendStatus = 'sent' } = {}) {
+    injectedSends = { targets: structuredClone(targets), inbox: structuredClone(inbox), hidden: new Set(), sent: [], sendStatus };
+    const state = injectedSends;
+    const source = {
+      targets: () => structuredClone(state.targets),
+      inbox: () => state.inbox.filter((item) => !state.hidden.has(item.id)).map((item) => ({ ...item })),
+      hide: (id) => {
+        const item = state.inbox.find((row) => row.id === id && !state.hidden.has(id));
+        if (!item) return null;
+        state.hidden.add(id);
+        // sync's store notifies the surfaces when a page is hidden; so does this.
+        queueMicrotask(() => { if (injectedSends === state) setSendsSource(source); });
+        return { id: item.id, url: item.url };
+      },
+      send: async (request) => { state.sent.push({ ...request }); return { status: state.sendStatus }; },
+    };
+    setSendsSource(source);
+  }
+
+  async function readTabImportDom() {
+    const wc = getUtilitySheetWebContents();
+    if (!wc || wc.isDestroyed()) return null;
+    return wc.executeJavaScript(`(() => {
+      if (location.host !== 'tab-import') return null;
+      const visiblePanel = [...document.querySelectorAll('[data-step-panel]')]
+        .find((panel) => !panel.hidden);
+      return {
+        step: visiblePanel?.dataset.stepPanel ?? null,
+        sourceLabels: [...document.querySelectorAll('.tab-import-source-btn')]
+          .map((button) => button.dataset.sourceLabel ?? button.textContent),
+        windows: [...document.querySelectorAll('.tab-import-window-heading h3')]
+          .map((heading) => heading.textContent),
+        preview: [...document.querySelectorAll('.tab-import-preview-row')]
+          .map((row) => ({
+            title: row.querySelector('.title')?.textContent ?? '',
+            meta: row.querySelector('.meta')?.textContent ?? '',
+            selected: row.querySelector('input[type="checkbox"]')?.checked ?? false,
+          })),
+        selectedCount: document.getElementById('tabImportSelectedCount')?.textContent ?? '',
+        groupNames: [...document.querySelectorAll('.tab-import-group-name')]
+          .map((input) => input.value),
+        applyLabel: document.getElementById('tabImportApplyBtn')?.textContent ?? '',
+        applyDisabled: document.getElementById('tabImportApplyBtn')?.disabled ?? true,
+        reviewDisabled: document.getElementById('tabImportContinueToReview')?.disabled ?? true,
+        recoveryHidden: document.getElementById('tabImportSourceRecovery')?.hidden ?? true,
+        recoveryText: document.getElementById('tabImportSourceRecovery')?.textContent ?? '',
+        recoveryButton: document.querySelector('#tabImportSourceRecovery button')?.textContent ?? '',
+        recoveryButtonCount: document.querySelectorAll('#tabImportSourceRecovery button').length,
+        sourceRows: [...document.querySelectorAll('.tab-import-source-btn')]
+          .map((button) => ({
+            label: button.dataset.sourceLabel ?? '',
+            disabled: button.disabled,
+            waiting: button.classList.contains('waiting'),
+            affordance: button.querySelector('.tab-import-source-waiting')?.textContent ?? '',
+          })),
+        status: document.getElementById('tabImportStatus')?.textContent ?? '',
+      };
+    })()`);
+  }
+
+  async function waitForTabImportDom(predicate, label, timeout = 8_000) {
+    const deadline = Date.now() + timeout;
+    let last = null;
+    for (;;) {
+      const surface = getUtilitySheetState();
+      if (surface?.visible && surface.ready && surface.url === 'blanc://tab-import/') {
+        try { last = await readTabImportDom(); } catch { last = null; }
+      } else {
+        last = null;
+      }
+      if (predicate(last)) return last;
+      if (Date.now() > deadline) {
+        throw new Error(`timed out waiting for ${label}; last: ${JSON.stringify(last)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  async function clickTabImportSelector(selector, matcher = null) {
+    const wc = getUtilitySheetWebContents();
+    if (!wc || wc.isDestroyed()) throw new Error('tab-import sheet is not open');
+    const clicked = await wc.executeJavaScript(`(() => {
+      const nodes = [...document.querySelectorAll(${JSON.stringify(selector)})];
+      const matcher = ${JSON.stringify(matcher)};
+      const node = matcher === null
+        ? nodes[0]
+        : nodes.find((candidate) =>
+          (candidate.dataset.sourceLabel ?? candidate.textContent) === matcher
+          || (candidate.dataset.sourceLabel ?? candidate.textContent).startsWith(matcher + ' ('));
+      if (!node || node.disabled) return false;
+      node.click();
+      return true;
+    })()`);
+    if (!clicked) throw new Error(`tab-import control unavailable: ${selector} ${matcher ?? ''}`);
+  }
+
+  async function ensureTabImportFixtureStage(name, targetStage) {
+    const fixture = TAB_IMPORT_FIXTURES[name];
+    if (!fixture) throw new Error(`unknown tab-import fixture: ${name}`);
+    const surface = getUtilitySheetState();
+    let dom = await readTabImportDom();
+    if (!surface?.visible || !dom || (activeTabImportFixtureName && activeTabImportFixtureName !== name)) {
+      if (surface?.visible) hideUtilitySheet();
+      openInternalPage('blanc://tab-import/');
+      dom = await waitForTabImportDom(
+        (value) => value?.step === 'source' && value.sourceLabels.includes(fixture.sourceLabel),
+        `${fixture.sourceLabel} source button`,
+        fixture.timeout,
+      );
+    }
+    activeTabImportFixtureName = name;
+    if (dom.step === 'source') {
+      await clickTabImportSelector('.tab-import-source-btn', fixture.sourceLabel);
+      dom = await waitForTabImportDom(
+        (value) => value?.step === 'tabs' && value.preview.length === fixture.candidateCount,
+        'tab-import tabs step',
+        fixture.timeout,
+      );
+    }
+    if (targetStage === 'tabs') return dom;
+    if (dom.step === 'tabs') {
+      await clickTabImportSelector('#tabImportContinueToOrganize');
+      dom = await waitForTabImportDom(
+        (value) => value?.step === 'organize' && !value.reviewDisabled,
+        'tab-import organize step',
+        fixture.timeout,
+      );
+    }
+    if (targetStage === 'organize') return dom;
+    if (dom.step === 'organize') {
+      await clickTabImportSelector('#tabImportContinueToReview');
+      dom = await waitForTabImportDom(
+        (value) => value?.step === 'review' && !value.applyDisabled,
+        'tab-import review step',
+        fixture.timeout,
+      );
+    }
+    return dom;
+  }
+
+  async function ensureTabImportQuitGate(name) {
+    const fixture = TAB_IMPORT_FIXTURES[name];
+    if (!fixture) throw new Error(`unknown tab-import fixture: ${name}`);
+    const surface = getUtilitySheetState();
+    let dom = await readTabImportDom();
+    if (!surface?.visible || !dom || (activeTabImportFixtureName && activeTabImportFixtureName !== name)) {
+      if (surface?.visible) hideUtilitySheet();
+      openInternalPage('blanc://tab-import/');
+      dom = await waitForTabImportDom(
+        (value) => value?.step === 'source' && value.sourceLabels.includes(fixture.sourceLabel),
+        `${fixture.sourceLabel} source button`,
+        fixture.timeout,
+      );
+    }
+    activeTabImportFixtureName = name;
+    if (dom.recoveryHidden) {
+      await clickTabImportSelector('.tab-import-source-btn', fixture.sourceLabel);
+      dom = await waitForTabImportDom(
+        (value) => value?.step === 'source' && value.recoveryHidden === false,
+        'tab-import verified quit gate',
+        fixture.timeout,
+      );
+    }
+    return dom;
+  }
+
+  async function renameTabImportGroup(from, to) {
+    const wc = getUtilitySheetWebContents();
+    if (!wc || wc.isDestroyed()) throw new Error('tab-import sheet is not open');
+    const changed = await wc.executeJavaScript(`(() => {
+      const input = [...document.querySelectorAll('.tab-import-group-name')]
+        .find((candidate) => candidate.value === ${JSON.stringify(String(from))});
+      if (!input) return false;
+      input.value = ${JSON.stringify(String(to))};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+    if (!changed) throw new Error(`review group not found: ${from}`);
+    return waitForTabImportDom(
+      (value) => value?.step === 'organize' && value.groupNames.includes(String(to)),
+      `organize group rename to ${to}`,
+    );
+  }
+
+  async function waitForTabImportProjection(candidateCount, timeout = 8_000) {
+    const deadline = Date.now() + timeout;
+    let last;
+    for (;;) {
+      last = projectRootTabImportSession();
+      if (!last?.error && last?.candidates?.length === candidateCount) return last;
+      if (Date.now() > deadline) {
+        throw new Error(`timed out waiting for tab-import projection; last: ${JSON.stringify(last)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  function tabImportApplyRequestFromProjection(projection) {
+    if (!projection || projection.error || !projection.proposal) {
+      throw new Error(`tab-import projection unavailable: ${JSON.stringify(projection)}`);
+    }
+    return {
+      generation: projection.generation,
+      groups: projection.proposal.groups.map((group) => ({
+        name: group.name,
+        candidateIds: [...group.candidateIds],
+      })),
+      ungroupedCandidateIds: [...projection.proposal.ungroupedCandidateIds],
+    };
+  }
+
+  globalThis.__blanc = {
+    blockingStatus() { return refs.blockingStatus(); },
+    blockingStatusInWindow(id) { return refs.runInWindowRuntime(id, () => refs.blockingStatus()); },
+    blockingMapping() { return refs.blockingMapping(); },
+    blockingOpen(tool) { return refs.blockingOpen(tool); },
+    blockingOpenInWindow(id, tool) { return refs.runInWindowRuntime(id, () => refs.blockingOpen(tool)); },
+    blockingRetry() { return refs.blockingRetry(); },
+    blockingExhaustRecovery() { return refs.blockingExhaustRecovery(); },
+    blockingStallAfterNextDecision(ms, options) { return refs.blockingStallAfterNextDecision(ms, options); },
+    blockingDecisionDeadline() { return refs.blockingDecisionDeadline(); },
+    blockingPopup() { return refs.blockingPopup({ right: 20 }); },
+    workspaceAction(action, ...args) { return refs.workspaceTestAction(action, args); },
+    // F45 Arc import: discovery platform, the stand-in for the file dialog,
+    // the read count and saved space records.
+    arcImport(action, ...args) { return refs.arcImportTest(action, args); },
+    // F49: the stand-in for the wallpaper file picker (null restores the dialog).
+    chooseWallpaperFile(file) { return refs.chooseWallpaperFileForTest(file); },
+    /** Run a script in the Bring Your Tabs sheet; refuses any other page. */
+    arcImportPage(script) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc || wc.isDestroyed()) return Promise.reject(new Error('tab-import sheet is not open'));
+      return wc.executeJavaScript(`(() => {
+        if (location.host !== 'tab-import') throw new Error('not the tab-import sheet');
+        return (${String(script)})();
+      })()`);
+    },
+    i18nState() { return refs.i18nState(); },
+    workspaceActionInWindow(id, action, ...args) { return refs.runInWindowRuntime(id, () => refs.workspaceTestAction(action, args)); },
+    workspacePageScript(id, script) { return tabs.get(id)?.view?.webContents?.executeJavaScript(script); },
+    workspacePageIdentity(id) { return tabs.get(id)?.view?.webContents?.id ?? null; },
+    // ---- state ----
+    windowRuntimes() { return windowRuntimeSnapshots(); },
+    openNewWindow() { return openNewWindowAction(); },
+    closeWindowRuntime(id) { return closeWindowRuntimeAction(String(id)); },
+    openTabInWindow(id, url, options) {
+      return openTabInWindowAction(String(id), String(url), options ?? {});
+    },
+    activateTabInWindow(runtimeId, tabId, focusContent = false) {
+      return refs.runInWindowRuntime(String(runtimeId), () => setActiveTab(String(tabId), { focusContent: !!focusContent }));
+    },
+    /** The Move Tab to New Window action; returns the tab's new window id. */
+    moveTabToNewWindow(id) {
+      moveTabToNewWindow(String(id));
+      return windowRuntimeSnapshots().find((runtime) => runtime.tabOrder.includes(String(id)))?.id ?? null;
+    },
+    createProfileWindow(name) { return createNamedLocalProfileWindow(String(name ?? '')); },
+    profiles() { return localProfileSnapshots(); },
+    renameProfile(id, name) {
+      return renameNamedLocalProfile(String(id), String(name ?? ''));
+    },
+    deleteProfile(id, confirmation) {
+      return deleteNamedLocalProfile(String(id), String(confirmation ?? ''));
+    },
+    profileBookmarkUrls(id) { return profileBookmarkUrls(String(id)); },
+    saveProfileFavorite(id, url, title) {
+      return saveProfileFavorite(String(id), String(url), String(title ?? url));
+    },
+    profileTabSession(id) { return profileTabSessionSnapshot(String(id)); },
+    startupReady() { return isSessionPersistenceReady(); },
+    browserCommandState() { return refs.browserCommandState(); },
+    /** The strip-reported island rect (window coords) — geometry only. Lets
+     * tests assert the morph/proximity anchor tracks the real pill (it went
+     * stale across window resizes when only a pill ResizeObserver fed it). */
+    islandRect() { const r = getIslandRect(); return r ? { ...r } : null; },
+    islandHoverRect() { const r = getIslandHoverRect(); return r ? { ...r } : null; },
+    islandHoverState() { return getIslandHoverState(); },
+    setIslandHoverOpen(on) { return setIslandHoverOpen(on); },
+    setIslandAutoHide(on) { return setIslandAutoHide(on === true); },
+    setIslandAutoHideStyle(style) { return setIslandAutoHideStyle(style); },
+    /** A floating Island view (auto-hide, float style): its native state, or
+     * null when the window has none for that role. */
+    floatViewState(role) { return getFloatViewState(String(role)); },
+    floatEval(role, script) {
+      const wc = getFloatWebContents(String(role));
+      if (!wc || wc.isDestroyed()) return null;
+      return wc.executeJavaScript(String(script));
+    },
+    sendFloatMouseInput(role, input) {
+      const wc = getFloatWebContents(String(role));
+      if (!wc || wc.isDestroyed()) return false;
+      wc.sendInputEvent(input);
+      return true;
+    },
+    tooltipViewState() { return getTooltipViewState(); },
+    glanceCardFocused() {
+      const wc = getGlanceCardWebContents();
+      return !!wc && !wc.isDestroyed() && wc.isFocused();
+    },
+    // Keys and pointer events to the floating Glance card's own document.
+    sendGlanceCardInput(input) {
+      const wc = getGlanceCardWebContents();
+      if (!wc || wc.isDestroyed()) return false;
+      wc.focus();
+      wc.sendInputEvent(input);
+      return true;
+    },
+    floatWebContentsIds(runtimeId) { return getFloatWebContentsIds(runtimeId == null ? null : String(runtimeId)); },
+    chromeSurfaceRegistered(webContentsId) { return isChromeSurfaceRegistered(Number(webContentsId)); },
+    /** The strip's own report of its Windows/Linux window buttons. */
+    chromeButtonRects() { return getChromeButtonRects(); },
+    /** The floating copies of the window controls and the menu button: each
+     * visible element's rect in window coordinates (x, y) and in its own
+     * view (viewX, viewY). */
+    async floatControlsState() {
+      const read = (role, script) => {
+        const wc = getFloatWebContents(role);
+        return wc && !wc.isDestroyed() ? wc.executeJavaScript(script) : null;
+      };
+      const measure = `(el) => {
+        const stage = document.getElementById('chrome').getBoundingClientRect();
+        const r = el.getBoundingClientRect();
+        return { x: r.left - stage.left, y: r.top - stage.top, viewX: r.left, viewY: r.top, width: r.width, height: r.height,
+          visible: getComputedStyle(el).visibility !== 'hidden' && r.width > 0 };
+      }`;
+      const [controls, menu] = await Promise.all([
+        read('controls', `(() => { const m = ${measure}; return [...document.querySelectorAll('#windowControls button')].map(m).filter((b) => b.visible); })()`),
+        read('menu', `(() => { const m = ${measure}; const b = document.getElementById('mainMenuButton'); return b && !b.hidden ? m(b) : null; })()`),
+      ]);
+      return { controls, menu };
+    },
+    mainWindowState() { return getMainWindowState(); },
+    restoreMainWindow() { return restoreMainWindow(); },
+    mainMenuRequests() { return getMainMenuRequests(); },
+    holdIslandInWindow(runtimeId, on) { return holdIslandInWindow(String(runtimeId), on === true); },
+    floatPillWebContentsId(runtimeId) { return floatPillWebContentsId(String(runtimeId)); },
+    focusWindowRuntime(runtimeId) { return focusWindowRuntime(String(runtimeId)); },
+    floatPillDiagnostics(runtimeId) { return floatPillDiagnostics(String(runtimeId)); },
+    chromeEval(script) {
+      const wc = getChromeWebContents();
+      if (!wc || wc.isDestroyed()) return null;
+      return wc.executeJavaScript(String(script));
+    },
+    /** Auto-hide state plus where the page view starts (0 = strip hidden). */
+    islandAutoHideState() { return getIslandAutoHideState(); },
+    overlayShowCount() { return getOverlayShowCount(); },
+    resetOverlayShowCount() { resetOverlayShowCount(); },
+    setTestCursorPoint(point) { return setTestCursorPoint(point); },
+    // Act as native Wayland does: no global pointer position to sample.
+    setCursorSamplingUnavailable(on) { return setTestCursorSamplingUnavailable(on); },
+    sendChromeMouseInput(input) {
+      const wc = getChromeWebContents();
+      if (!wc || wc.isDestroyed()) return false;
+      wc.sendInputEvent(input);
+      return true;
+    },
+    sendOverlayInput(input) {
+      const wc = getOverlayWebContents();
+      if (!wc || wc.isDestroyed()) return false;
+      wc.sendInputEvent(input);
+      return true;
+    },
+    // The strip document's top drag band: 'none' while it is not drawn,
+    // else its computed app-region.
+    async dragBandAppRegion() {
+      const wc = getChromeWebContents();
+      if (!wc || wc.isDestroyed()) return null;
+      return wc.executeJavaScript(`(() => {
+        const band = document.getElementById('dragBand');
+        if (!band) return null;
+        const style = getComputedStyle(band);
+        if (style.display === 'none') return 'none';
+        return style.getPropertyValue('-webkit-app-region') || style.appRegion;
+      })()`);
+    },
+    // The strip's window-drag region: the computed app-region of #strip.
+    async stripAppRegion() {
+      const wc = getChromeWebContents();
+      if (!wc || wc.isDestroyed()) return null;
+      return wc.executeJavaScript(`getComputedStyle(document.getElementById('strip')).getPropertyValue('-webkit-app-region') || getComputedStyle(document.getElementById('strip')).appRegion`);
+    },
+    async overlayPanelRect() {
+      const wc = getOverlayWebContents();
+      if (!wc || wc.isDestroyed()) return null;
+      return wc.executeJavaScript(`(() => {
+        const r = document.getElementById('islandPanel')?.getBoundingClientRect();
+        return r && r.width > 0 ? { left: r.left, top: r.top, right: r.right, bottom: r.bottom } : null;
+      })()`);
+    },
+    pinnedHome(tabId) { return tabs.get(String(tabId))?.pinnedHomeUrl ?? null; },
+    chooseSessionRecovery(choice) { return chooseSessionRecovery(String(choice)); },
+    sessionRecoveryState() { return getSessionRecoveryState(); },
+    selectTabRows(id, mode) { return selectTabRows(id, mode); },
+    selectedTabIds() { return getSelectedTabIds(); },
+    runSelectedTabsAction(action, args = {}) { return runTabsAction(action, args); },
+    state() {
+      const list = [];
+      for (const [id, t] of tabs) {
+        const wc = t.view?.webContents;
+        list.push({
+          id,
+          url: urlOf(t),
+          loadedUrl: committedUrlOf(t),
+          loading: isLoadingOf(t),
+          isLoading: !!t.isLoading,
+          title: t.title || '',
+          customTitle: t.customTitle ?? null,
+          favicon: t.favicon || null,
+          groupId: t.groupId ?? null,
+          splitId: t.splitId ?? null,
+          pinned: !!t.pinned,
+          // What the tab shows as muted, a site mute included (tab-audio.js
+          // shownMuted), and what its page's audio really is.
+          muted: !!(t.muted || (t.siteMuted && !t.siteUnmuted)),
+          audioMuted: liveContents(t)?.isAudioMuted?.() ?? null,
+          audible: !!t.audible,
+          // Projection of the one-time hidden-start autoplay guard; a visible
+          // pane must never carry it.
+          audioGuarded: !!t.backgroundAutoplayMuted,
+          canGoBack: !!t.canGoBack,
+          canGoForward: !!t.canGoForward,
+          private: !!t.private,
+          // This object is produced inside electronApp.evaluate(); a viewless
+          // tab must be observable rather than making every scenario throw.
+          asleep: !!t.asleep,
+          // Projection only — the capture record (anchors, counts) stays
+          // main-process-internal even here.
+          capture: t.capture ?? { audio: false, video: false },
+          webContentsId: wc?.id ?? null,
+          bounds: t.view ? t.view.getBounds() : null,
+          sessionKind: wc
+            ? (wc.session === getPrivateBrowsingSession() ? 'private' : 'default')
+            : null,
+          sessionPersistent: sessionPersistentOf(t),
+        });
+      }
+      return {
+        tabs: list,
+        tabOrder: [...getTabOrder()],
+        clusters: clusterSlots().map((slot) => ({
+          key: slot.key,
+          groupId: slot.group?.id ?? null,
+          tabIds: [...slot.tabIds],
+        })),
+        groups: getGroups().map((g) => ({ id: g.id, name: g.name, collapsed: !!g.collapsed, color: g.color ?? null })),
+        splits: getSplits().map((sp) => ({ id: sp.id, tabIds: [...sp.tabIds], layout: sp.layout, focusedIndex: sp.focusedIndex })),
+        activeTabId: getActiveTabId(),
+        glanceTabId: getGlanceTabId(),
+        focusedPaneTabId: getFocusedPaneTabId(),
+        glanceCard: getGlanceCard(),
+      };
+    },
+
+    // ---- tab / group actions ----
+    openTab(url, opts) {
+      const id = createTab(url, opts || {});
+      setActiveTab(id, { focusContent: false });
+      return id;
+    },
+    newTab() {
+      const id = createTab(newTabUrl());
+      setActiveTab(id, { focusContent: false });
+      return id;
+    },
+    duplicateActive() { duplicateTab(getActiveTabId()); },
+    pinTab(id) { toggleTabPinned(id); },
+    returnPinnedHome(id) { return pinnedHomeActions().returnPinnedHome(String(id)); },
+    setPinnedHome(id) { return pinnedHomeActions().setPinnedHome(String(id)); },
+    goBack(id) { return goBack(String(id)); },
+    muteTab(id) { toggleTabMuted(id); },
+    closeTab(id) { closeTab(id); },
+    reopenClosed() { reopenClosedTab(); },
+    setGlance(id) { return setGlanceTab(id); },
+    // ---- Split View (F53) ----
+    makeSplit(initiatorId, otherIds) { return createSplitFromTabs(initiatorId, otherIds)?.id ?? null; },
+    splitLayout() { return splitLayoutForTest(); },
+    splitCornerTabs() { return splitCornerTabsForTest(); },
+    clickSplitCorner(tabId, part) { return clickSplitCornerForTest(tabId, part); },
+    raiseTabView(tabId) { return raiseTabViewForTest(tabId); },
+    keepGlanceAsSplit() { return keepGlanceAsSplit()?.id ?? null; },
+    /** A tab-menu item as a click runs it: the real dispatcher and actions. */
+    runTabMenuItem(tabId, itemId, extra = {}) {
+      const { runTabContextMenuItem } = require('./tab-context-menu');
+      return runTabContextMenuItem(itemId, { tab: { id: tabId, url: tabs.get(tabId)?.url }, ...extra, actions: menuContextActionsForTest() });
+    },
+    closedEntrySummaries() { return closedEntrySummaries(); },
+    /** One tab-menu item's label and state, as a right-click on its row shows it. */
+    tabMenuItem(tabId, itemId) {
+      const item = tabMenuItemsForTest(String(tabId))?.find((entry) => entry.id === itemId);
+      return item ? { label: item.label, enabled: item.enabled !== false } : null;
+    },
+    moveGroupToNewWindow(groupId) { return !!moveGroupToNewWindowForTest(groupId); },
+    // Move Group to Space ▸ (D8): the menu's actions, by group name.
+    moveGroupToSpaceByName(name, workspaceId) {
+      const group = getGroups().find((g) => sameGroupName(g.name, name));
+      return group ? moveGroupToSpaceForTest(group.id, workspaceId) : null;
+    },
+    beginNewSpaceForGroupByName(name) {
+      const group = getGroups().find((g) => sameGroupName(g.name, name));
+      return group ? beginNewSpaceForGroupForTest(group.id) : false;
+    },
+    straySplitIds() { return straySplitIds(); },
+    windowChildViewCount() { return windowChildViewCount(); },
+    attachedTabViewIds() { return attachedTabViewIds(); },
+    /** Give a pane keyboard focus, as a click into it does. */
+    focusPane(id) {
+      const wc = liveContents(tabs.get(id));
+      if (!wc) return false;
+      wc.focus();
+      return true;
+    },
+    closeGlance() { return closeGlanceAction({ focusContent: false }); },
+    openGlanceAsTab() { return openGlanceAsTabAction(); },
+    resetGlanceCard() { return resetGlanceCardFrame(); },
+    getGlanceCard() { return getGlanceCard(); },
+    setWindowGlance(runtimeId, tabId) {
+      return setGlanceTabInWindow(String(runtimeId), String(tabId));
+    },
+    closeWindowGlance(runtimeId) { return closeGlanceInWindow(String(runtimeId)); },
+    // A window's first Glance layout, before its own strip has measured the
+    // Island: size the window, open Glance there and read the geometry in the
+    // same turn, ahead of any report from that strip.
+    async firstGlanceLayoutInWindow(runtimeId, tabId, width) {
+      return refs.runInWindowRuntime(String(runtimeId), async () => {
+        setWindowContentSize(Number(width), 800);
+        await setGlanceTab(String(tabId));
+        return getGlanceCard();
+      });
+    },
+    closeTabInWindow(runtimeId, tabId) {
+      return closeTabInWindowAction(String(runtimeId), String(tabId));
+    },
+    reopenClosedInWindow(runtimeId) { return reopenClosedTabInWindow(String(runtimeId)); },
+    groupActiveByName(name) { groupTabByName(getActiveTabId(), name); },
+    groupTabByName(id, name) { groupTabByName(id, name); },
+    renameTab(id, name) { renameTab(id, name); },
+    beginRenameTab(id) { beginRenameTab(id); },
+    beginRenameDeviceByName(name) {
+      const device = shownInjectedDevices().find((d) => d.name === name);
+      if (device) beginRenameDevice(device.deviceId);
+      return !!device;
+    },
+    beginRenameGroupByName(name) {
+      const group = getGroups().find((g) => sameGroupName(g.name, name));
+      if (group) beginRenameGroup(group.id);
+      return !!group;
+    },
+    // Tab menu additions (spec 2026-10-17-tab-menu-additions-design.md).
+    newTabBelow(id) { return newTabBelow(id); },
+    closeTabsBeside(id, direction) { closeTabsBeside(id, direction); return true; },
+    toggleSiteMute(id) { return toggleSiteMute(id); },
+    setGroupColorByName(name, color) {
+      const group = getGroups().find((g) => sameGroupName(g.name, name));
+      return group ? setGroupColor(group.id, color).ok : false;
+    },
+    ungroupGroupByName(name) {
+      const group = getGroups().find((g) => sameGroupName(g.name, name));
+      if (group) ungroupGroup(group.id);
+      return !!group;
+    },
+    activateTab(id, focusContent = false) { setActiveTab(id, { focusContent: !!focusContent }); },
+    focusTabContents(id) {
+      const tab = tabs.get(id);
+      const wc = tab?.view?.webContents;
+      if (!wc || wc.isDestroyed()) return false;
+      wc.focus();
+      return true;
+    },
+    // Fire the webContents event the autoplay guard listens to, without a
+    // media element: the guard's decision is what is under test.
+    simulateMediaStarted(id) {
+      const wc = liveContents(tabs.get(id));
+      if (!wc || wc.isDestroyed()) return false;
+      wc.emit('media-started-playing');
+      return true;
+    },
+    tabBounds(id) {
+      const tab = tabs.get(id);
+      return tab?.view ? tab.view.getBounds() : null;
+    },
+    // On macOS a tab view detached while it had focus (an inactive tab) can
+    // keep reporting isFocused(), and getFocusedWebContents() returns the
+    // first contents that does. Only contents on screen in the focused window
+    // can hold the keyboard, so those are asked first.
+    focusedWebContentsId() {
+      const window = BrowserWindow.getFocusedWindow();
+      const onScreen = window && !window.isDestroyed()
+        ? [window.webContents, ...window.contentView.children
+          .filter((view) => view.getVisible?.() !== false)
+          .map((view) => view.webContents)]
+        : [];
+      const focused = onScreen.find((contents) => contents && !contents.isDestroyed() && contents.isFocused());
+      return (focused ?? webContents.getFocusedWebContents())?.id ?? null;
+    },
+    zoomLevel(tabId) { return liveContents(tabs.get(tabId))?.getZoomLevel() ?? null; },
+    zoomMode(tabId) { return liveContents(tabs.get(tabId))?.getZoomMode() ?? null; },
+    zoomPercent(tabId) {
+      const level = liveContents(tabs.get(tabId))?.getZoomLevel();
+      return typeof level === 'number' ? levelToPercent(level) : null;
+    },
+    /** What the page is really drawn at, not what Electron reports: in manual
+     * mode a level reads back without the page changing. */
+    async drawnZoomPercent(tabId) {
+      const tab = tabs.get(tabId);
+      const wc = liveContents(tab);
+      if (!wc) return null;
+      return Math.round(100 * tab.view.getBounds().width / await wc.executeJavaScript('innerWidth'));
+    },
+    tabUrl(tabId) { return liveContents(tabs.get(tabId))?.getURL() ?? null; },
+    pageZoom() { return settings.getSettings().pageZoom; },
+    setPageZoom(percent) { return settings.setSettings({ pageZoom: percent }).pageZoom; },
+    siteZoomSites() { return siteZoom.sites(); },
+    clearSiteZoom() { siteZoom.clearSites(); },
+    /** Hosts in Chromium's saved per-host zoom for the Personal session. */
+    chromiumZoomHosts() {
+      const file = path.join(session.defaultSession.getStoragePath(), 'Preferences');
+      const partitions = JSON.parse(fs.readFileSync(file, 'utf8')).partition?.per_host_zoom_levels ?? {};
+      return Object.values(partitions).flatMap((hosts) => Object.keys(hosts));
+    },
+    // A real mouse click on an element of a tab's page, so the page's own
+    // target=_blank / modifier handling decides the window-open disposition.
+    async clickInTab(tabId, selector, modifiers = []) {
+      const wc = liveContents(tabs.get(tabId));
+      if (!wc) return false;
+      const point = await wc.executeJavaScript(`(() => {
+        const rect = document.querySelector(${JSON.stringify(String(selector))})?.getBoundingClientRect();
+        return rect ? { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) } : null;
+      })()`);
+      if (!point) return false;
+      wc.focus();
+      const input = { ...point, button: 'left', clickCount: 1, modifiers: [...modifiers] };
+      wc.sendInputEvent({ ...input, type: 'mouseDown' });
+      wc.sendInputEvent({ ...input, type: 'mouseUp' });
+      return true;
+    },
+    // A browser command as a person presses it with this tab's page focused.
+    // Windows/Linux: the key reaches the page and main's before-input-event
+    // routes it by sender. macOS: the native menu item handles the key and
+    // carries no sender, so the focused pane decides — callers establish it
+    // first. Zoom and print exist only as menu items on every platform.
+    pressBrowserCommand(tabId, commandId) {
+      const wc = liveContents(tabs.get(tabId));
+      if (!wc) return false;
+      const menuOnly = { 'zoom-in': 'zoom-in', 'zoom-out': 'zoom-out', 'zoom-reset': 'zoom-reset' };
+      if (process.platform === 'darwin' || menuOnly[commandId]) {
+        const itemId = menuOnly[commandId] ?? `browser-${commandId}`;
+        const item = Menu.getApplicationMenu()?.getMenuItemById(itemId);
+        if (!item) throw new Error(`no menu item ${itemId}`);
+        item.click();
+        return true;
+      }
+      const keys = {
+        reload: ['R', ['control']], 'hard-reload': ['R', ['control', 'shift']],
+        'close-tab': ['W', ['control']], find: ['F', ['control']],
+        back: ['Left', ['alt']], forward: ['Right', ['alt']], 'new-tab': ['T', ['control']],
+      };
+      if (!keys[commandId]) throw new Error(`no key for ${commandId}`);
+      const [keyCode, modifiers] = keys[commandId];
+      wc.focus();
+      wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
+      wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+      return true;
+    },
+    railActivationSerial() { return getRailActivationSerial(); },
+    toggleGroup(id) { toggleGroupCollapsed(id); },
+    moveTab(id, target) { return moveTabTo(id, target); },
+    reorderGroup(id, beforeGroupId) { return reorderGroupBefore(id, beforeGroupId); },
+    overlayDragging() { return getOverlayDragging(); },
+    // The function the Cmd/Ctrl+1–9 menu items call.
+    selectTabAtIndex(index) { selectTabAtIndex(index); },
+    setTabPresentation(id, patch = {}) {
+      const tab = tabs.get(id);
+      if (!tab) return false;
+      if (typeof patch.title === 'string') tab.title = patch.title;
+      if (typeof patch.favicon === 'string' || patch.favicon === null) tab.favicon = patch.favicon;
+      if (typeof patch.isLoading === 'boolean') tab.isLoading = patch.isLoading;
+      if (typeof patch.audible === 'boolean') tab.audible = patch.audible;
+      if (Number.isInteger(patch.blockedCount) && patch.blockedCount >= 0) tab.blockedCount = patch.blockedCount;
+      if (typeof patch.muted === 'boolean') {
+        tab.muted = patch.muted;
+        tab.view?.webContents?.setAudioMuted(patch.muted);
+      }
+      broadcastTabs();
+      return true;
+    },
+    async navigateTab(id, url) {
+      const tab = tabs.get(id);
+      if (!tab?.view?.webContents) return false;
+      return refs.navigateTabToAddress(id, String(url));
+    },
+    continueUnsafeInTab(id) {
+      const wc = tabs.get(id)?.view?.webContents;
+      return wc ? refs.continueUnsafeForSender(wc) : { ok: false, error: 'no-tab' };
+    },
+    forgetCertificateExceptionInTab(id) {
+      setActiveTab(id, { focusContent: false });
+      return refs.forgetActiveCertificateException();
+    },
+    forgetCertificateExceptionOnly(id) {
+      const tab = tabs.get(id);
+      const wc = tab?.view?.webContents;
+      const origin = tab?.documentCertificateException?.origin;
+      if (!wc || !origin) return false;
+      const forgotten = refs.certificateExceptions.forget(wc.session, origin);
+      return wc.session.closeAllConnections().then(() => forgotten);
+    },
+    setCertificateExceptionCap(n) { refs.certificateExceptions.setCapForTest(Number(n)); },
+    resetCertificateExceptionsForTest() {
+      for (const tab of tabs.values()) {
+        const wc = tab.view?.webContents;
+        if (wc) refs.certificateExceptions.clear(wc.session);
+      }
+      refs.certificateExceptions.setCapForTest(64);
+    },
+    tabWebContentsId(id) { return tabs.get(id)?.view?.webContents?.id ?? null; },
+    executeTab(id, source) {
+      const tab = tabs.get(id);
+      if (!tab?.view?.webContents) return null;
+      return tab.view.webContents.executeJavaScript(String(source));
+    },
+    tabNavigation(id) {
+      const tab = tabs.get(id);
+      const history = tab?.view?.webContents?.navigationHistory;
+      if (!history) return null;
+      return {
+        entries: history.getAllEntries().map((entry) => ({ url: entry.url, title: entry.title })),
+        activeIndex: history.getActiveIndex(),
+      };
+    },
+    tabListenerState(id) {
+      const wc = tabs.get(id)?.view?.webContents;
+      if (!wc || wc.isDestroyed()) return null;
+      return {
+        didNavigate: wc.listenerCount('did-navigate'),
+        title: wc.listenerCount('page-title-updated'),
+        input: wc.listenerCount('before-input-event'),
+      };
+    },
+    armBeforeUnloadObjection(id) {
+      const wc = tabs.get(id)?.view?.webContents;
+      if (!wc || wc.isDestroyed()) return false;
+      const originalClose = wc.close;
+      const probe = { prevented: false, fired: false };
+      beforeUnloadProbes.set(id, probe);
+      wc.close = function acceptanceBeforeUnloadClose() {
+        wc.close = originalClose;
+        queueMicrotask(() => {
+          probe.fired = true;
+          wc.emit('will-prevent-unload', {
+            preventDefault() { probe.prevented = true; },
+          });
+        });
+      };
+      return true;
+    },
+    beforeUnloadProbe(id) { return beforeUnloadProbes.get(id) ?? null; },
+    closeTabsInGroupName(name) {
+      const g = getGroups().find((x) => sameGroupName(x.name, name));
+      if (!g) return;
+      for (const [id, t] of tabs) if (t.groupId === g.id) closeTab(id);
+    },
+    // The atomic single-entry group close (F2-6) — distinct from
+    // closeTabsInGroupName above, which models per-tab user closes.
+    closeGroupByName(name) {
+      const g = getGroups().find((x) => sameGroupName(x.name, name));
+      if (g) closeGroup(g.id);
+    },
+    // Redacted closed-entry projection for the harness: tier facts only,
+    // never snapshots, seeds, or view references (spec §4.1 discipline).
+    closedEntriesSummary() {
+      return getClosedEntries().map((entry) => ({
+        id: entry.id,
+        kind: entry.kind,
+        url: entry.kind === 'group' ? null : entry.url,
+        held: !!entry.view,
+        tabCount: entry.kind === 'group' ? entry.tabs.length : 1,
+      }));
+    },
+
+    // ---- favorites (bookmarks store) ----
+    favoriteActive() {
+      const t = tabs.get(getActiveTabId());
+      if (!t) return;
+      // Favorite the tab MODEL's url — what the real app's favorite action uses
+      // and what state()/the F9 wait observe — so the wait and the action agree
+      // (getURL() lags until navigation commits, which made this race/flake).
+      const url = urlOf(t);
+      if (!bookmarks.isBookmarked(url)) bookmarks.toggleBookmark(url, t.title || url);
+    },
+    favoriteAllTabs() {
+      for (const t of tabs.values()) {
+        const url = urlOf(t);
+        if (/^https?:/.test(url) && !bookmarks.isBookmarked(url)) {
+          bookmarks.toggleBookmark(url, titleOf(t) || url);
+        }
+      }
+    },
+    activeFavorited() { const t = tabs.get(getActiveTabId()); return !!t && bookmarks.isBookmarked(urlOf(t)); },
+    bookmarkUrls() { return bookmarks.listBookmarks().map((b) => b.url); },
+    bookmarkRecords() {
+      return bookmarks.listBookmarks().map(({ url, title, folder }) => ({ url, title, folder }));
+    },
+
+    // ---- history store ----
+    seedHistory() { history.addVisit('http://seed.local/', 'Seed'); },
+    async seedBillboardHistory() {
+      const current = tabs.get(getActiveTabId());
+      await current?.view?.webContents?.session.clearStorageData({
+        origin: 'blanc://newtab',
+        storages: ['localstorage'],
+      });
+      for (const [url, title] of [
+        ['https://youtube.com/watch?v=one', 'YouTube – videos worth watching'],
+        ['https://cnet.com/article/one', 'CNET – technology news and reviews'],
+        ['https://youtube.com/watch?v=two', 'YouTube – videos worth watching'],
+        ['https://scrollapp.co/', 'Scroll – creative work, beautifully organized'],
+        ['https://cnet.com/article/two', 'CNET – technology news and reviews'],
+        ['https://youtube.com/watch?v=three', 'YouTube – videos worth watching'],
+        ['https://developer.mozilla.org/docs', 'MDN Web Docs'],
+        ['https://nintendo.com/', 'Nintendo – Official Site'],
+        ['https://blanc.day/', 'Blanc Browser – browse without the baggage'],
+      ]) history.addVisit(url, title);
+      for (const [url, file] of [
+        ['https://youtube.com/', ['favicons', 'youtube.com.ico']],
+        ['https://cnet.com/', ['favicons', 'cnet.com.ico']],
+        ['https://scrollapp.co/', ['favicons', 'scrollapp.co.ico']],
+        ['https://developer.mozilla.org/', ['favicons', 'developer.mozilla.org.ico']],
+        ['https://nintendo.com/', ['favicons', 'nintendo.com.ico']],
+        ['https://blanc.day/', ['favicon-32x32.png']],
+      ]) {
+        const source = path.join(app.getAppPath(), 'site', 'public', ...file);
+        const png = nativeImage.createFromPath(source)
+          .resize({ width: 32, height: 32, quality: 'best' })
+          .toPNG();
+        history.cacheSiteIcon(url, `data:image/png;base64,${png.toString('base64')}`);
+      }
+      return history.listTopSites({ limit: 6 });
+    },
+    seedBillboardOverflowHistory() {
+      history.clearHistory();
+      // Different visit counts make the sixty-host order deterministic even
+      // when this tight fixture loop produces identical Date.now() values.
+      for (let index = 0; index < 60; index++) {
+        const key = `site-${String(index).padStart(2, '0')}.example`;
+        for (let visit = 0; visit < 60 - index; visit++) {
+          history.addVisit(`https://${key}/${visit}`, `Site ${index}`);
+        }
+      }
+      return history.listTopSites({ limit: 48 }).map((site) => site.key);
+    },
+    clearHistory() { history.clearHistory(); archive.clearArchive(); },
+    historyCount() { return history.listHistory({ limit: 5000 }).length; },
+
+    // ---- 1Password fill capsule + hint (macOS-only; null off-platform) ----
+    setOnePasswordConfig(enabled, account) {
+      settings.setSettings({ onePasswordEnabled: !!enabled, onePasswordAccount: String(account ?? '') });
+      return settings.getSettings().onePasswordEnabled;
+    },
+    onePasswordTarget() { return onePasswordTargetForTest?.() ?? null; },
+    showFillStatus(kind) { return showFillStatusForTest?.(String(kind)) ?? null; },
+    fillStatusState() { return fillStatusState?.() ?? null; },
+    readFillStatusDom(script) { return readFillStatusDom?.(script) ?? null; },
+
+    // ---- settings ----
+    setAdblock(on) { settings.setSettings({ adblockEnabled: !!on }); },
+    setIslandTabIcons(on) { return settings.setSettings({ islandTabIcons: !!on }).islandTabIcons; },
+    // Mini Window (#1138).
+    openMiniWindow() { return miniWindowTest.open(); },
+    keepMiniWindow(id) { return miniWindowTest.keep(id); },
+    expireMiniWindow(id) { return miniWindowTest.expire(id); },
+    miniWindowState(id) { return miniWindowTest.state(id); },
+    miniWindowChip(id, options) { return miniWindowTest.chip(id, options); },
+    setMiniWindowShortcut(id) {
+      const saved = settings.setSettings({ miniWindowShortcut: id }).miniWindowShortcut;
+      return { saved, status: miniWindowTest.shortcutStatus() };
+    },
+    setIslandSize(size) { return settings.setSettings({ islandSize: size }).islandSize; },
+    // The launch Sunrise plays once per launch; acceptance rearms that launch.
+    setLaunchSunrise(on) {
+      const saved = settings.setSettings({ launchSunrise: !!on }).launchSunrise;
+      rearmLaunchSunrise();
+      return saved;
+    },
+    setTabSwitchOrder(order) { settings.setSettings({ tabSwitchOrder: order }); return settings.getSettings().tabSwitchOrder; },
+    async probeOnePasswordUtilityProcess() {
+      const result = await probeOnePasswordPackage();
+      return {
+        ...result,
+        processCount: app.getAppMetrics()
+          .filter((metric) => metric.name === 'Spatial Credential Broker').length,
+      };
+    },
+    // The REAL handler body from main.js, not a copy of it — a mirror here
+    // would keep the suite green even with the shipping handler reverted to
+    // the bare global toggle this whole change exists to fix.
+    toggleAdblock() { return runBlockAdsCommand(); },
+    adblockEnabled() { return settings.getSettings().adblockEnabled; },
+    setHomePage(url) { settings.setSettings({ homePage: url }); },
+    setQuietTabs(value) { settings.setSettings({ tabSleep: value }); return settings.getSettings().tabSleep; },
+    residentSpaces() { return getResidentSpaces(); },
+    roomPass() { return getRoomPass(); },
+    raceSwitchBackDuringQuiet(workspaceId) { return raceSwitchBackDuringQuiet(workspaceId); },
+    setSearchEngine(x) { settings.setSettings({ searchEngine: x }); },
+    searchEngine() { return settings.getSettings().searchEngine; },
+    setCustomSearchEngine(template) {
+      return settings.setSettings({ searchEngine: 'custom', searchEngineTemplate: template }).searchEngine;
+    },
+    setSearchSuggestions(on) { settings.setSettings({ searchSuggestions: !!on }); },
+    setBangsEnabled(on) { settings.setSettings({ bangsEnabled: !!on }); },
+    setCustomBangs(list) { return settings.setSettings({ customBangs: list }).customBangs; },
+    recentBangs() { return settings.getSettings().recentBangs; },
+    // Blanc's icon server for bang rows, stubbed per host: 'png' answers a
+    // real 1×1 PNG (converted to the stored 32px icon), 'not-found' a 404,
+    // anything else fails. Test mode never reaches the network.
+    stubBangIconServer(map) {
+      const png = nativeImage.createFromDataURL(TEST_BANG_ICON_PNG).toPNG();
+      bangIcons.setFetcherForTest(async (url) => {
+        const answer = map?.[url.split('/').pop()];
+        if (answer === 'png') return { contentType: 'image/png', bytes: png };
+        if (answer === 'not-found') return { status: 404 };
+        return null;
+      });
+    },
+    bangIconRequests() { return bangIcons.requestedHosts(); },
+    bangIconStore() { return bangIcons.storedHostsForTest(); },
+    setUsagePing(on) { settings.setSettings({ usagePing: !!on }); },
+    searchSuggestions() { return settings.getSettings().searchSuggestions; },
+    settingsSyncValues() { return settings.exportForSync().values; },
+    darkWebsitesSettings() {
+      const { darkWebsites, darkWebsitesExceptions } = settings.getSettings();
+      return { darkWebsites, darkWebsitesExceptions };
+    },
+    setMouseGestures(enabled, mapping) {
+      const partial = { mouseGesturesEnabled: !!enabled };
+      if (mapping !== undefined) partial.mouseGestureMapping = mapping;
+      settings.setSettings(partial);
+      const current = settings.getSettings();
+      return { enabled: current.mouseGesturesEnabled, mapping: current.mouseGestureMapping };
+    },
+    sendMouseInput(tabId, input) {
+      const wc = tabs.get(tabId)?.view?.webContents;
+      if (!wc || wc.isDestroyed()) return false;
+      wc.focus();
+      wc.sendInputEvent(input);
+      return true;
+    },
+    tabSleep() { return settings.getSettings().tabSleep; },
+    setTabSleep(value) { return settings.setSettings({ tabSleep: value }).tabSleep; },
+    tabLayout() { return settings.getSettings().tabLayout; },
+    setTabLayout(layout) { return setTabLayout(layout); },
+    setAppearance(theme) { return settings.setSettings({ theme }).theme; },
+    setNewtabDynamicWallpaper(on) { return settings.setSettings({ newtabDynamicWallpaper: !!on }).newtabDynamicWallpaper; },
+    newtabLayout() { return settings.getSettings().newtabLayout; },
+    setNewtabLayout(layout) { return settings.setSettings({ newtabLayout: layout }).newtabLayout; },
+    readNewtabLayoutDom() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      return tab.view.webContents.executeJavaScript(`(() => ({
+        layout: document.body.dataset.layout ?? null,
+        active: document.querySelector('[data-layout-pick].active')?.dataset.layoutPick ?? null,
+        // The active layout root is the one whose computed display isn't none.
+        visible: ['Ledger', 'Billboard', 'Shelf', 'Tally']
+          .filter((name) => getComputedStyle(document.getElementById('layout' + name)).display !== 'none'),
+      }))()`);
+    },
+    // The launch Sunrise on the active Start Page: absent once it has ended
+    // (or was never due), else whether it shows and how far it has got.
+    readLaunchSunrise() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const scene = document.getElementById('launchSunrise');
+        if (!scene) return { present: false, layoutReady: document.body.classList.contains('layout-ready') };
+        const style = getComputedStyle(scene);
+        return {
+          present: true,
+          shown: !scene.hidden && style.display !== 'none',
+          pointerEvents: style.pointerEvents,
+          animations: scene.getAnimations({ subtree: true }).map((animation) => animation.animationName).sort(),
+          layoutReady: document.body.classList.contains('layout-ready'),
+        };
+      })()`);
+    },
+    readMigrationChecklistDom() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const shell = document.getElementById('migrationChecklistShell');
+        const popover = document.getElementById('migrationChecklist');
+        const sync = document.getElementById('migrationSyncTask');
+        const tabs = document.getElementById('migrationTabsTask');
+        const space = document.getElementById('migrationSpaceTask');
+        const bounds = (element) => {
+          if (!element || getComputedStyle(element).display === 'none') return null;
+          const rect = element.getBoundingClientRect();
+          return { top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left,
+            width: rect.width, height: rect.height };
+        };
+        return {
+          count: shell ? 1 : 0,
+          visible: !!shell && !shell.hidden && getComputedStyle(shell).display !== 'none',
+          open: !!popover && popover.matches(':popover-open'),
+          progress: shell?.querySelector('.js-migration-progress')?.textContent ?? null,
+          label: document.getElementById('migrationChecklistLabel')?.textContent ?? null,
+          title: document.getElementById('migrationChecklistTitle')?.textContent ?? null,
+          syncComplete: sync?.classList.contains('is-complete') ?? false,
+          tabsComplete: tabs?.classList.contains('is-complete') ?? false,
+          spaceComplete: space?.classList.contains('is-complete') ?? false,
+          expanded: document.getElementById('migrationChecklistCompact')?.getAttribute('aria-expanded') === 'true',
+          focused: document.hasFocus(),
+          focusedId: document.activeElement?.id ?? null,
+          layout: document.body.dataset.layout ?? null,
+          shellBounds: bounds(shell),
+          popoverBounds: popover?.matches(':popover-open') ? bounds(popover) : null,
+          footerBounds: bounds(document.getElementById('layoutFooter')),
+          customizeBounds: bounds(document.getElementById('customizeButton')),
+          hideBounds: bounds(document.getElementById('migrationChecklistHide')),
+          pillInFooterLeft: !!shell?.closest('#layoutFooter .footer-left'),
+          viewportWidth: innerWidth,
+        };
+      })()`);
+    },
+    // F35-10/11/12/13: one read of the frame — footer checklist pill, active
+    // layout content, footer, Patron slot and empty hints — so scenarios can
+    // prove "nothing covers content" without per-layout selectors.
+    readStartFrameGeometry() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const rect = (element) => {
+          if (!element) return null;
+          const style = getComputedStyle(element);
+          if (style.display === 'none' || style.visibility === 'hidden') return null;
+          const r = element.getBoundingClientRect();
+          if (!r.width || !r.height) return null;
+          return { top: r.top, right: r.right, bottom: r.bottom, left: r.left, width: r.width, height: r.height };
+        };
+        const layout = document.body.dataset.layout;
+        const name = layout.charAt(0).toUpperCase() + layout.slice(1);
+        const rootEl = document.getElementById('layout' + name);
+        const shellEl = document.getElementById('migrationChecklistShell');
+        const shell = shellEl && !shellEl.hidden ? rect(shellEl) : null;
+        const content = [...rootEl.querySelectorAll('a, button, h2, .ledger-label, .shelf-card, .tally-chart, .tally-caption, .bb-clock, .bb-blocked, .start-empty-hint')]
+          .map((element) => ({ selector: element.id ? '#' + element.id : element.className || element.tagName, rect: rect(element) }))
+          .filter((entry) => entry.rect);
+        const patron = document.getElementById('patronCallout');
+        const footerLeft = document.querySelector('#layoutFooter .footer-left');
+        const root = document.documentElement;
+        return {
+          layout,
+          private: document.documentElement.dataset.theme === 'private',
+          viewportWidth: innerWidth,
+          viewportHeight: innerHeight,
+          maxScrollY: Math.max(0, Math.max(root.scrollHeight, document.body.scrollHeight) - innerHeight),
+          shell,
+          content,
+          footer: rect(document.getElementById('layoutFooter')),
+          patronInLayout: !!rootEl.querySelector('.js-patron-callout'),
+          patronInFooterLeft: !!patron && patron.parentElement === footerLeft,
+          patronVisible: !!patron && !patron.hidden && !!rect(patron),
+          patron: patron && !patron.hidden ? rect(patron) : null,
+          emptyHints: [...rootEl.querySelectorAll('.start-empty-hint')].filter((element) => rect(element)).length,
+        };
+      })()`);
+    },
+    // F35-10: one read of the footer's three groups, with the blocked count
+    // forced to a long worst case, so a scenario can sweep widths.
+    readStartFooterLayout(blockedText) {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        if (${JSON.stringify(blockedText ?? null)} !== null) {
+          document.getElementById('footerLeft').textContent = ${JSON.stringify(blockedText ?? '')};
+        }
+        const box = (selector) => {
+          const element = document.querySelector(selector);
+          if (!element || element.hidden || getComputedStyle(element).display === 'none') return null;
+          const r = element.getBoundingClientRect();
+          return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height };
+        };
+        const items = [...document.querySelectorAll('#layoutFooter .footer-left > *')]
+          .filter((element) => !element.hidden && getComputedStyle(element).display !== 'none' && element.getBoundingClientRect().width > 0)
+          .map((element) => element.getBoundingClientRect());
+        const centres = items.map((r) => Math.round((r.top + r.bottom) / 2));
+        return {
+          layout: document.body.dataset.layout,
+          viewportWidth: innerWidth,
+          leftOnOneLine: centres.every((centre) => Math.abs(centre - centres[0]) <= 4),
+          left: box('#layoutFooter .footer-left'),
+          customize: box('#customizeButton'),
+          right: box('#layoutFooter .footer-right'),
+          footer: box('#layoutFooter'),
+        };
+      })()`);
+    },
+    // F35-18: the Billboard's visible content block against the open area
+    // between the window top and the fixed footer.
+    readBillboardVerticalBox() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const shown = [...document.getElementById('layoutBillboard').children].filter((element) => {
+          const style = getComputedStyle(element);
+          const box = element.getBoundingClientRect();
+          return !element.hidden && style.display !== 'none' && style.position !== 'absolute' && box.height > 1;
+        });
+        if (!shown.length) return null;
+        const top = Math.min(...shown.map((element) => element.getBoundingClientRect().top));
+        const bottom = Math.max(...shown.map((element) => element.getBoundingClientRect().bottom));
+        const footerTop = document.getElementById('layoutFooter').getBoundingClientRect().top;
+        const headerBottom = document.querySelector('.start-header').getBoundingClientRect().bottom;
+        const round = (value) => Math.round(value * 10) / 10;
+        return {
+          layout: document.body.dataset.layout,
+          viewportWidth: innerWidth,
+          headerBottom: round(headerBottom),
+          contentTop: round(top),
+          above: round(top),
+          below: round(footerTop - bottom),
+          parts: shown.map((element) => element.id || element.className),
+        };
+      })()`);
+    },
+    readStartBlockedCard() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const card = document.getElementById('shBlocked')?.closest('.shelf-card');
+        return !!card && !card.hidden && getComputedStyle(card).display !== 'none';
+      })()`);
+    },
+    readShelfGeometry() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const rect = (element) => {
+          if (!element || element.hidden || getComputedStyle(element).display === 'none') return null;
+          const r = element.getBoundingClientRect();
+          return { left: Math.round(r.left), right: Math.round(r.right), top: Math.round(r.top), bottom: Math.round(r.bottom) };
+        };
+        return {
+          columns: document.getElementById('layoutShelf').dataset.columns ?? null,
+          viewportWidth: innerWidth,
+          tiles: [...document.querySelectorAll('#shFavorites .shelf-tile')].map(rect).filter(Boolean),
+          groups: rect(document.querySelector('.shelf-card-groups')),
+          blocked: rect(document.querySelector('.shelf-card-blocked')),
+        };
+      })()`);
+    },
+    readTallyGeometry() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const rect = (element) => {
+          if (!element || element.hidden || getComputedStyle(element).display === 'none') return null;
+          const r = element.getBoundingClientRect();
+          return { left: Math.round(r.left), right: Math.round(r.right), top: Math.round(r.top), bottom: Math.round(r.bottom), width: Math.round(r.width) };
+        };
+        return {
+          viewportWidth: innerWidth,
+          private: document.documentElement.dataset.theme === 'private',
+          content: rect(document.getElementById('startContent')),
+          left: rect(document.querySelector('.tally-left')),
+          right: rect(document.querySelector('.tally-right')),
+        };
+      })()`);
+    },
+    clickMigrationChecklist(action) {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return false;
+      const ids = {
+        sync: 'migrationSyncAction',
+        tabs: 'migrationTabsAction',
+        space: 'migrationSpaceAction',
+        iphone: 'migrationIphoneAction',
+        hide: 'migrationChecklistHide',
+        compact: 'migrationChecklistCompact',
+      };
+      const id = ids[action];
+      if (!id) return false;
+      // Tasks live in the pill's popover, so reach them the way a person
+      // does: open the popover from the pill, then click a task that is
+      // actually rendered. A popover that fails to open fails the step.
+      const inPopover = action === 'sync' || action === 'tabs' || action === 'space';
+      return wc.executeJavaScript(`(() => {
+        const btn = document.getElementById('${id}');
+        if (!btn) return false;
+        if (${inPopover}) {
+          const popover = document.getElementById('migrationChecklist');
+          if (!popover.matches(':popover-open')) document.getElementById('migrationChecklistCompact').click();
+          if (!popover.matches(':popover-open')) return false;
+          const box = btn.getBoundingClientRect();
+          if (!box.width || !box.height) return false;
+        }
+        btn.focus();
+        btn.click();
+        return true;
+      })()`);
+    },
+    // Test-only reset so acceptance scenarios remain independent in one profile.
+    resetMigrationChecklist() {
+      settings.setSettings({
+        migrationChecklistDismissed: false,
+        syncMigrationCompleted: false,
+        tabImportCompleted: false,
+        spaceMigrationCompleted: false,
+        iphoneMigrationCompleted: false,
+      });
+      const current = settings.getSettings();
+      return {
+        dismissed: current.migrationChecklistDismissed,
+        syncComplete: current.syncMigrationCompleted,
+        tabsComplete: current.tabImportCompleted,
+        spaceComplete: current.spaceMigrationCompleted,
+      };
+    },
+    setPatronCalloutDismissedAt(ms) {
+      settings.setSettings({ patronCalloutDismissedAt: Number(ms) });
+      return settings.getSettings().patronCalloutDismissedAt;
+    },
+    patronCalloutDismissedAt() { return settings.getSettings().patronCalloutDismissedAt; },
+    clickPatronCalloutClose() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const btn = document.getElementById('patronCalloutHide');
+        if (!btn || btn.closest('[hidden]')) return false;
+        btn.click();
+        return document.getElementById('patronCallout').hidden;
+      })()`);
+    },
+    // iphoneComplete undefined keeps the stored value (design 2026-10-28 §6.1).
+    setMigrationChecklistProgress(syncComplete, tabsComplete, spaceComplete = false, iphoneComplete) {
+      settings.setSettings({
+        syncMigrationCompleted: !!syncComplete, tabImportCompleted: !!tabsComplete, spaceMigrationCompleted: !!spaceComplete,
+        ...(iphoneComplete === undefined ? {} : { iphoneMigrationCompleted: !!iphoneComplete }),
+      });
+      return true;
+    },
+    migrationChecklistSettings() {
+      const current = settings.getSettings();
+      return {
+        dismissed: current.migrationChecklistDismissed === true,
+        syncComplete: current.syncMigrationCompleted === true,
+        tabsComplete: current.tabImportCompleted === true,
+        spaceComplete: current.spaceMigrationCompleted === true,
+      };
+    },
+    sharedSpacesTest(action,payload) {return refs.sharedSpacesTest(action,payload);},
+    syncEnabled() { return sync.status().enabled === true; },
+    async readStartPageFontUsage() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      const page = await tab.view.webContents.executeJavaScript(`(async () => {
+        await Promise.all([
+          document.fonts.load('22px "Instrument Sans"'),
+        ]).catch(() => []);
+        const selectors = [
+          '.start-brand-date', '.ledger-label', '.bb-clock',
+          '.bb-blocked', '.shelf-label', '.shelf-count', '.tally-count',
+          '.tally-caption', '.ledger-footer', '.layout-switcher button',
+          '.ob-step-label', '.ob-content p'
+        ];
+        if (selectors.some((selector) => !document.querySelector(selector))) return null;
+        const headingSelector = '.bb-clock, .ledger-where, .migration-checklist-heading h2, .ob-content h1';
+        const everything = [...document.querySelectorAll('body, body *')];
+        const label = (element) => element.id || element.className || element.tagName;
+        return {
+          samples: selectors.map((selector) => ({
+            selector,
+            family: getComputedStyle(document.querySelector(selector)).fontFamily,
+          })),
+          headings: [...document.querySelectorAll(headingSelector)].map((element) => ({
+            selector: element.className || 'onboarding h1',
+            family: getComputedStyle(element).fontFamily,
+          })),
+          textFaceLoaded: document.fonts.check('22px "Instrument Sans"'),
+          newsreader: everything
+            .filter((element) => getComputedStyle(element).fontFamily.includes('Newsreader'))
+            .slice(0, 20).map(label),
+          jetbrains: everything
+            .filter((element) => getComputedStyle(element).fontFamily.includes('JetBrains Mono'))
+            .slice(0, 20).map(label),
+        };
+      })()`);
+      return { page };
+    },
+    async readStartPageLayoutFit() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      const audit = `(() => {
+        scrollTo(0, 0);
+        const root = document.documentElement;
+        const body = document.body;
+        const describe = (element) => {
+          if (element.id) return '#' + element.id;
+          const classes = [...element.classList].slice(0, 3);
+          return element.tagName.toLowerCase() + (classes.length ? '.' + classes.join('.') : '');
+        };
+        const visible = (element) => {
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' &&
+            rect.width > 0 && rect.height > 0;
+        };
+        const hasDirectText = (element) => [...element.childNodes]
+          .some((node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
+        const ignored = (element) => element.matches(
+          '.page-sr-only, .mj-sr-only, .mj-skip, [data-dock-label], [aria-hidden="true"], ' +
+          '.fav .name, .shelf-tile .name, .shelf-tile .host, .shelf-date, .bb-fav .label'
+        );
+        const text = [...body.querySelectorAll('*')]
+          .filter((element) => visible(element) && hasDirectText(element) && !ignored(element));
+        const horizontalText = text.filter((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.left < -1 || rect.right > innerWidth + 1;
+        }).map(describe);
+        const unreachableText = text.filter((element) => {
+          const rect = element.getBoundingClientRect();
+          const documentBottom = Math.max(root.scrollHeight, body.scrollHeight);
+          return rect.top < -1 || rect.bottom + scrollY > documentBottom + 1;
+        }).map(describe);
+        const clippedText = text.filter((element) => {
+          const style = getComputedStyle(element);
+          const clipsX = style.overflowX === 'hidden' || style.overflowX === 'clip';
+          const clipsY = style.overflowY === 'hidden' || style.overflowY === 'clip';
+          return (clipsX && element.scrollWidth > element.clientWidth + 1) ||
+            (clipsY && element.scrollHeight > element.clientHeight + 1);
+        }).map(describe);
+        const surfaces = [...body.querySelectorAll('main, .ledger-footer')]
+          .filter(visible)
+          .filter((element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.left < -1 || rect.right > innerWidth + 1;
+          })
+          .map(describe);
+        const documentBottom = Math.max(root.scrollHeight, body.scrollHeight);
+        const maxScrollY = Math.max(0, documentBottom - innerHeight);
+        const footer = document.getElementById('layoutFooter')?.getBoundingClientRect();
+        const footerOverlaps = footer
+          ? [...body.querySelectorAll('main a, main button, main .shelf-card')]
+              .filter(visible)
+              .filter((element) => {
+                const rect = element.getBoundingClientRect();
+                const topAtBottom = rect.top - maxScrollY;
+                const bottomAtBottom = rect.bottom - maxScrollY;
+                return bottomAtBottom > footer.top + 1 && topAtBottom < footer.bottom - 1;
+              })
+              .map(describe)
+          : [];
+        return {
+          layout: body.dataset.layout ?? null,
+          viewportWidth: innerWidth,
+          viewportHeight: innerHeight,
+          clientWidth: root.clientWidth,
+          scrollWidth: root.scrollWidth,
+          horizontalText,
+          unreachableText,
+          clippedText,
+          surfaces,
+          footerOverlaps,
+        };
+      })()`;
+      const page = await tab.view.webContents.executeJavaScript(audit);
+      return { page };
+    },
+    readBillboardSites() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      return tab.view.webContents.executeJavaScript(`(() => ({
+        sites: [...document.querySelectorAll('#bbFavorites .bb-site')].map((item) => ({
+          key: item.dataset.siteKey,
+          href: item.querySelector('.bb-fav')?.href ?? null,
+          label: item.querySelector('.label')?.textContent ?? null,
+          hasIcon: item.querySelector('.tile')?.classList.contains('has-icon') ?? false,
+          dismissLabel: item.querySelector('.bb-site-dismiss')?.getAttribute('aria-label') ?? null,
+          pinned: item.classList.contains('pinned'),
+          pinLabel: item.querySelector('.bb-site-pin')?.getAttribute('aria-label') ?? null,
+          title: item.querySelector('.label')?.title ?? null,
+          ariaLabel: item.querySelector('.bb-fav')?.getAttribute('aria-label') ?? null,
+          top: Math.round(item.getBoundingClientRect().top),
+          visible: getComputedStyle(item).display !== 'none',
+          lines: (() => {
+            const label = item.querySelector('.label');
+            if (!label) return 0;
+            return Math.round(label.getBoundingClientRect().height / parseFloat(getComputedStyle(label).lineHeight));
+          })(),
+        })),
+        hidden: JSON.parse(localStorage.getItem('blanc.billboard.hidden-top-sites.v1') || '[]'),
+        status: document.getElementById('bbTopSitesStatus')?.textContent ?? '',
+        focusedPinOf: document.activeElement?.classList.contains('bb-site-pin')
+          ? document.activeElement.closest('.bb-site')?.dataset.siteKey ?? null
+          : null,
+      }))()`);
+    },
+    clearStartPagePins() {
+      for (const pin of startPagePins.listPins()) startPagePins.unpin(pin.url);
+      return startPagePins.listPins().length === 0;
+    },
+    startPagePins() { return startPagePins.listPins(); },
+    // The Favorites page's rows and their Start Page pins.
+    readFavoritesSheetPins() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc || wc.isDestroyed()) return null;
+      return wc.executeJavaScript(`(() => {
+        if (location.host !== 'bookmarks') return null;
+        return [...document.querySelectorAll('#list .row[data-url]')].map((row) => ({
+          url: row.dataset.url,
+          title: row.querySelector('.title')?.textContent ?? '',
+          pinned: row.classList.contains('start-pinned'),
+          mark: row.querySelector('.row-pin-mark')?.getAttribute('aria-label') ?? null,
+          button: row.querySelector('.pin-toggle')?.textContent ?? null,
+          buttonLabel: row.querySelector('.pin-toggle')?.getAttribute('aria-label') ?? null,
+          focused: document.activeElement === row.querySelector('.pin-toggle'),
+        }));
+      })()`);
+    },
+    toggleFavoritesSheetPin(title) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc || wc.isDestroyed()) return false;
+      return wc.executeJavaScript(`(() => {
+        const row = [...document.querySelectorAll('#list .row[data-url]')]
+          .find((candidate) => candidate.querySelector('.title')?.textContent === ${JSON.stringify(String(title))});
+        const button = row?.querySelector('.pin-toggle');
+        if (!button || button.disabled) return false;
+        button.focus();
+        button.click();
+        return true;
+      })()`);
+    },
+    // The favorites the showing favorites layout draws.
+    readStartFavorites() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const layout = document.body.dataset.layout;
+        const list = { ledger: 'favoritesList', shelf: 'shFavorites', tally: 'tlFavorites' }[layout];
+        const items = list ? [...document.getElementById(list).querySelectorAll('[data-favorite-url]')] : [];
+        return {
+          layout,
+          favorites: items.map((item) => ({
+            url: item.dataset.favoriteUrl,
+            title: item.querySelector('.name')?.textContent ?? null,
+            pinned: item.classList.contains('pinned'),
+            pinLabel: item.querySelector('.fav-pin')?.getAttribute('aria-label') ?? null,
+            pinShown: (() => {
+              const pin = item.querySelector('.fav-pin');
+              return !!pin && getComputedStyle(pin).opacity === '1';
+            })(),
+          })),
+          status: document.getElementById('favoritesPinStatus')?.textContent ?? '',
+          focusedPinOf: document.activeElement?.classList.contains('fav-pin')
+            ? document.activeElement.closest('[data-favorite-url]')?.dataset.favoriteUrl ?? null
+            : null,
+        };
+      })()`);
+    },
+    // Clicks a favorite's pin in the showing favorites layout.
+    toggleFavoritePin(title) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const list = { ledger: 'favoritesList', shelf: 'shFavorites', tally: 'tlFavorites' }[document.body.dataset.layout];
+        const item = list && [...document.getElementById(list).querySelectorAll('[data-favorite-url]')]
+          .find((candidate) => candidate.querySelector('.name')?.textContent === ${JSON.stringify(String(title))});
+        const button = item?.querySelector('.fav-pin');
+        if (!button) return false;
+        button.focus();
+        button.click();
+        return true;
+      })()`);
+    },
+    // Clicks a site's pin, which pins an unpinned site and unpins a pinned one.
+    toggleBillboardPin(key) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const item = [...document.querySelectorAll('#bbFavorites .bb-site')]
+          .find((candidate) => candidate.dataset.siteKey === ${JSON.stringify(String(key))});
+        const button = item?.querySelector('.bb-site-pin');
+        if (!button) return false;
+        button.focus();
+        button.click();
+        return true;
+      })()`);
+    },
+    hideBillboardSite(key) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const item = [...document.querySelectorAll('#bbFavorites .bb-site')]
+          .find((candidate) => candidate.dataset.siteKey === ${JSON.stringify(String(key))});
+        const button = item?.querySelector('.bb-site-dismiss');
+        if (!button) return false;
+        button.focus();
+        button.click();
+        return true;
+      })()`);
+    },
+    setBillboardHidden(keys) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      const bounded = Array.isArray(keys) ? keys.slice(0, 200).map(String) : [];
+      return tab.view.webContents.executeJavaScript(`(() => {
+        localStorage.setItem(
+          'blanc.billboard.hidden-top-sites.v1',
+          ${JSON.stringify(JSON.stringify(bounded))}
+        );
+        return true;
+      })()`);
+    },
+    async readMahjongDom() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return null;
+      try {
+        return await wc.executeJavaScript(`(() => {
+          const tileRect = document.querySelector('.mj-tile:not([hidden])')?.getBoundingClientRect();
+          const frameRect = document.querySelector('.mj-board-frame')?.getBoundingClientRect();
+          const wrapRect = document.getElementById('mjBoardWrap')?.getBoundingClientRect();
+          const boardRect = document.getElementById('mjBoard')?.getBoundingClientRect();
+          const dockRect = document.querySelector('.mj-dock')?.getBoundingClientRect();
+          const dockButtons = [...document.querySelectorAll('.mj-dock > button')]
+            .map((button) => button.getBoundingClientRect());
+          const fontSelectors = ['.mj-title', '.mj-session', '.mj-meter-label', '.mj-dock-action', '.mj-tray-kicker'];
+          const firstDockButton = dockButtons[0];
+          const secondDockButton = dockButtons[1];
+          return {
+            url: location.href,
+            tileCount: document.querySelectorAll('.mj-tile').length,
+            freeTileCount: document.querySelectorAll('.mj-tile:not([data-blocked])').length,
+            timer: document.getElementById('mjTimer')?.textContent ?? null,
+            mode: document.querySelector('.mj')?.dataset.mode ?? null,
+            layout: document.querySelector('.mj')?.dataset.layout ?? null,
+            tileWidth: tileRect?.width ?? 0,
+            tileHeight: tileRect?.height ?? 0,
+            boardFrameHeight: frameRect?.height ?? 0,
+            boardWrapWidth: wrapRect?.width ?? 0,
+            boardCenterDeltaX: boardRect && frameRect
+              ? Math.abs((boardRect.left + boardRect.right - frameRect.left - frameRect.right) / 2)
+              : Infinity,
+            boardFrameLeft: frameRect?.left ?? 0,
+            boardFrameRight: frameRect?.right ?? 0,
+            boardFrameTop: frameRect?.top ?? 0,
+            boardFrameBottom: frameRect?.bottom ?? 0,
+            dockLeft: dockRect?.left ?? 0,
+            dockRight: dockRect?.right ?? 0,
+            dockTop: dockRect?.top ?? 0,
+            dockBottom: dockRect?.bottom ?? 0,
+            dockButtonWidth: firstDockButton?.width ?? 0,
+            dockButtonHeight: firstDockButton?.height ?? 0,
+            dockButtonCount: dockButtons.length,
+            dockButtonGap: firstDockButton && secondDockButton
+              ? secondDockButton.top - firstDockButton.bottom
+              : 0,
+            fontSamples: fontSelectors.map((selector) => ({
+              selector,
+              family: getComputedStyle(document.querySelector(selector)).fontFamily,
+            })),
+            instrument: [...document.querySelectorAll('body, body *')]
+              .filter((element) => getComputedStyle(element).fontFamily.includes('Instrument Sans'))
+              .slice(0, 20)
+              .map((element) => element.id || element.className || element.tagName),
+            tileFaceFamily: getComputedStyle(document.querySelector('.mj-face text')).fontFamily,
+            viewportWidth: innerWidth,
+            viewportHeight: innerHeight,
+          };
+        })()`);
+      } catch {
+        return null;
+      }
+    },
+    async readMahjongDealState() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return null;
+      try {
+        return await wc.executeJavaScript(`(() => game ? ({
+          layoutId: game.layoutId,
+          seed: game.seed,
+          mode: game.mode,
+          burstRules: game.burstRules,
+          zen: game.zen,
+          dailyKey: game.dailyKey,
+          kinds: game.kinds.slice(),
+        }) : null)()`);
+      } catch {
+        return null;
+      }
+    },
+    async copyMahjongDealFromBoards() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return null;
+      try {
+        return await wc.executeJavaScript(`(async () => {
+          openSetup();
+          document.getElementById('mjCopyDeal')?.click();
+          const live = document.getElementById('mjLive');
+          const deadline = Date.now() + 2000;
+          while (live?.textContent !== 'Deal link copied.' && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          const result = {
+            live: live?.textContent ?? null,
+            boardsOpen: !document.getElementById('mjSetupSheet').hidden,
+          };
+          closeSetup();
+          return result;
+        })()`, true);
+      } catch {
+        return null;
+      }
+    },
+    async readMahjongCompletionGeometry() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return null;
+      try {
+        return await wc.executeJavaScript(`(async () => {
+          const card = document.getElementById('mjWin');
+          const wrap = document.getElementById('mjBoardWrap');
+          const time = document.getElementById('mjWinTime');
+          const best = document.getElementById('mjWinBest');
+          const lastAction = document.getElementById('mjWinBoards');
+          if (!card || !wrap || !time || !best || !lastAction) return null;
+          const wasHidden = card.hidden;
+          const previousTime = time.textContent;
+          const previousBest = best.textContent;
+          const previousScrollTop = card.scrollTop;
+          try {
+            // Use the longest realistic Tray labels so containment reflects
+            // the completed UI rather than its shorter dormant markup.
+            time.textContent = '14,400 points · 9999:59';
+            best.textContent = 'best 14,400 · 9999:59';
+            card.hidden = false;
+            card.scrollTop = 0;
+            void card.offsetWidth;
+            await new Promise((resolve) => setTimeout(resolve, 320));
+            const cardRect = card.getBoundingClientRect();
+            const wrapRect = wrap.getBoundingClientRect();
+            const initialActionRect = lastAction.getBoundingClientRect();
+            const actionInitiallyVisible =
+              initialActionRect.top >= cardRect.top - 1 &&
+              initialActionRect.bottom <= cardRect.bottom + 1;
+            if (!actionInitiallyVisible) {
+              card.scrollTop = card.scrollHeight;
+              await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+            }
+            const actionRect = lastAction.getBoundingClientRect();
+            const bodyRect = document.body.getBoundingClientRect();
+            const cardStyle = getComputedStyle(card);
+            return {
+              card: { left: cardRect.left, top: cardRect.top, right: cardRect.right, bottom: cardRect.bottom },
+              wrap: { left: wrapRect.left, top: wrapRect.top, right: wrapRect.right, bottom: wrapRect.bottom },
+              body: { left: bodyRect.left, top: bodyRect.top, right: bodyRect.right, bottom: bodyRect.bottom },
+              viewport: { left: 0, top: 0, right: innerWidth, bottom: innerHeight },
+              centerDeltaX: Math.abs((cardRect.left + cardRect.right - innerWidth) / 2),
+              centerDeltaY: Math.abs((cardRect.top + cardRect.bottom - innerHeight) / 2),
+              documentClientWidth: document.documentElement.clientWidth,
+              bodyClientWidth: document.body.clientWidth,
+              bodyScrollWidth: document.body.scrollWidth,
+              computedLeft: cardStyle.left,
+              clientHeight: card.clientHeight,
+              scrollHeight: card.scrollHeight,
+              scrollTop: card.scrollTop,
+              overflowY: cardStyle.overflowY,
+              actionInitiallyVisible,
+              actionVisibleAfterScroll:
+                actionRect.top >= cardRect.top - 1 && actionRect.bottom <= cardRect.bottom + 1,
+              viewportWidth: innerWidth,
+              viewportHeight: innerHeight,
+            };
+          } finally {
+            card.hidden = wasHidden;
+            card.scrollTop = previousScrollTop;
+            time.textContent = previousTime;
+            best.textContent = previousBest;
+          }
+        })()`);
+      } catch {
+        return null;
+      }
+    },
+    async setActiveTabZoomFactor(factor) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !/^blanc:\/\/(newtab|mahjong)\//.test(urlOf(tab))) return null;
+      const applied = Math.min(3, Math.max(0.5, Number(factor) || 1));
+      tab.view.webContents.setZoomFactor(applied);
+      return tab.view.webContents.getZoomFactor();
+    },
+    async activeTabZoomFactor() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !/^blanc:\/\/(newtab|mahjong)\//.test(urlOf(tab))) return null;
+      return tab.view.webContents.getZoomFactor();
+    },
+    async readMahjongRecordsGeometry() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return null;
+      try {
+        return await wc.executeJavaScript(`(async () => {
+          const sheet = document.getElementById('mjRecordsSheet');
+          const card = sheet?.querySelector('.mj-records-card');
+          const trigger = document.getElementById('mjRecords');
+          if (!sheet || !card || !trigger || typeof openRecords !== 'function' || typeof closeRecords !== 'function') return null;
+          if (!sheet.hidden) closeRecords();
+          openRecords();
+          await new Promise((resolve) => setTimeout(resolve, 320));
+          const cardRect = card.getBoundingClientRect();
+          const measured = {
+            card: { left: cardRect.left, top: cardRect.top, right: cardRect.right, bottom: cardRect.bottom },
+            viewport: { left: 0, top: 0, right: innerWidth, bottom: innerHeight },
+            scrollWidth: card.scrollWidth,
+            clientWidth: card.clientWidth,
+            overflowY: getComputedStyle(card).overflowY,
+            rowCount: document.querySelectorAll('#mjRecordsRows tr').length,
+            viewportWidth: innerWidth,
+            viewportHeight: innerHeight,
+            zoomFactor: outerWidth ? outerWidth / innerWidth : 1,
+          };
+          closeRecords();
+          await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+          measured.focusReturned = document.activeElement === trigger;
+          return measured;
+        })()`);
+      } catch {
+        return null;
+      }
+    },
+    async clickMahjongFreeTile() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return false;
+      try {
+        return await wc.executeJavaScript(`(() => {
+          const tile = document.querySelector('.mj-tile:not([data-blocked]):not([hidden])');
+          if (!tile) return false;
+          tile.click();
+          return true;
+        })()`);
+      } catch {
+        return false;
+      }
+    },
+    async rapidUndoMahjongMatch() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return null;
+      try {
+        return await wc.executeJavaScript(`(async () => {
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const free = [...document.querySelectorAll('.mj-tile:not([data-blocked]):not([hidden])')];
+          let pair = null;
+          for (let first = 0; first < free.length && !pair; first += 1) {
+            const firstName = free[first].getAttribute('aria-label')?.split(',')[0];
+            for (let second = first + 1; second < free.length; second += 1) {
+              const secondName = free[second].getAttribute('aria-label')?.split(',')[0];
+              if (firstName && firstName === secondName) {
+                pair = [free[first], free[second]];
+                break;
+              }
+            }
+          }
+          if (!pair) return { matched: false };
+          pair[0].click();
+          pair[1].click();
+          await sleep(50);
+          document.getElementById('mjUndo')?.click();
+          await sleep(900);
+          return {
+            matched: true,
+            score: document.getElementById('mjScore')?.textContent ?? null,
+            live: document.getElementById('mjLive')?.textContent ?? null,
+            transientCount: document.querySelectorAll(
+              '.mj-tile-flight, .mj-score-flight, .mj-tray-burst'
+            ).length,
+            comboFxClass: document.getElementById('mjComboFx')?.className ?? null,
+          };
+        })()`);
+      } catch {
+        return null;
+      }
+    },
+    async auditMahjongCorrectness() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://mahjong/') ? liveContents(tab) : null;
+      if (!wc) return null;
+      try {
+        return await wc.executeJavaScript(`(async () => {
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const clickTile = async (index, delay = 420) => {
+            tileButtons[index]?.click();
+            await sleep(delay);
+          };
+          const highlighted = () => [...document.querySelectorAll('.mj-tile.hinted')]
+            .map((tile) => Number(tile.dataset.i)).sort((a, b) => a - b);
+
+          startGame({ layoutId: 'arch', mode: 'classic', seed: 91001 }, { soundCue: false });
+          const classicHints = E.hintMoves(game);
+          document.getElementById('mjHint').click();
+          const firstHint = highlighted();
+          document.getElementById('mjHint').click();
+          const secondHint = highlighted();
+
+          startGame({ layoutId: 'peaks', mode: 'tray', seed: 91002 }, { soundCue: false });
+          const match = E.availableMoves(game).find((move) => move.length === 2 && !game.tray.includes(move[0]));
+          if (!match) return { error: 'no Burst pair' };
+          await clickTile(match[0]);
+          await clickTile(match[1], 820);
+          document.getElementById('mjUndo').click();
+          await sleep(80);
+          const matchUndo = {
+            tray: game.tray.slice(),
+            parked: match[0],
+            mate: match[1],
+            parkedRemoved: game.removed[match[0]],
+            mateRemoved: game.removed[match[1]],
+          };
+
+          startGame({ layoutId: 'peaks', mode: 'tray', seed: 91003 }, { soundCue: false });
+          const free = [...tileButtons]
+            .filter((tile) => tile && !tile.dataset.blocked && !tile.hidden)
+            .map((tile) => Number(tile.dataset.i));
+          if (free.length < 4) return { error: 'not enough free tiles' };
+          for (let index = 0; index < game.kinds.length; index += 1) game.kinds[index] = 'chr-9';
+          for (let offset = 0; offset < 4; offset += 1) game.kinds[free[offset]] = 'chr-' + (offset + 1);
+          renderBoard();
+          refreshTiles();
+          for (const index of free.slice(0, 3)) await clickTile(index);
+          document.getElementById('mjHint').click();
+          await sleep(30);
+          const safeHint = {
+            highlighted: highlighted(),
+            live: document.getElementById('mjLive')?.textContent ?? null,
+          };
+          const parkedSet = new Set(free.slice(0, 4));
+          const mates = game.kinds.map((_, index) => index)
+            .filter((index) => !parkedSet.has(index)).slice(0, 4);
+          for (let offset = 0; offset < 4; offset += 1) game.kinds[mates[offset]] = 'chr-' + (offset + 1);
+          await clickTile(free[3]);
+          const rescue = document.getElementById('mjRescue');
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          await sleep(30);
+          const rescueEscape = {
+            hidden: rescue.hidden,
+            status: game.status,
+            focus: document.activeElement?.id ?? null,
+          };
+          checkEndStates();
+          const shuffled = shuffleGame();
+          await sleep(620);
+          document.getElementById('mjUndo').click();
+          await sleep(80);
+          const rescueUndo = {
+            shuffled,
+            visible: !rescue.hidden,
+            status: game.status,
+            traySize: game.tray.length,
+          };
+
+          startGame({
+            layoutId: 'peaks', mode: 'tray', seed: 91004,
+            burstRules: E.BURST_RULES.AUTO,
+          }, { soundCue: false });
+          openSetup();
+          const burstControls = {
+            autoVisible: !document.getElementById('mjAutoClearOption').hidden,
+            zenVisible: !document.getElementById('mjZenOption').hidden,
+          };
+          document.getElementById('mjModeClassic').click();
+          const classicControls = {
+            autoVisible: !document.getElementById('mjAutoClearOption').hidden,
+            zenVisible: !document.getElementById('mjZenOption').hidden,
+          };
+          const zenToggle = document.getElementById('mjZen');
+          zenToggle.checked = true;
+          zenToggle.dispatchEvent(new Event('change', { bubbles: true }));
+          const recordEventCountBeforeZen = [...Array(localStorage.length).keys()]
+            .map((index) => localStorage.key(index))
+            .filter((key) => key?.startsWith(S.RECORD_EVENT_PREFIX)).length;
+          startSetupChoice();
+          startTimer();
+          await sleep(80);
+          pauseTimer();
+          const zenTiming = {
+            elapsedMs: game.elapsedMs,
+            timerDisplay: getComputedStyle(document.getElementById('mjTimeMeter')).display,
+            scoreDisplay: getComputedStyle(document.getElementById('mjScoreMeter')).display,
+            badge: document.getElementById('mjRulesBadge').textContent,
+          };
+          game.removed.fill(true);
+          game.status = 'won';
+          game.completionRecorded = false;
+          checkEndStates();
+          const recordEventCountAfterZen = [...Array(localStorage.length).keys()]
+            .map((index) => localStorage.key(index))
+            .filter((key) => key?.startsWith(S.RECORD_EVENT_PREFIX)).length;
+          const zenCompletion = {
+            title: document.getElementById('mjWinTitle').textContent,
+            rules: document.getElementById('mjWinRules').textContent,
+            notice: document.getElementById('mjWinZen').textContent,
+            resultHidden: document.getElementById('mjWinResult').hidden,
+            eventDelta: recordEventCountAfterZen - recordEventCountBeforeZen,
+          };
+
+          openSetup();
+          const zenReset = document.getElementById('mjZen').checked;
+          document.getElementById('mjModeTray').click();
+          const autoToggle = document.getElementById('mjAutoClears');
+          autoToggle.checked = false;
+          autoToggle.dispatchEvent(new Event('change', { bubbles: true }));
+          startSetupChoice();
+          const manualGame = {
+            burstRules: game.burstRules,
+            scoringRevision: game.scoringRevision,
+            badge: document.getElementById('mjRulesBadge').textContent,
+          };
+          openSetup();
+          const manualRemembered = !document.getElementById('mjAutoClears').checked;
+          closeSetup();
+          paintRecords();
+          const burstLabels = [...document.querySelectorAll('#mjRecordsRows .mj-record-variants')]
+            .flatMap((cell) => [...cell.querySelectorAll('small')].map((label) => label.textContent));
+
+          const result = {
+            classicHintCount: classicHints.length,
+            firstHint,
+            secondHint,
+            matchUndo,
+            safeHint,
+            rescueEscape,
+            rescueUndo,
+            burstControls,
+            classicControls,
+            zenTiming,
+            zenCompletion,
+            zenReset,
+            manualGame,
+            manualRemembered,
+            burstLabels,
+          };
+          startGame({
+            layoutId: 'peaks', mode: 'tray', seed: 91005,
+            burstRules: E.BURST_RULES.AUTO,
+          }, { soundCue: false });
+          return result;
+        })()`);
+      } catch {
+        return null;
+      }
+    },
+    clickNewtabLayoutSwitcher(name) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const popover = document.getElementById('customizePopover');
+        const opener = document.getElementById('customizeButton');
+        if (!popover || !opener) return false;
+        if (!popover.matches(':popover-open')) { opener.focus(); opener.click(); }
+        if (!popover.matches(':popover-open')) return false;
+        const button = popover.querySelector('[data-layout-pick="${String(name).replace(/[^a-z]/g, '')}"]');
+        if (!button) return false;
+        button.click();
+        return true;
+      })()`);
+    },
+    openStartCustomize() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const popover = document.getElementById('customizePopover');
+        const opener = document.getElementById('customizeButton');
+        if (!popover || !opener) return false;
+        if (!popover.matches(':popover-open')) { opener.focus(); opener.click(); }
+        return popover.matches(':popover-open');
+      })()`);
+    },
+    readStartCustomize() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => ({
+        open: document.getElementById('customizePopover')?.matches(':popover-open') ?? false,
+        expanded: document.getElementById('customizeButton')?.getAttribute('aria-expanded') ?? null,
+        focusedId: document.activeElement?.id ?? null,
+        pressed: [...document.querySelectorAll('[data-layout-pick][aria-pressed="true"]')].map((b) => b.dataset.layoutPick),
+      }))()`);
+    },
+    pressStartPageKey(keyCode) {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return false;
+      wc.focus();
+      wc.sendInputEvent({ type: 'keyDown', keyCode: String(keyCode) });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: String(keyCode) });
+      return true;
+    },
+    readMahjongFooterLink() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => ({
+        href: document.getElementById('mahjongLink')?.href ?? null,
+        target: document.getElementById('mahjongLink')?.target ?? null,
+        layout: document.body.dataset.layout,
+        switcherCount: document.querySelectorAll('[data-layout-pick]').length,
+        frameCount: document.querySelectorAll('iframe').length,
+      }))()`);
+    },
+    clickMahjongFooterLink() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab && urlOf(tab).startsWith('blanc://newtab') ? liveContents(tab) : null;
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const link = document.getElementById('mahjongLink');
+        if (!link) return false;
+        link.click();
+        return true;
+      })()`);
+    },
+    /** Click Continue until the walkthrough shows `step`. */
+    advanceOnboardingTo(step) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(async () => {
+        const dialog = document.getElementById('onboardDialog');
+        if (!dialog || dialog.hidden) return false;
+        for (let i = 0; i < 200 && Number(dialog.dataset.step) < ${Number(step)}; i += 1) {
+          const next = document.getElementById('obNext');
+          if (!next.disabled) next.click();
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        return dialog.dataset.step === '${Number(step)}';
+      })()`);
+    },
+    // F52 spec D5: the Tab Archive row in "Meet the island".
+    readOnboardingArchiveOffer() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const row = document.getElementById('obArchiveRow');
+        const toggle = document.getElementById('obArchive');
+        return {
+          hidden: !row || row.hidden || row.closest('section')?.hidden === true,
+          checked: toggle?.getAttribute('aria-checked') === 'true',
+          label: row?.textContent.replace(/\\s+/g, ' ').trim() ?? '',
+        };
+      })()`);
+    },
+    clickOnboarding(selector) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector(${JSON.stringify(String(selector))});
+        if (!el || el.disabled || document.getElementById('onboardDialog').hidden) return false;
+        el.click();
+        return true;
+      })()`);
+    },
+    /** The new tab page's own onboarding bridge, called directly. */
+    sendOnboardingSet(partial) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(
+        `window.bowserPages.start.onboardingSet(${JSON.stringify(partial ?? {})}).then(() => true)`);
+    },
+    tabArchiveSetting() { return settings.getSettings().tabArchive; },
+    readOnboardingDom() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      return tab.view.webContents.executeJavaScript(`(() => ({
+        shown: !(document.getElementById('onboardDialog')?.hidden ?? true),
+        step: document.getElementById('onboardDialog')?.dataset.step ?? null,
+      }))()`);
+    },
+    async auditOnboardingInvitationTypography() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab?.view?.webContents;
+      if (!wc || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      const debuggerWasAttached = wc.debugger.isAttached();
+      if (!debuggerWasAttached) wc.debugger.attach('1.3');
+
+      const resetToFirstStep = () => wc.executeJavaScript(`(async () => {
+        const dialog = document.getElementById('onboardDialog');
+        if (!dialog || dialog.hidden) return false;
+        const waitFor = async (expected) => {
+          for (let i = 0; i < 80; i += 1) {
+            if (dialog.dataset.step === String(expected)) return true;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          return false;
+        };
+        while (Number(dialog.dataset.step) > 0) {
+          const expected = Number(dialog.dataset.step) - 1;
+          document.getElementById('obBack').click();
+          if (!(await waitFor(expected))) return false;
+        }
+        return true;
+      })()`);
+
+      const captureTheme = async (theme, forward) => {
+        await wc.debugger.sendCommand('Emulation.setEmulatedMedia', {
+          features: [{ name: 'prefers-color-scheme', value: theme }],
+        });
+        return wc.executeJavaScript(`(async () => {
+          const dialog = document.getElementById('onboardDialog');
+          const content = document.getElementById('obContent');
+          const waitFor = async (predicate) => {
+            for (let i = 0; i < 120; i += 1) {
+              if (predicate()) return true;
+              await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            return false;
+          };
+          if (!dialog || dialog.hidden) return null;
+          const dark = ${JSON.stringify(theme === 'dark')};
+          if (!(await waitFor(() => matchMedia('(prefers-color-scheme: dark)').matches === dark))) {
+            throw new Error('theme did not settle');
+          }
+          await document.fonts.ready;
+          const order = ${forward ? '[0, 1, 2, 3, 4, 5]' : '[5, 4, 3, 2, 1, 0]'};
+          const steps = [];
+          for (let index = 0; index < order.length; index += 1) {
+            const step = order[index];
+            if (!(await waitFor(() => dialog.dataset.step === String(step)))) {
+              throw new Error('onboarding step did not settle: ' + step);
+            }
+            const section = document.querySelector('#obContent [data-step="' + step + '"]');
+            const title = section.querySelector('h1');
+            const style = getComputedStyle(title);
+            const titleRect = title.getBoundingClientRect();
+            const contentRect = content.getBoundingClientRect();
+            const next = document.getElementById('obNext');
+            next.focus();
+            const focus = getComputedStyle(next);
+            steps.push({
+              step,
+              text: title.textContent,
+              font: style.fontFamily,
+              size: style.fontSize,
+              weight: style.fontWeight,
+              lineHeight: style.lineHeight,
+              tracking: style.letterSpacing,
+              opticalSizing: style.fontOpticalSizing,
+              insideContent: titleRect.left >= contentRect.left - 1 && titleRect.right <= contentRect.right + 1,
+              horizontalOverflow: section.scrollWidth > section.clientWidth + 1,
+              focusOutline: focus.outlineStyle !== 'none' && parseFloat(focus.outlineWidth) >= 1,
+            });
+            if (index < order.length - 1) {
+              document.getElementById(${forward ? "'obNext'" : "'obBack'"}).click();
+            }
+          }
+          return {
+            theme: dark ? 'dark' : 'light',
+            fontLoaded: document.fonts.check('22px "Instrument Sans"'),
+            dialogOverflow: dialog.scrollWidth > dialog.clientWidth + 1,
+            pageOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+            steps,
+          };
+        })()`);
+      };
+
+      try {
+        if (!(await resetToFirstStep())) return null;
+        const light = await captureTheme('light', true);
+        const dark = await captureTheme('dark', false);
+        return { light, dark };
+      } finally {
+        await wc.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [] });
+        if (!debuggerWasAttached) wc.debugger.detach();
+      }
+    },
+    skipOnboarding() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const skip = document.getElementById('obSkip');
+        if (!skip || document.getElementById('onboardDialog').hidden) return false;
+        skip.click();
+        return true;
+      })()`);
+    },
+    firstRunState() {
+      const current = settings.getSettings();
+      return {
+        complete: settings.isFirstRunComplete(),
+        searchSuggestions: current.searchSuggestions,
+        usagePing: current.usagePing,
+      };
+    },
+    glanceShortcutEnabled() {
+      return Menu.getApplicationMenu()
+        ?.getMenuItemById('toggle-glance')
+        ?.enabled === true;
+    },
+    pressGlanceShortcut() {
+      const accelerator = Menu.getApplicationMenu()
+        ?.getMenuItemById('toggle-glance')
+        ?.accelerator;
+      if (!['CmdOrCtrl+Shift+G', 'CommandOrControl+Shift+G'].includes(accelerator)) {
+        throw new Error(`unexpected Glance accelerator: ${accelerator}`);
+      }
+      const wc = getChromeWebContents();
+      if (!wc) throw new Error('chrome webContents unavailable');
+      const modifiers = process.platform === 'darwin'
+        ? ['meta', 'shift']
+        : ['control', 'shift'];
+      wc.focus();
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'G', modifiers });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'G', modifiers });
+      return true;
+    },
+    pressVerticalTabsShortcut() {
+      const accelerator = Menu.getApplicationMenu()
+        ?.getMenuItemById('toggle-vertical-tabs')
+        ?.accelerator;
+      if (!['CmdOrCtrl+Alt+V', 'CommandOrControl+Alt+V'].includes(accelerator)) {
+        throw new Error(`unexpected vertical-tabs accelerator: ${accelerator}`);
+      }
+      const wc = getChromeWebContents();
+      if (!wc) throw new Error('chrome webContents unavailable');
+      const modifiers = process.platform === 'darwin'
+        ? ['meta', 'alt']
+        : ['control', 'alt'];
+      wc.focus();
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'V', modifiers });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'V', modifiers });
+      return true;
+    },
+    verticalTabsWidth() { return settings.getSettings().verticalTabsWidth; },
+    setVerticalTabsWidth(width) { return setVerticalTabsWidth(width); },
+    verticalTabsMetrics() { return getVerticalTabsMetrics(); },
+    mergeRemoteTabLayout(layout) {
+      settings.mergeFromSync({
+        values: { tabLayout: layout },
+        meta: { tabLayout: Date.now() + 60_000 },
+      });
+      return settings.getSettings().tabLayout;
+    },
+    setAppIcon(x) { settings.setSettings({ appIcon: x }); },
+    appIcon() { return settings.getSettings().appIcon; },
+    secureDns() { return settings.getSettings().secureDns; },
+    secureDnsTemplate() { return settings.getSettings().secureDnsTemplate; },
+    webrtcPolicy() { return settings.getSettings().webrtcPolicy; },
+    setSecureDns(dns, template = '') { settings.setSettings({ secureDns: dns, secureDnsTemplate: template }); },
+    clearSupporter() { settings.setPatron(null); },
+    addException(h) {
+      const cur = settings.getSettings().adblockExceptions;
+      settings.setSettings({ adblockExceptions: [...cur, h] });
+    },
+    exceptions() { return settings.getSettings().adblockExceptions; },
+    // The exception-list hostname of the active tab — lets a scenario talk
+    // about "the active site" instead of hardcoding the fixture server's host.
+    activeHostname() {
+      const tab = tabs.get(getActiveTabId());
+      return tab ? blockableHostname(urlOf(tab)) : null;
+    },
+    allowAdsOnActive() { return runAllowAdsCommand(); },
+    // The REAL pill element, so the allow-listed indicator is covered end to
+    // end (serializeTabs -> tabs:updated -> renderer) rather than at the model
+    // — the state being invisible in the chrome is the whole point of it.
+    pillShieldState() {
+      const wc = getChromeWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const el = document.getElementById('pillShield');
+        if (!el) return null;
+        return {
+          hidden: !!el.hidden,
+          off: el.classList.contains('shield-off'),
+          // The Island's own tooltip (#938) replaced the native title.
+          title: el.dataset.tooltip ?? el.title,
+        };
+      })()`);
+    },
+    // ---- blank-tab affordance (F37) ----
+    // Read through the real chrome DOM rather than the tab model: the point
+    // of F37 is what the pill SHOWS, and a model-level proxy would pass even
+    // if the placeholder never rendered.
+    // The computed motion of the Glance chrome: the strip's header and
+    // divider, and the overlay's picker when one is up.
+    // The page context menu's Open Link in Glance, which Playwright cannot
+    // click (a native menu): the same main-process action the item calls.
+    runLinkSpaceMenuItem(tabId, url, text, itemId) { return runLinkSpaceMenuItem(String(tabId), String(url), String(text ?? ""), itemId); },
+    openLinkInGlance(tabId, url) { return openLinkInGlance(String(tabId), String(url)); },
+    // The floating Glance card's computed motion, read in its own document.
+    async glanceCardMotion() {
+      const wc = getGlanceCardWebContents();
+      if (!wc || wc.isDestroyed()) return null;
+      return wc.executeJavaScript(`(() => {
+        const card = document.getElementById('glanceCard');
+        if (!card) return null;
+        const style = getComputedStyle(card);
+        return { transition: style.transition, transform: style.transform, opacity: style.opacity, hidden: card.hidden };
+      })()`);
+    },
+    // Close the Glance and, in the same turn, read whether the card's view is
+    // still visible: a visible view would take the page's clicks.
+    closeGlanceAndReadCard() {
+      const closed = closeGlanceAction({ focusContent: false });
+      const wc = getGlanceCardWebContents();
+      return { closed, cardViewVisible: wc && !wc.isDestroyed() ? getGlanceCardViewVisible() : false };
+    },
+    // Close a tab and, in the same turn, read whether a Glance is still open,
+    // whether the card view is visible and the frame settings hold for it.
+    // A window's first Glance: the card view goes first, so this open makes
+    // it again (as a new window would), and in the same turn read what shows.
+    async openFirstGlanceAndRead(id) {
+      destroyGlanceCardViewForTest();
+      const opened = await setGlanceTab(String(id));
+      return { opened, cardViewVisible: getGlanceCardViewVisible(), glancePageVisible: getGlancePageViewVisible() };
+    },
+    glancePageViewVisible() { return getGlancePageViewVisible(); },
+    closeTabAndReadGlance(id) {
+      closeTab(String(id));
+      return { glanceTabId: getGlanceTabId(), cardViewVisible: getGlanceCardViewVisible(), savedFrame: getSavedGlanceFrame() };
+    },
+    // The Glance header's identity cross-fade (in the card's document) and
+    // the overlay's picker motion.
+    async glanceHeaderMotion() {
+      const strip = getGlanceCardWebContents();
+      if (!strip || strip.isDestroyed()) return null;
+      const read = (selector) => `(() => {
+        const element = document.querySelector(${JSON.stringify(selector)});
+        if (!element) return null;
+        const style = getComputedStyle(element);
+        return { transition: style.transition, transform: style.transform, opacity: style.opacity, transformOrigin: style.transformOrigin, width: element.getBoundingClientRect().width };
+      })()`;
+      const header = await strip.executeJavaScript(read('#glanceHeader'));
+      const identity = await strip.executeJavaScript(`(() => {
+        const element = document.querySelector('#glanceHeader .glance-tab-identity');
+        return element ? { transition: getComputedStyle(element).transition, swapping: element.classList.contains('swapping') } : null;
+      })()`);
+      const overlay = getOverlayWebContents();
+      const picker = overlay && getOverlayMode() === 'glance' ? await overlay.executeJavaScript(read('#glancePicker')) : null;
+      return { header, identity, picker };
+    },
+    pillPlaceholderState() {
+      const wc = getChromeWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const label = document.getElementById('pillDomain');
+        const chip = document.getElementById('pillSlash');
+        if (!label) return null;
+        // The caret is gone (fbc8270): the prompt now carries its own motion,
+        // a bright band washing through the glyphs. Report the mechanism that
+        // actually ships in each branch — the animation plus whether the
+        // gradient is painting the text — so the guard can't be satisfied by
+        // deleting the affordance.
+        const cs = getComputedStyle(label);
+        const fill = cs.webkitTextFillColor || cs.color;
+        return {
+          text: label.textContent,
+          placeholder: label.classList.contains('placeholder'),
+          animation: cs.animationName,
+          gradientPainted: /rgba\\(0, 0, 0, 0\\)|transparent/.test(fill),
+          reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+          chipHidden: chip ? !!chip.hidden : null,
+          chipLabel: chip ? chip.textContent : null,
+        };
+      })()`);
+    },
+    clickPillSlash() {
+      const wc = getChromeWebContents();
+      if (!wc) throw new Error('chrome webContents unavailable');
+      return wc.executeJavaScript(`document.getElementById('pillSlash').click()`);
+    },
+    /** What the island's address input currently holds, per the renderer. */
+    overlayAddressValue() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(
+        `document.getElementById('addressInput')?.value ?? null`,
+      );
+    },
+    /**
+     * The id of the overlay element that holds keyboard focus, or null when
+     * the overlay document itself does not have focus — a focused input in
+     * an unfocused view would take no keystrokes.
+     */
+    overlayFocusedId() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(
+        `document.hasFocus() ? (document.activeElement?.id ?? null) : null`,
+      );
+    },
+    /**
+     * Dispatch a real keydown on the active tab's page, as a person typing
+     * with the page focused would. Goes through the page's own listener and
+     * the pages:start:open-island channel — not a shortcut into main.
+     */
+    typeIntoActivePage(key) {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab?.view?.webContents;
+      if (!wc || wc.isDestroyed()) throw new Error('no live active tab');
+      wc.focus();
+      wc.sendInputEvent({ type: 'keyDown', keyCode: key });
+      wc.sendInputEvent({ type: 'char', keyCode: key });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: key });
+      return true;
+    },
+
+    // ---- shield popover (F12-6) ----
+    // Real DOM clicks through the real chrome:open-shield / adblock IPC —
+    // same end-to-end rationale as pillShieldState above.
+    clickPillShield() {
+      const wc = getChromeWebContents();
+      if (!wc) throw new Error('chrome webContents unavailable');
+      return wc.executeJavaScript(`document.getElementById('pillShield').click()`);
+    },
+    shieldPopoverState() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const pop = document.getElementById('shieldPop');
+        if (!pop) return null;
+        const row = document.getElementById('shieldPopConnection');
+        return {
+          visible: !pop.hidden,
+          host: document.getElementById('shieldPopHost').textContent,
+          on: document.getElementById('shieldPopToggle').classList.contains('on'),
+          toggleShown: !document.getElementById('shieldPopToggle').hidden,
+          connection: row && !row.hidden ? 'Connection · ' + document.getElementById('shieldPopConnectionValue').textContent : null,
+          header: document.querySelector('.shield-pop-state')?.textContent.trim() ?? '',
+          route: document.getElementById('shieldPopRoute')?.hidden === false ? {
+            label: document.getElementById('shieldPopRouteLabel').textContent,
+            on: document.getElementById('shieldPopRouteToggle').getAttribute('aria-checked') === 'true',
+            note: document.getElementById('shieldPopRouteNote').textContent,
+          } : null,
+        };
+      })()`);
+    },
+    clickShieldRouteToggle() {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay webContents unavailable');
+      return wc.executeJavaScript(`document.getElementById('shieldPopRouteToggle').click()`);
+    },
+    clickShieldPopoverToggle() {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay webContents unavailable');
+      return wc.executeJavaScript(`document.getElementById('shieldPopToggle').click()`);
+    },
+    // ---- site-info fold (F12-7/8/9): the badge door, trigger truth, focus ----
+    clickInsecureBadge() {
+      const wc = getChromeWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const b = document.getElementById('pillInsecure');
+        if (!b || b.hidden) return false;
+        b.click();
+        return true;
+      })()`);
+    },
+    pillInsecureHidden() {
+      const wc = getChromeWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`document.getElementById('pillInsecure')?.hidden ?? null`);
+    },
+    shieldAriaExpanded() {
+      const wc = getChromeWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`({
+        shield: document.getElementById('pillShield')?.getAttribute('aria-expanded') ?? null,
+        insecure: document.getElementById('pillInsecure')?.getAttribute('aria-expanded') ?? null,
+      })`);
+    },
+    chromeFocusedId() {
+      const wc = getChromeWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`document.activeElement?.id ?? null`);
+    },
+    pressOverlayEscape() {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay is not open');
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+      return true;
+    },
+
+    // ---- Blanc Spaces mark and menu (F41) ----
+    spaceMarkState(windowId) {
+      const read = () => {
+        const wc = getChromeWebContents();
+        if (!wc) return null;
+        return wc.executeJavaScript(`(() => {
+          const mark = document.getElementById('pillSpace');
+          if (!mark) return null;
+          const rect = mark.getBoundingClientRect();
+          const parts = [document.getElementById('pillSpaceSymbol'), document.getElementById('pillSpaceName')];
+          return {
+            hidden: mark.hidden,
+            inIsland: !!mark.closest('#islandPill'),
+            inRail: !!mark.closest('.vertical-tabs-toolbar'),
+            state: mark.dataset.state,
+            name: parts[1].textContent,
+            label: mark.getAttribute('aria-label'),
+            expanded: mark.getAttribute('aria-expanded'),
+            fill: mark.style.getPropertyValue('--space-fill'),
+            on: mark.style.getPropertyValue('--space-on'),
+            edge: mark.dataset.edge ?? null,
+            // As drawn: the quiet mark has no fill of its own; the colour is
+            // the square behind the symbol, the name is the Island's text.
+            markBackground: getComputedStyle(mark).backgroundColor,
+            squareBackground: getComputedStyle(parts[0]).backgroundColor,
+            symbolColor: getComputedStyle(parts[0]).color,
+            nameColor: getComputedStyle(parts[1]).color,
+            islandText: getComputedStyle(document.getElementById('islandPill')).color,
+            square: (() => { const b = parts[0].getBoundingClientRect(); return { width: b.width, height: b.height, inset: b.left - rect.left }; })(),
+            nameTruncated: parts[1].scrollWidth > parts[1].clientWidth,
+            symbol: parts[0].dataset.symbol ?? null,
+            left: rect.left,
+            bottom: rect.bottom,
+            islandBottom: document.getElementById('islandPill').getBoundingClientRect().bottom,
+            animatedProperties: [...new Set(parts.flatMap((p) => p.getAnimations()).flatMap((a) => a.effect.getKeyframes().flatMap((k) => Object.keys(k))))],
+            animations: parts.flatMap((p) => p.getAnimations()).map((a) => ({ kind: a.constructor.name, time: a.currentTime, duration: a.effect.getTiming().duration })),
+            reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+          };
+        })()`);
+      };
+      return windowId ? refs.runInWindowRuntime(String(windowId), read) : read();
+    },
+    clickPillSpace() {
+      const wc = getChromeWebContents();
+      if (!wc) throw new Error('chrome webContents unavailable');
+      return wc.executeJavaScript(`document.getElementById('pillSpace').click()`);
+    },
+    pressOverlayKey(keyCode, modifiers = []) {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay is not open');
+      wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
+      wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+      return true;
+    },
+    // The Spaces menu as it closes: main's mode, whether the overlay view is
+    // still on screen, and the menu as the overlay is drawing it.
+    async spacesMenuExitState() {
+      const wc = getOverlayWebContents();
+      const view = { mode: getOverlayMode() ?? null, showing: isOverlayViewShowing() };
+      if (!wc) return view;
+      const menu = await wc.executeJavaScript(`(() => {
+        const m = document.getElementById('workspaceSwitcher'); const s = getComputedStyle(m);
+        return { hidden: m.hidden, closing: document.body.dataset.closing ?? '', display: s.display, top: s.top, left: s.left, transform: s.transform, opacity: Number(s.opacity) };
+      })()`);
+      return { ...view, ...menu };
+    },
+    async emulateReducedMotion(on) {
+      for (const wc of [getChromeWebContents(), getOverlayWebContents()].filter(Boolean)) {
+        if (!wc.debugger.isAttached()) wc.debugger.attach('1.3');
+        await wc.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: on ? 'reduce' : '' }] });
+      }
+      return true;
+    },
+
+    setSupporterActive() { settings.setPatron({ kind: 'founding', key: 'test', activationId: 'test', benefitId: null, activatedAt: 0 }); },
+
+    // ---- address-bar context menu (F19-2/F19-3) ----
+    // A native Menu.popup() can't be driven by Playwright, so these bind the
+    // same pure/action layers the popup runs: buildAddressMenu for contents,
+    // runAddressMenuItem for the click paths (incl. the pasteAndGo wrapper).
+    setClipboardText(text) { clipboard.writeText(text); },
+    readClipboardText() { return clipboard.readText(); },
+    addressMenuWired() { return isAddressMenuAttached(); },
+    async addressFieldText() {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay is not open');
+      // The PRODUCTION read (shared id constant + executeJavaScript), so the
+      // acceptance binding exercises the real field-read path, not a copy.
+      return readAddressFieldText(wc);
+    },
+    async addressMenu({ fieldText }) {
+      return buildAddressMenu({
+        // In the real event Blink reports all-true flags for a focused,
+        // populated input; the flag→enabled mapping is unit-tested.
+        editFlags: {
+          canUndo: true, canRedo: true, canCut: true, canCopy: true,
+          canPaste: true, canDelete: true, canSelectAll: true,
+        },
+        clipboardText: await clipboard.readText(),
+        fieldText,
+        t: refs.t,
+      });
+    },
+    runAddressMenuItem(id, fieldText) {
+      return runAddressMenuItem(id, {
+        wc: getOverlayWebContents(),
+        fieldText,
+        actions: {
+          // Mirror the production closure (main.js) exactly, guard included —
+          // the hook must not exercise a path a real click can't take.
+          pasteAndGo: (text) => {
+            const id = getActiveTabId();
+            if (id) pasteAndGo(id, text);
+          },
+        },
+      });
+    },
+
+    // ---- address routing / overlay ----
+    resolveAddress(input) { return normalizeAddressInput(input); },
+    wouldHandOff(url) {
+      return classifyExternalNavigation(url).action !== 'none';
+    },
+    handoffDecision(url) { return classifyExternalNavigation(url).action; },
+    openDownloads() { openInternalPage('blanc://downloads/'); },
+    openHistorySheet() { openInternalPage('blanc://history/'); },
+    // F52: the History sheet's Archived view, read and clicked through its own DOM.
+    async historySheetArchivedRows() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc || !wc.getURL().startsWith('blanc://history/')) return null;
+      return wc.executeJavaScript(`(() => ({
+        view: document.getElementById('viewArchived')?.getAttribute('aria-pressed') === 'true' ? 'archived' : 'visits',
+        rows: [...document.querySelectorAll('#list .row')].map((row) => ({
+          title: row.querySelector('.title')?.textContent ?? '',
+          url: row.querySelector('.url')?.textContent ?? '',
+        })),
+      }))()`);
+    },
+    async historySheetClick(selector) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const el = document.querySelector(${JSON.stringify(String(selector))});
+        if (!el || el.hidden) return false;
+        el.click();
+        return true;
+      })()`);
+    },
+    openSettings() { openInternalPage('blanc://settings/'); },
+    // F47: Settings → General → Your bangs, through the page's own controls.
+    async settingsBangControls() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => ({
+        enabled: document.getElementById('bangsEnabled')?.checked ?? null,
+        rows: [...document.querySelectorAll('#customBangList .site-row')].map((row) => ({
+          code: row.querySelector('.custom-bang-code')?.textContent.replace(/^!/, '') ?? '',
+          name: row.querySelector('.site-row-name')?.textContent ?? '',
+          host: row.querySelector('.custom-bang-host')?.textContent ?? '',
+        })),
+        empty: !!document.querySelector('#customBangList .site-list-empty'),
+        error: document.getElementById('customBangError')?.hidden === false ? document.getElementById('customBangError').textContent : null,
+        replaces: document.getElementById('customBangReplaces')?.hidden === false ? document.getElementById('customBangReplaces').textContent : null,
+      }))()`);
+    },
+    async settingsAddBang(code, name, template) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const set = (id, value) => { const el = document.getElementById(id); if (!el) return false; el.value = value; return true; };
+        if (!set('customBangCode', ${JSON.stringify(String(code))})) return false;
+        if (!set('customBangName', ${JSON.stringify(String(name))})) return false;
+        if (!set('customBangTemplate', ${JSON.stringify(String(template))})) return false;
+        document.getElementById('customBangAdd').click();
+        return true;
+      })()`);
+    },
+    async settingsRemoveBang(code) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const row = [...document.querySelectorAll('#customBangList .site-row')]
+          .find((r) => r.querySelector('.custom-bang-code')?.textContent === '!' + ${JSON.stringify(String(code))});
+        if (!row) return false;
+        row.querySelector('.site-row-remove').click();
+        return true;
+      })()`);
+    },
+    /** ⌘+ in one window, whichever window the OS has focused. */
+    zoomInWindow(id) { return refs.runInWindowRuntime(String(id), () => zoomActiveTab(1)); },
+    openSettingsInWindow(id) { return refs.runInWindowRuntime(String(id), () => openInternalPage('blanc://settings/')); },
+    async settingsSiteZoomRowsInWindow(id) {
+      return refs.runInWindowRuntime(String(id), () => getUtilitySheetWebContents()?.executeJavaScript(
+        `[...document.querySelectorAll('#siteZoomList .site-row-name')].map((name) => name.textContent)`) ?? []);
+    },
+    closeUtilitySurfaceInWindow(id) { return refs.runInWindowRuntime(String(id), () => hideUtilitySheet()); },
+    async settingsChoosePageZoom(percent) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const select = document.getElementById('pageZoom');
+        if (!select?.options.length) return false;
+        select.value = ${JSON.stringify(String(percent))};
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()`);
+    },
+    async settingsSiteZoomRows() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return [];
+      return wc.executeJavaScript(`[...document.querySelectorAll('#siteZoomList .site-row')].map((row) => ({
+        name: row.querySelector('.site-row-name')?.textContent ?? '',
+        detail: row.querySelector('.site-row-detail')?.textContent ?? '',
+      }))`);
+    },
+    async settingsRemoveSiteZoom(site) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const row = [...document.querySelectorAll('#siteZoomList .site-row')]
+          .find((candidate) => candidate.querySelector('.site-row-name')?.textContent === ${JSON.stringify(String(site))});
+        row?.querySelector('.site-row-remove').click();
+        return !!row;
+      })()`);
+    },
+    async settingsProfileRows() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return [];
+      return wc.executeJavaScript(`[...document.querySelectorAll('.profile-row')].map((row) => ({
+        id: row.dataset.profileId,
+        title: row.querySelector('.title')?.textContent ?? '',
+        meta: row.querySelector('.meta')?.textContent ?? '',
+        actions: [...row.querySelectorAll('.actions button')].map((button) => button.textContent)
+      }))`);
+    },
+    async scrollSettingsSheetToEnd() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const page = document.querySelector('body.sheet .page');
+        page.scrollTop = page.scrollHeight;
+        return true;
+      })()`);
+    },
+    async settingsCurrentSection() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`document.querySelector('.settings-nav a.current')?.dataset.group ?? null`);
+    },
+    async utilitySheetPalette() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => ({
+        text: getComputedStyle(document.body).color,
+        card: getComputedStyle(document.querySelector('.page')).backgroundColor,
+        currentNav: getComputedStyle(document.querySelector('.page-nav a.current')).color,
+      }))()`);
+    },
+    async utilitySheetRowIcons() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`[...document.querySelectorAll('.row')].map((row) => {
+        const icon = row.querySelector('.row-icon');
+        return { image: !!icon?.querySelector('img'), letter: icon?.classList.contains('fallback') ? icon.textContent : '' };
+      })`);
+    },
+    async historyDayHeadings() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`[...document.querySelectorAll('.day-heading')].map((h) => h.textContent)`);
+    },
+    async settingsHintState() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`[...document.querySelectorAll('.setting .label .hint:not(.field-error)')]
+        .filter((hint) => hint.offsetParent)
+        .map((hint, index) => ({ index, text: hint.textContent, folded: hint.classList.contains('folded'),
+          hasToggle: hint.nextElementSibling?.classList.contains('hint-toggle') ?? false }))`);
+    },
+    async toggleFirstFoldedHint() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => { const b = document.querySelector('.hint-toggle'); b?.click(); return !!b; })()`);
+    },
+    /** Settings → Profiles → Open links from other apps (F60): read the
+     * group, or drive its controls the way a person does. */
+    async settingsLinkRoutes(action, ...args) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const [action, ...args] = ${JSON.stringify([String(action), ...args])};
+        const card = document.getElementById('linkRoutesCard');
+        if (!card) return null;
+        const rows = () => [...document.querySelectorAll('#linkRoutesList .link-route-row')];
+        const fire = (element, ...events) => { for (const type of events) element.dispatchEvent(new Event(type, { bubbles: true })); };
+        if (action === 'state') {
+          return {
+            ready: card.dataset.ready === 'true',
+            shown: !card.hidden,
+            fallback: card.querySelector('.link-route-fallback')?.textContent ?? '',
+            rows: rows().map((row) => {
+              const [profile, space] = row.querySelectorAll('select');
+              const input = row.querySelector('input[type="text"]');
+              return {
+                label: row.getAttribute('aria-label'),
+                value: input.value,
+                invalid: input.getAttribute('aria-invalid') === 'true',
+                error: row.querySelector('.field-error')?.textContent ?? '',
+                note: row.querySelector('.link-route-note')?.textContent ?? '',
+                profileId: profile.value,
+                spaceId: space.value || null,
+                private: row.querySelector('input[type="checkbox"]').checked,
+              };
+            }),
+          };
+        }
+        if (action === 'add') { document.getElementById('linkRouteAdd').click(); return rows().length; }
+        const row = rows()[args[0]];
+        if (!row) return false;
+        if (action === 'fill') {
+          const input = row.querySelector('input[type="text"]');
+          input.value = args[1];
+          fire(input, 'input', 'change');
+          return true;
+        }
+        if (action === 'profile') {
+          const select = row.querySelectorAll('select')[0];
+          select.value = args[1];
+          fire(select, 'change');
+          return select.value === args[1];
+        }
+        return false;
+      })()`);
+    },
+    async settingsCreateProfile(name) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const input = document.getElementById('newProfileName');
+        const create = document.getElementById('newProfileCreate');
+        if (!input || !create) return false;
+        input.value = ${JSON.stringify(String(name ?? ''))};
+        create.click();
+        return true;
+      })()`);
+    },
+    async settingsRenameProfile(profileId, name) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const row = document.querySelector('.profile-row[data-profile-id=' + JSON.stringify(${JSON.stringify(String(profileId))}) + ']');
+        const rename = [...(row?.querySelectorAll('.actions button') ?? [])].find((button) => button.textContent === 'Rename');
+        if (!rename) return false;
+        rename.click();
+        const input = row.querySelector('.main input');
+        const save = [...row.querySelectorAll('.actions button')].find((button) => button.textContent === 'Save');
+        if (!input || !save) return false;
+        input.value = ${JSON.stringify(String(name ?? ''))};
+        save.click();
+        return true;
+      })()`);
+    },
+    async settingsDeleteProfile(profileId, confirmation) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const row = document.querySelector('.profile-row[data-profile-id=' + JSON.stringify(${JSON.stringify(String(profileId))}) + ']');
+        let confirm = [...(row?.querySelectorAll('.actions button') ?? [])].find((button) => button.textContent === 'Delete permanently');
+        if (!confirm) {
+          const remove = [...(row?.querySelectorAll('.actions button') ?? [])].find((button) => button.textContent === 'Delete');
+          if (!remove) return false;
+          remove.click();
+          confirm = [...row.querySelectorAll('.actions button')].find((button) => button.textContent === 'Delete permanently');
+        }
+        const input = row.querySelector('.main input');
+        if (!input || !confirm) return false;
+        input.value = ${JSON.stringify(String(confirmation ?? ''))};
+        confirm.click();
+        return true;
+      })()`);
+    },
+    openFind() { openFindBar(); },
+    openPanel() { showOverlay('panel'); },
+    openPalette() { showOverlay('palette'); },
+    closeOverlay() { hideOverlay({ refocusContent: false }); },
+    overlayMode() { return getOverlayMode(); },
+    findTabId() { return getFindTargetTabId(); },
+    overlayViewBounds() { return getOverlayViewBounds(); },
+    overlayViewAttached() { return getOverlayViewAttached(); },
+    // The hidden display-capture helper is created on the first share
+    // request; this creates it the same way, for tests that need it to exist.
+    async prepareDisplayCaptureHelper() {
+      await prepareDisplayCaptureHelper();
+      return true;
+    },
+    setSearchSuggestionFixture(suggestions) {
+      setTestSearchSuggestionFixture(suggestions);
+    },
+    searchSuggestionRequests() {
+      return getTestSearchSuggestionRequests();
+    },
+    captureSearchNavigation(enabled) {
+      setTestSearchNavigationCapture(enabled);
+    },
+    capturedSearchSubmission() {
+      return getTestSearchSubmission();
+    },
+    async editAddressInput(value, inputType = 'insertText') {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay is not open');
+      return wc.executeJavaScript(`(() => {
+        const input = document.getElementById(${JSON.stringify(ADDRESS_INPUT_ID)});
+        if (!input) return false;
+        input.value = ${JSON.stringify(String(value))};
+        input.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: ${JSON.stringify(String(inputType))},
+          data: null
+        }));
+        return true;
+      })()`);
+    },
+    async pressAddressKey(key, modifiers = {}) {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay is not open');
+      const init = {
+        key: String(key),
+        bubbles: true,
+        altKey: !!modifiers.altKey,
+        ctrlKey: !!modifiers.ctrlKey,
+        metaKey: !!modifiers.metaKey,
+        shiftKey: !!modifiers.shiftKey,
+      };
+      return wc.executeJavaScript(`(() => {
+        const input = document.getElementById(${JSON.stringify(ADDRESS_INPUT_ID)});
+        if (!input) return false;
+        input.dispatchEvent(new KeyboardEvent('keydown', ${JSON.stringify(init)}));
+        return true;
+      })()`);
+    },
+    // faviconDecoded is deliberately the decoded pixel size, not a boolean: a
+    // synced icon whose bytes are corrupt still yields a `has-icon` class and a
+    // non-empty background-image, so only an actual decode separates a rendered
+    // favicon from a broken one.
+    /** The ⌘L panel's section headers (groups, devices, the bang picker). */
+    async addressSectionHeaders() {
+      const wc = getOverlayWebContents();
+      if (!wc) return [];
+      return wc.executeJavaScript(`[...document.querySelectorAll('#islandList .island-ghead .ghead-name')].map((el) => el.textContent)`);
+    },
+    /** Whether the ⌘L list's highlighted row sits inside the list's scroll
+     * viewport (null when nothing is highlighted). */
+    async addressActiveRowVisible() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const list = document.getElementById('islandList');
+        const row = list?.querySelector('.island-row.active');
+        if (!list || !row) return null;
+        const l = list.getBoundingClientRect();
+        const r = row.getBoundingClientRect();
+        return r.top >= l.top - 1 && r.bottom <= l.bottom + 1;
+      })()`);
+    },
+    async addressInputValue() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`document.getElementById(${JSON.stringify(ADDRESS_INPUT_ID)})?.value ?? null`);
+    },
+    /** A suggestions request straight through the bridge, around the
+     * overlay's own guard, so main's refusal is what is tested. */
+    async requestSearchSuggestions(query) {
+      const wc = getOverlayWebContents();
+      if (!wc) throw new Error('overlay is not open');
+      return wc.executeJavaScript(`window.browserAPI.searchSuggestions(${JSON.stringify(String(query))})`);
+    },
+    async addressResultRows() {
+      const wc = getOverlayWebContents();
+      if (!wc) return [];
+      return wc.executeJavaScript(`(async () => {
+        const rows = [...document.querySelectorAll('#islandList .island-row')];
+        return Promise.all(rows.map(async (row) => {
+          const fav = row.querySelector('.favicon');
+          const raw = fav ? getComputedStyle(fav).backgroundImage : '';
+          let url = '';
+          if (raw && raw.indexOf('url(') === 0) {
+            url = raw.slice(4, raw.length - 1);
+            if (url[0] === '"' || url[0] === "'") url = url.slice(1, -1);
+          }
+          let faviconDecoded = null;
+          if (url) {
+            faviconDecoded = await new Promise((resolve) => {
+              const img = new Image();
+              img.onload = () => resolve(img.naturalWidth + 'x' + img.naturalHeight);
+              img.onerror = () => resolve(false);
+              img.src = url;
+            });
+          }
+          return {
+            title: row.querySelector('.row-title')?.textContent ?? '',
+            // Bang hint and picker rows carry a code and a sentence or name.
+            cmd: row.querySelector('.row-cmd')?.textContent ?? '',
+            hint: row.querySelector('.row-hint')?.textContent ?? '',
+            sub: row.querySelector('.row-sub')?.textContent ?? '',
+            tag: row.querySelector('.row-tag')?.textContent ?? '',
+            label: row.querySelector('.row-primary')?.getAttribute('aria-label') ?? '',
+            quiet: row.classList.contains('quiet'),
+            active: row.classList.contains('active'),
+            enter: !!row.querySelector('.row-enter'),
+            faviconClass: fav ? fav.className : '',
+            faviconHasIcon: !!(fav && fav.classList.contains('has-icon')),
+            faviconDecoded
+          };
+        }));
+      })()`);
+    },
+    async addressCommandNotice() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const row = document.querySelector('#islandList .command-notice');
+        return row ? { text: row.textContent, role: row.getAttribute('role') } : null;
+      })()`);
+    },
+    async overlayRendererMode() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript('document.body.dataset.mode || null');
+    },
+    utilitySurface() { return getUtilitySheetState(); },
+    closeUtilitySurface() { hideUtilitySheet(); return true; },
+    windowContentBounds() { return getWindowContentBounds(); },
+    setWindowContentSize(width, height) { setWindowContentSize(width, height); },
+    // Fronts + focuses the window and reports whether it is now focused, so
+    // pointer-driven steps can insist on an unoccluded, undeprioritized
+    // chrome renderer before dispatching a captured pointer sequence.
+    focusWindow() { return focusMainWindow(); },
+    activeGuestBounds() { return tabs.get(getActiveTabId())?.view.getBounds() ?? null; },
+    utilityBounds() { return getUtilitySheetBounds(); },
+    overlayBounds() { return getOverlayBounds(); },
+    async overlayElementRect(selector) {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const element = document.querySelector(${JSON.stringify(String(selector))});
+        if (!element || element.hidden) return null;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return {
+          x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+          display: style.display, visibility: style.visibility
+        };
+      })()`);
+    },
+    async islandLayoutToggleState() {
+      const wc = getOverlayWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => {
+        const button = document.getElementById('footerTabLayout');
+        if (!button) return null;
+        return {
+          // The Island's own tooltip (#938) replaced the native title.
+          title: button.dataset.tooltip ?? button.title,
+          label: button.getAttribute('aria-label'),
+          pressed: button.getAttribute('aria-pressed')
+        };
+      })()`);
+    },
+    async islandDotsState() {
+      const chrome = getChromeWebContents();
+      if (!chrome) return null;
+      return chrome.executeJavaScript(`(() => {
+        const overflow = document.querySelector('.pill-overflow');
+        return {
+          directCount: document.querySelectorAll('.island-dot').length,
+          directIds: [...document.querySelectorAll('.island-dot')]
+            .map((dot) => dot.dataset.tabId),
+          directTitles: [...document.querySelectorAll('.island-dot')]
+            .map((dot) => dot.title),
+          overflowText: overflow?.textContent ?? '',
+          overflowLabel: overflow?.getAttribute('aria-label') ?? '',
+          // Site icons instead of dots (#1175): the row's mode and, per
+          // direct tab, whether it draws an icon at rest.
+          iconsMode: document.getElementById('pillDots')?.classList.contains('icons') === true,
+          iconCount: document.querySelectorAll('#pillDots .island-dot > .dot-icon').length,
+          peekCount: document.querySelectorAll('#pillDots .island-dot > .dot-peek').length,
+        };
+      })()`);
+    },
+    async quietChromeState(id) {
+      const chrome = getChromeWebContents();
+      if (!chrome) return null;
+      return chrome.executeJavaScript(`(() => {
+        const dot = document.querySelector(
+          '.island-dot[data-tab-id="' + CSS.escape(${JSON.stringify(String(id))}) + '"]'
+        );
+        const row = document.querySelector(
+          '.vertical-tab-row[data-tab-id="' + CSS.escape(${JSON.stringify(String(id))}) + '"]'
+        );
+        return {
+          dotPresent: !!dot,
+          dotQuiet: !!dot?.classList.contains('asleep'),
+          dotPrivate: !!dot?.classList.contains('private'),
+          dotLabel: dot?.getAttribute('aria-label') ?? '',
+          railQuiet: !!row?.classList.contains('quiet'),
+          railPrivate: !!row?.classList.contains('private'),
+          railLabel: row?.querySelector('.vertical-tab-primary')?.getAttribute('aria-label') ?? '',
+        };
+      })()`);
+    },
+    async clickIslandDot(id) {
+      const chrome = getChromeWebContents();
+      if (!chrome) return false;
+      return chrome.executeJavaScript(`(() => {
+        const dot = document.querySelector(
+          '.island-dot[data-tab-id="' + CSS.escape(${JSON.stringify(String(id))}) + '"]'
+        );
+        if (!dot || dot.getClientRects().length === 0) return false;
+        dot.click();
+        return true;
+      })()`);
+    },
+    async quietRowDimStyles(id) {
+      const overlay = getOverlayWebContents();
+      const chrome = getChromeWebContents();
+      if (!overlay || !chrome) {
+        return { panel: { error: 'no web contents' }, rail: { error: 'no web contents' } };
+      }
+      const idJson = JSON.stringify(String(id));
+
+      // One measurement, both surfaces. Contains no backticks and no ${...},
+      // so it interpolates verbatim into each executeJavaScript template below.
+      const MEASURE = `(row, interactive) => {
+        const out = {};
+        if (interactive) {
+          out.hovered = row.matches(':hover');
+          out.focused = row.matches(':focus-within');
+        }
+        // Rendered: display/visibility up the whole ancestor chain.
+        for (let el = row; el && el !== document.documentElement; el = el.parentElement) {
+          const s = getComputedStyle(el);
+          if (s.display === 'none') return { error: 'display:none on ' + (el.className || el.tagName) };
+          if (s.visibility === 'hidden') return { error: 'visibility:hidden on ' + (el.className || el.tagName) };
+        }
+        // The dim IS the state: the row's own computed opacity, plus the
+        // cumulative product ABOVE it (a transparent ancestor would make the
+        // dim unreadable while the row's own value still said 0.5).
+        let cumulative = 1;
+        for (let el = row.parentElement; el && el !== document.documentElement; el = el.parentElement) {
+          cumulative *= parseFloat(getComputedStyle(el).opacity);
+        }
+        const rect = row.getBoundingClientRect();
+        return Object.assign(out, {
+          rowOpacity: getComputedStyle(row).opacity,
+          ancestorOpacity: cumulative,
+          rectWidth: rect.width, rectHeight: rect.height,
+        });
+      }`;
+
+      const panel = await overlay.executeJavaScript(`(() => {
+        const measure = ${MEASURE};
+        const row = document.querySelector(
+          '#islandList .island-row[data-tab-id="' + CSS.escape(${idJson}) + '"]'
+        );
+        if (!row) return { error: 'quiet panel row not found' };
+        if (!row.classList.contains('quiet')) return { error: 'panel row is not .quiet' };
+        return measure(row, true);
+      })()`);
+
+      const rail = await chrome.executeJavaScript(`(() => {
+        const measure = ${MEASURE};
+        const row = document.querySelector(
+          '.vertical-tab-row[data-tab-id="' + CSS.escape(${idJson}) + '"]'
+        );
+        if (!row) return { error: 'quiet rail row not found' };
+        if (!row.classList.contains('quiet')) return { error: 'rail row is not .quiet' };
+        return measure(row, false);
+      })()`);
+
+      return { panel, rail };
+    },
+    async clickIslandLayoutToggle() {
+      const wc = getOverlayWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const button = document.getElementById('footerTabLayout');
+        if (!button) return false;
+        button.click();
+        return true;
+      })()`);
+    },
+    async activePageState() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab) return null;
+      return tab.view.webContents.executeJavaScript(`(() => ({
+        loadCounter: Number(sessionStorage.getItem('acceptance-load-count') || 0),
+        draft: document.getElementById('acceptance-draft')?.value ?? null
+      }))()`);
+    },
+    async setActivePageDraft(value) {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const input = document.getElementById('acceptance-draft');
+        if (!input) return false;
+        input.value = ${JSON.stringify(String(value))};
+        return true;
+      })()`);
+    },
+    activeWebContentsId() {
+      return tabs.get(getActiveTabId())?.view.webContents.id ?? null;
+    },
+    async probeFocusAfterTabBroadcast(id) {
+      const tab = tabs.get(id);
+      if (!tab) return { tabBlurCount: 0, chromeFocusCount: 0 };
+      const wc = tab.view?.webContents;
+      if (!wc) return { tabBlurCount: 0, chromeFocusCount: 0 };
+      // Let the Playwright main-process evaluate handoff settle, then establish
+      // page focus immediately before the product broadcast under test.
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      wc.focus();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const chrome = getChromeWebContents();
+      let tabBlurCount = 0;
+      let chromeFocusCount = 0;
+      const onTabBlur = () => { tabBlurCount += 1; };
+      const onChromeFocus = () => { chromeFocusCount += 1; };
+      wc.on('blur', onTabBlur);
+      chrome?.on('focus', onChromeFocus);
+      tab.title = `${tab.title || 'Tab'} · focus probe`;
+      broadcastTabs();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      wc.removeListener('blur', onTabBlur);
+      chrome?.removeListener('focus', onChromeFocus);
+      return {
+        tabBlurCount,
+        chromeFocusCount,
+      };
+    },
+    beginTabFocusObservation(id) {
+      clearFocusObservation();
+      const tab = tabs.get(id);
+      if (!tab) return false;
+      const wc = tab.view?.webContents;
+      if (!wc) return false;
+      const observation = { wc, count: 0, listener: null };
+      observation.listener = () => { observation.count += 1; };
+      observation.wc.on('focus', observation.listener);
+      focusObservation = observation;
+      return true;
+    },
+    finishTabFocusObservation() {
+      if (!focusObservation) return { count: 0 };
+      const result = { count: focusObservation.count };
+      clearFocusObservation();
+      return result;
+    },
+    /** `count` > 1 adds numbered copies of the fixture device, for a drawer
+     * taller than its height cap. */
+    injectRemoteDevices(count = 1) {
+      const devices = Array.from({ length: Math.max(1, count) }, (_, index) => (index === 0 ? remoteFixture[0] : {
+        ...remoteFixture[0],
+        deviceId: `${remoteFixture[0].deviceId}-${index + 1}`,
+        name: `${remoteFixture[0].name} ${index + 1}`,
+      }));
+      pushRemoteDevices(devices);
+      return structuredClone(devices);
+    },
+    clearRemoteDevices() { pushRemoteDevices([]); },
+    /** Send to device: `{targets, inbox, sendStatus}` replace sync's sends. */
+    injectSends(options) { injectSends(options); return true; },
+    clearSends() { injectedSends = null; setSendsSource(null); return true; },
+    sentRequests() { return structuredClone(injectedSends?.sent ?? []); },
+    setSendStatus(status) { if (injectedSends) injectedSends.sendStatus = status; return true; },
+    /** The Ledger's Sent to this device rows on every open start page. */
+    async sentStartPageRows() {
+      const rows = [];
+      for (const tab of tabs.values()) {
+        if (!urlOf(tab).startsWith('blanc://newtab')) continue;
+        try {
+          rows.push(...await tab.view.webContents.executeJavaScript(`[...document.querySelectorAll('#sentList .sent-item')].map((item) => ({
+            title: item.querySelector('.name')?.textContent ?? '',
+            from: item.querySelector('.host')?.textContent ?? '',
+            visible: !document.getElementById('sentSection').hidden,
+          }))`));
+        } catch { /* a start page mid-navigation has nothing to read */ }
+      }
+      return rows;
+    },
+    async clickSentStartPageRow(title, part) {
+      for (const tab of tabs.values()) {
+        if (!urlOf(tab).startsWith('blanc://newtab')) continue;
+        const clicked = await tab.view.webContents.executeJavaScript(`(() => {
+          const item = [...document.querySelectorAll('#sentList .sent-item')].find((el) => el.querySelector('.name')?.textContent === ${JSON.stringify(title)});
+          const target = item?.querySelector(${JSON.stringify(part === 'dismiss' ? '.sent-dismiss' : 'a.fav')});
+          if (!target) return false;
+          target.click();
+          return true;
+        })()`).catch(() => false);
+        if (clicked) return true;
+      }
+      return false;
+    },
+    // Mirrors addressResultRows' favicon reporting so the start page and the
+    // Quick Switcher are guarded to the same standard: the tile letter is
+    // replaced by the icon only once the bytes actually decode.
+    async remoteStartPageRows() {
+      const rows = [];
+      for (const tab of tabs.values()) {
+        if (!urlOf(tab).startsWith('blanc://newtab')) continue;
+        try {
+          const rendered = await tab.view.webContents.executeJavaScript(
+            `(async () => {
+              const items = [...document.querySelectorAll('#remoteList a')];
+              return Promise.all(items.map(async (row) => {
+                const tile = row.querySelector('.tile');
+                const raw = tile ? getComputedStyle(tile).backgroundImage : '';
+                let url = '';
+                if (raw && raw.indexOf('url(') === 0) {
+                  url = raw.slice(4, raw.length - 1);
+                  if (url[0] === '"' || url[0] === "'") url = url.slice(1, -1);
+                }
+                let faviconDecoded = null;
+                if (url) {
+                  faviconDecoded = await new Promise((resolve) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img.naturalWidth + 'x' + img.naturalHeight);
+                    img.onerror = () => resolve(false);
+                    img.src = url;
+                  });
+                }
+                return {
+                  title: row.querySelector('.name')?.textContent ?? '',
+                  host: row.querySelector('.host')?.textContent ?? '',
+                  href: row.href,
+                  tileLetter: tile ? tile.textContent : '',
+                  faviconHasIcon: !!(tile && tile.classList.contains('has-icon')),
+                  faviconDecoded
+                };
+              }));
+            })()`
+          );
+          rows.push(...rendered);
+        } catch { /* page may still be committing; caller polls */ }
+      }
+      return rows;
+    },
+    nativeMenuLabels() {
+      const labels = [];
+      const visit = (menu) => {
+        for (const item of menu?.items ?? []) {
+          if (item.label) labels.push(item.label);
+          if (item.submenu) visit(item.submenu);
+        }
+      };
+      visit(Menu.getApplicationMenu());
+      return labels;
+    },
+    openFavoritesSheet() { openInternalPage('blanc://bookmarks/'); },
+    openTabImport() { openInternalPage('blanc://tab-import/'); },
+    readTabImportDom,
+    getTabImportSessionProjection() { return projectRootTabImportSession(); },
+    async applyTabImportFixture(name, options = {}) {
+      const fixtureName = String(name ?? '');
+      const stage = String(options?.stage ?? 'apply');
+      if (stage === 'quit-gate' || stage === 'after-quit-refusal') {
+        let dom = await ensureTabImportQuitGate(fixtureName);
+        if (stage === 'after-quit-refusal') {
+          await clickTabImportSelector('#tabImportSourceRecovery button');
+          dom = await waitForTabImportDom(
+            (value) => value?.step === 'source' && value.status.includes('Reopen'),
+            'tab-import exact-newest refusal',
+            TAB_IMPORT_FIXTURES[fixtureName].timeout,
+          );
+        }
+        return { ok: true, dom };
+      }
+      const targetStage = stage === 'preview' || stage === 'cancel'
+        ? 'tabs'
+        : (stage === 'organize' || options?.renameFrom || options?.directApply ? 'organize' : 'review');
+      let dom = await ensureTabImportFixtureStage(
+        fixtureName,
+        targetStage,
+      );
+      if (stage === 'preview' || stage === 'organize' || stage === 'review') {
+        return {
+          ok: true,
+          dom,
+          projection: await waitForTabImportProjection(
+            TAB_IMPORT_FIXTURES[fixtureName].candidateCount,
+            TAB_IMPORT_FIXTURES[fixtureName].timeout,
+          ),
+        };
+      }
+      if (options?.renameFrom && options?.renameTo) {
+        dom = await renameTabImportGroup(options.renameFrom, options.renameTo);
+        await clickTabImportSelector('#tabImportContinueToReview');
+        dom = await waitForTabImportDom(
+          (value) => value?.step === 'review' && !value.applyDisabled,
+          'tab-import review after rename',
+          TAB_IMPORT_FIXTURES[fixtureName].timeout,
+        );
+      }
+      const projection = await waitForTabImportProjection(
+        TAB_IMPORT_FIXTURES[fixtureName].candidateCount,
+        TAB_IMPORT_FIXTURES[fixtureName].timeout,
+      );
+      if (options?.runtimeId !== undefined && options?.runtimeId !== null) {
+        const request = tabImportApplyRequestFromProjection(projection);
+        if (options?.staleGeneration) request.generation = `stale-${request.generation}`;
+        return applyTabImportFromRuntime(
+          options.runtimeId,
+          projection.sessionId,
+          request,
+        );
+      }
+      if (options?.directApply) {
+        const request = tabImportApplyRequestFromProjection(projection);
+        const beforeBroadcasts = getTabStateBroadcastCount();
+        const result = applyTabImportFromRuntime(
+          testRuntimeId,
+          projection.sessionId,
+          request,
+        );
+        const broadcastCount = getTabStateBroadcastCount() - beforeBroadcasts;
+        if (result?.ok) activeTabImportFixtureName = null;
+        return { ...result, applied: result?.ok === true, projection, broadcastCount };
+      }
+      if (stage === 'cancel') {
+        // Use the renderer's real close control: the ✕ calls
+        // bowserPages.surface.close, and main's hideUtilitySheet destroys
+        // the session (discardUtilityImportState). Clicking it proves the
+        // path a person takes, rather than calling hideUtilitySheet here.
+        await clickTabImportSelector('.sheet-close');
+        const closeDeadline = Date.now() + 8_000;
+        while (getUtilitySheetState()?.visible) {
+          if (Date.now() > closeDeadline) throw new Error('timed out dismissing tab-import sheet');
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        activeTabImportFixtureName = null;
+        return {
+          ok: true,
+          cancelled: true,
+          projectionAfterCancel: projectRootTabImportSession(),
+          surfaceAfterCancel: getUtilitySheetState(),
+        };
+      }
+      await clickTabImportSelector('#tabImportApplyBtn');
+      const deadline = Date.now() + 8_000;
+      while (getUtilitySheetState()?.visible) {
+        if (Date.now() > deadline) {
+          throw new Error(`timed out applying tab-import fixture; last: ${JSON.stringify(await readTabImportDom())}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      activeTabImportFixtureName = null;
+      return { ok: true, applied: true, projection };
+    },
+    activePageHasTabImportBridge() {
+      const tab = tabs.get(getActiveTabId());
+      const wc = tab?.view?.webContents;
+      if (!wc || wc.isDestroyed()) return false;
+      return wc.executeJavaScript(
+        `typeof window.bowserPages?.tabImport === 'object'`
+      );
+    },
+    utilitySheetContentsId() { return getUtilitySheetWebContents()?.id ?? null; },
+    // Settings → Sync device pairing (design 2026-10-16): the off-state code
+    // path as the person sees it, and the clicks/typing that drive it. Reads
+    // DOM state only; the pairing code itself never appears in this record.
+    // Design 2026-10-28 §6.2: which windows ask to be left out of capture.
+    windowsContentProtected() {
+      // Blanc's own record of the window it protected: macOS 27 keeps
+      // isContentProtected() true after protection is lifted (see main.js).
+      const win = pairingProtectedWindow?.();
+      return win && !win.isDestroyed() ? 1 : 0;
+    },
+    settingsSyncPairingDom() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc || !wc.getURL().startsWith('blanc://settings')) return null;
+      return wc.executeJavaScript(`(() => {
+        const byId = (id) => document.getElementById(id);
+        const visible = (el) => !!el && !el.hidden && el.offsetParent !== null;
+        return {
+          pathOrder: [...document.querySelectorAll('#syncPaths .sync-path')].map((b) => b.id),
+          pathsVisible: visible(byId('syncPaths')),
+          codeFormVisible: visible(byId('syncCodeForm')),
+          nameFormVisible: visible(byId('syncForm')),
+          connectDisabled: !!byId('syncCodeSubmit')?.disabled,
+          codeValue: byId('syncCode')?.value ?? '',
+          status: byId('syncCodeStatus')?.textContent ?? '',
+          // Design 2026-10-28: Turn on Sync, Other ways, the on state and the sheet.
+          turnOnVisible: visible(byId('syncTurnOn')),
+          firstPath: document.querySelector('#syncPaths button')?.id ?? '',
+          otherWays: [...document.querySelectorAll('#syncOtherWays .sync-path')].map((b) => b.id),
+          syncOn: visible(byId('syncActive')),
+          handle: byId('syncStatusHandle')?.textContent ?? '',
+          recoveryPromptVisible: visible(byId('syncRecoveryPrompt')),
+          sheetOpen: !!byId('syncPairingDialog')?.open,
+          // Open is not enough: a modal inside a hidden ancestor opens at 0×0.
+          sheetVisible: !!byId('syncPairingDialog')?.open && byId('syncPairingDialog').getBoundingClientRect().width > 0,
+          sheetCode: byId('syncPairingDialog')?.open && !byId('syncPairing')?.hidden ? (byId('syncPairingCode')?.textContent ?? '') : '',
+          joinedTitle: byId('syncPairingDialog')?.open && !byId('syncPairingJoined')?.hidden ? (byId('syncPairingJoinedTitle')?.textContent ?? '') : '',
+          askingSpaces: !!byId('syncPairingDialog')?.open && !byId('syncPairingQuestion')?.hidden && !byId('syncPairingJoined')?.hidden,
+          doneVisible: !!byId('syncPairingDialog')?.open && !byId('syncPairingJoined')?.hidden,
+          // Connect your iPhone (design 2026-10-28 §6.1–§6.2).
+          connectIphoneVisible: visible(byId('syncConnectIphone')),
+          startShown: !!byId('syncPairingDialog')?.open && !byId('syncPairingStart')?.hidden,
+          sheetTitle: byId('syncPairingDialog')?.open ? (!byId('syncPairingStart')?.hidden ? byId('syncPairingStartTitle') : byId('syncPairingTitle'))?.textContent ?? '' : '',
+          // An <svg> has no .hidden property: judge the QR by what's drawn.
+          qrPath: byId('syncPairingQr')?.getBoundingClientRect().width > 0 ? (byId('syncPairingQr')?.firstElementChild?.getAttribute('d') ?? '') : '',
+          qrViewBox: byId('syncPairingQr')?.getAttribute('viewBox') ?? '',
+        };
+      })()`);
+    },
+    settingsSyncPairingAct(action, value) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc || !wc.getURL().startsWith('blanc://settings')) return false;
+      return wc.executeJavaScript(`(() => {
+        const action = ${JSON.stringify(String(action))};
+        const value = ${JSON.stringify(String(value ?? ''))};
+        if (action === 'choose-code') { document.getElementById('syncPathCode').click(); return true; }
+        if (action === 'use-passphrase') { document.getElementById('syncUsePassphrase').click(); return true; }
+        if (action === 'back') { document.getElementById('syncCodeBack').click(); return true; }
+        if (action === 'turn-on') { document.getElementById('syncTurnOn').click(); return true; }
+        if (action === 'add-device') { document.getElementById('syncAddDevice').click(); return true; }
+        if (action === 'spaces-not-now') { document.getElementById('syncPairingSpacesNotNow').click(); return true; }
+        if (action === 'connect-iphone') { document.getElementById('syncConnectIphone').click(); return true; }
+        if (action === 'continue') { document.getElementById('syncPairingContinue').click(); return true; }
+        if (action === 'add-this-first') { document.getElementById('syncPairingAddThisFirst').click(); return true; }
+        if (action === 'type-code') {
+          const input = document.getElementById('syncCode');
+          input.value = value;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          return true;
+        }
+        return false;
+      })()`);
+    },
+    async destroyUtilitySheetContents() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc || wc.isDestroyed()) return false;
+      // close() initiates native teardown; destruction and cache cleanup can
+      // arrive later. The harness should return after the promised action.
+      await new Promise(resolve => {
+        wc.once('destroyed', resolve);
+        wc.close();
+      });
+      return true;
+    },
+    readBrowserImportDom() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return null;
+      return wc.executeJavaScript(`(() => ({
+        options: [...document.querySelectorAll('#browserSource option')].map((o) => ({
+          value: o.value,
+          label: o.textContent,
+        })),
+        buttonHidden: document.getElementById('browserImportBtn')?.hidden ?? true,
+        findHidden: document.getElementById('browserFindBtn')?.hidden ?? true,
+        status: document.getElementById('importStatus')?.textContent ?? '',
+      }))()`);
+    },
+    clickBrowserFind() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const button = document.getElementById('browserFindBtn');
+        if (!button || button.hidden) return false;
+        button.click();
+        return true;
+      })()`);
+    },
+    // Chooses a detected profile by its visible label, as picking it from the
+    // Favorites page's profile menu would.
+    selectBrowserSource(label) {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`((label) => {
+        const select = document.getElementById('browserSource');
+        const option = [...(select?.options ?? [])].find((o) => o.textContent === label && !o.disabled);
+        if (!option) return false;
+        select.value = option.value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })(${JSON.stringify(String(label))})`);
+    },
+    clickBrowserImport() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) return false;
+      return wc.executeJavaScript(`(() => {
+        const button = document.getElementById('browserImportBtn');
+        if (!button || button.hidden) return false;
+        button.click();
+        return true;
+      })()`);
+    },
+    showTestFirstRunMigration() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      // The acceptance profile completes first run at launch; the synthetic
+      // status below stands for a fresh profile, so main's own first-run gate
+      // (the Tab Archive offer, spec D5) must agree with it.
+      refs.setFirstRunPendingForTest(true);
+      tab.view.webContents.send('pages:start:status', {
+        startup: { phase: 'skipped', attempt: 0, error: null },
+        privacy: {
+          required: true,
+          searchSuggestions: true,
+          usagePing: false,
+        },
+      });
+      return true;
+    },
+    // First-run onboarding dialog (replaced the privacy card, 2026-08-16).
+    // The names keep their card-era spelling so F30-3's steps stay bound;
+    // "migration" now means the dialog's import step.
+    readFirstRunMigrationDom() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return null;
+      return tab.view.webContents.executeJavaScript(`(() => ({
+        initialReady: (document.getElementById('footerLeft')?.textContent ?? '').length > 0,
+        privacyHidden: document.getElementById('onboardDialog')?.hidden ?? true,
+        migrationHidden: document.querySelector('#obContent [data-step="1"]')?.hidden ?? true,
+        findHidden: document.getElementById('obLook')?.hidden ?? true,
+        options: [...document.querySelectorAll('#obSources .ob-src-row')].map((row) => row.textContent),
+        status: document.getElementById('obImportStatus')?.textContent ?? '',
+        bringTabsHidden: document.getElementById('obBringTabs')?.hidden ?? true,
+        bringTabsLabel: document.getElementById('obBringTabs')?.textContent ?? '',
+        step: document.getElementById('onboardDialog')?.dataset.step ?? null,
+      }))()`);
+    },
+    // Advances the dialog to its import step (step 1) so the migration
+    // hooks below have their surface on screen.
+    openFirstRunImportStep() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const dialog = document.getElementById('onboardDialog');
+        if (!dialog || dialog.hidden) return false;
+        if (dialog.dataset.step === '0') document.getElementById('obNext').click();
+        return dialog.dataset.step === '1';
+      })()`);
+    },
+    clickFirstRunMigrationFind() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const button = document.getElementById('obLook');
+        if (!button || button.hidden) return false;
+        button.click();
+        return true;
+      })()`);
+    },
+    clickFirstRunMigration() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const dialog = document.getElementById('onboardDialog');
+        if (!dialog || dialog.hidden || dialog.dataset.step !== '1') return false;
+        const rows = [...document.querySelectorAll('#obSources .ob-src-row')]
+          .filter((row) => !row.textContent.includes('bookmarks file'));
+        if (!rows.length) return false;
+        if (!rows[0].classList.contains('selected')) rows[0].click();
+        document.getElementById('obNext').click();
+        return true;
+      })()`);
+    },
+    clickFirstRunBringTabs() {
+      const tab = tabs.get(getActiveTabId());
+      if (!tab || !urlOf(tab).startsWith('blanc://newtab')) return false;
+      return tab.view.webContents.executeJavaScript(`(() => {
+        const button = document.getElementById('obBringTabs');
+        if (!button || button.hidden) return false;
+        button.click();
+        return true;
+      })()`);
+    },
+
+    // ---- utility sheet drive helpers (acceptance) ----
+    // Both click helpers ASSERT the anchor exists — an optional-chained
+    // click would silently no-op and turn a rendering regression into a
+    // downstream timeout instead of a pointed failure.
+    async followNewtabFavoritesLink() {
+      const t = tabs.get(getActiveTabId());
+      const clicked = await t.view.webContents.executeJavaScript(
+        `(() => { const a = document.querySelector('a[href="blanc://bookmarks/"]'); if (a) a.click(); return !!a; })()`);
+      if (!clicked) throw new Error('newtab ledger has no favorites link');
+    },
+    seedFavorite(url, title, favicon) {
+      // Prefer a production-accepted PNG so Quick Switcher Favorite rows can
+      // assert a real decode. Callers may pass null explicitly to seed an
+      // iconless favorite (the heal path).
+      const icon = favicon === undefined
+        ? 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAABr0lEQVR4nLTWsUrDQBgH8O/7cmpr1aFj8Rmq+BSiaAdBqnZQfAlx8EnsIO1UcKhDfQkdbJd20EFBUKgFO0TTXM7vEhDR1ia55JZLLnC/u/93kBPKb57nSSkPj4+a9UZn5iQ3IhcUAYJxEzw7+k0IUT2vZmwcXvaXREG6nwrQXEBeu+5QPxASePC6feG0OpZYVK4EYwN5B9wpTyFpA7WJ/VLNbrUTMWivsm+POA1dBiJiTZHKNyvZjaJ0hygsHlAQv1kPnd5j935zp8TrRAVs6AkRsuWie/vi9J5IZEDHGHMfVnf2dLXjzd0McuUVfWq45okatOBYy1bho9V+K9VB11uHpQ39Ecyz4vPuOdLhetrpGIQ6F+TTkpKhp/CTTcugoEvPoO+nlAz6+ZKGQb/eEzfo71CyBo0dTdCgCeOJGROBpIz/gESMKYC5MR0wNEIBJkZYILYRAYhnRANiGJGBsMZVJbvOxnscIJSBmG8ezJfW8BnOIG7zz4niHDgNzoSTCWrKRnCTg6hFnr4Pxf94DGYPrtVGwBhjqwaOhOAuisY7GGNc3w12GzCS4C+fjS8AAAD///R8eLkAAAAGSURBVAMAqMIc5gOIAroAAAAASUVORK5CYII='
+        : favicon;
+      if (!bookmarks.isBookmarked(url)) bookmarks.toggleBookmark(url, title || url, icon);
+      else if (icon) bookmarks.updateFavicon(url, icon);
+    },
+    // F16-6 attack drivers: run the hostile expression in the ACTIVE tab's
+    // real page context and resolve only after it executed — a scenario
+    // must never pass because an inline script silently failed to run.
+    async attemptNavigateActiveTab(url) {
+      const t = tabs.get(getActiveTabId());
+      const ran = await t.view.webContents.executeJavaScript(
+        `(() => { location.href = ${JSON.stringify(String(url))}; return true; })()`);
+      if (ran !== true) throw new Error('navigation attempt did not execute');
+    },
+    async attemptWindowOpenActiveTab(url) {
+      const t = tabs.get(getActiveTabId());
+      const ran = await t.view.webContents.executeJavaScript(
+        `(() => { window.open(${JSON.stringify(String(url))}); return true; })()`);
+      if (ran !== true) throw new Error('window.open attempt did not execute');
+    },
+    async clickFirstSheetLink() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) throw new Error('sheet not open');
+      const clicked = await wc.executeJavaScript(
+        `(() => { const a = document.querySelector('a[href^="https"], a[href^="http"]'); if (a) a.click(); return !!a; })()`);
+      if (!clicked) throw new Error('no outbound link rendered in sheet');
+    },
+    async clickPatronCheckout() {
+      const wc = getUtilitySheetWebContents();
+      if (!wc) throw new Error('sheet not open');
+      const clicked = await wc.executeJavaScript(
+        `(() => { const a = document.getElementById('patronCheckout'); if (a) { a.click(); return true; } return false; })()`);
+      if (clicked !== true) throw new Error('Patron checkout CTA not rendered in Settings');
+      return true;
+    },
+    attemptChromeNavigation(url) { return attemptChromeNavigation(String(url)); },
+    chromeUrl() { return getChromeUrl(); },
+    persistedSessionData() { return persistedSessionData(); },
+    serializedTabsPayload() { return serializedTabsPayload(); },
+    tabHandoffState() { return getTabHandoffTestState(); },
+    queueTabHandoff(url) { return queueTabHandoffForTest(String(url)); },
+    acceptTabHandoff(destination) { return acceptTabHandoffForTest(destination); },
+    cancelTabHandoff() { return cancelTabHandoffForTest(); },
+    sessionSyncSnapshot() {
+      return syncSnapshot(getTabOrder().map((id) => tabs.get(id)), getGroups());
+    },
+
+    // ---- Quiet Tabs ----
+    // Every method drives the real main-process implementation; a mirror here
+    // would keep the acceptance suite green if the shipping code regressed.
+    async sleepTab(id) { return sleepTab(id); },
+    // quietTab refuses whenever anything is uncertain and records why; the
+    // desktop smokes read the reason so a refusal can't fail them silently.
+    async quietTabOutcome(id) {
+      const rested = await sleepTab(id);
+      return { rested, reason: rested ? null : (quietRefusal(id) ?? 'unknown') };
+    },
+    async wakeTab(id, navigateTo = null) { return wakeTab(id, { navigateTo }); },
+    async wakeTabAtIndex(id, atIndex) { return wakeTab(id, { atIndex }); },
+    async sleepBackgroundTabsNow() { return sleepBackgroundTabsNow(); },
+    createQuietTab(url, title = 'Restored quiet tab', isPrivate = false) {
+      return createTab(String(url), {
+        private: !!isPrivate,
+        asleep: true,
+        title: String(title),
+        favicon: null,
+      });
+    },
+    setQuietProtection(id, reason) {
+      const tab = tabs.get(id);
+      if (!tab) return false;
+      if (reason === 'pinned') tab.pinned = true;
+      else if (reason === 'muted') tab.muted = true;
+      else if (reason === 'audible') tab.audible = true;
+      else if (reason === 'used media') tab.usedMedia = true;
+      else if (reason === 'capturing') {
+        tab.capturing = true;
+        tab.capture = { audio: true, video: false };
+      }
+      else if (reason === 'adopted child') tab.adopted = true;
+      else if (reason === 'non-refetchable POST') tab.restorableCommit = false;
+      else if (reason === 'pending permission') {
+        getPermissionPrompts().set(`quiet-${id}`, { tabId: id, resolve: () => {} });
+      } else return false;
+      broadcastTabs();
+      return true;
+    },
+    /** With an id: that tab's redacted state. Without: every tab in tab order.
+     * NEVER returns entries: snapshots can contain POST bodies and form data. */
+    /** Kill a tab's renderer exactly as Blanc's renderer discard does: a
+     *  SIGKILL of the verified own renderer on Linux, where Electron's crash
+     *  request is only a request, and forcefullyCrashRenderer() elsewhere. */
+    crashTabRenderer(id) {
+      const wc = tabs.get(id)?.view?.webContents;
+      if (!wc || wc.isDestroyed()) return null;
+      return terminateRenderer(wc);
+    },
+    /** For the acceptance harness's self-test: an uncaught main-process
+     *  exception, which the BLANC_TEST handler logs before exiting. */
+    raiseMainProcessExceptionForTest() {
+      // Late enough that this call's reply reaches the harness first.
+      setTimeout(() => { throw new Error('acceptance harness: synthetic main-process exception'); }, 100);
+      return true;
+    },
+    sleepState(id) {
+      const snapshots = getSleepSnapshots();
+      const one = (tabId, tab) => ({
+        id: tabId,
+        asleep: !!tab.asleep,
+        hasSnapshot: snapshots.has(tabId),
+        entryCount: snapshots.get(tabId)?.entries.length ?? 0,
+        droppedPageState: !!snapshots.get(tabId)?.droppedPageState,
+      });
+      if (typeof id === 'string') {
+        const tab = tabs.get(id);
+        return tab ? one(id, tab) : null;
+      }
+      return getTabOrder()
+        .map((tabId) => {
+          const tab = tabs.get(tabId);
+          return tab ? one(tabId, tab) : null;
+        })
+        .filter(Boolean);
+    },
+    /** Backdate a tab's idle clock so a sweep sees it as idle. */
+    setTabIdleSince(id, msAgo) {
+      const tab = tabs.get(id);
+      if (!tab) return false;
+      tab.lastActiveAt = Date.now() - Number(msAgo || 0);
+      return true;
+    },
+    async runSleepSweep() { return runSleepSweep(); },
+    // ---- Tab Archive (F52) ----
+    setTabArchive(value) { return settings.setSettings({ tabArchive: value }).tabArchive; },
+    /** Backdate a tab's last-viewed clock so an archive sweep sees it as idle. */
+    setTabViewedSince(id, msAgo) {
+      const tab = tabs.get(id);
+      if (!tab) return false;
+      tab.lastViewedAt = Date.now() - Number(msAgo || 0);
+      return true;
+    },
+    setArchiveGraceUntil(ms) { setArchiveGraceUntil(ms); },
+    /** The real resume listeners, as when the machine wakes from sleep. */
+    emitPowerResume() { powerMonitor.emit('resume'); },
+    async runArchiveSweep() { return runArchiveSweep(); },
+    /** One-shot: once the sweep has probed `id`, make it the active tab, as a
+     *  person switching to it mid-sweep would. */
+    activateCandidateDuringArchiveProbe(id) {
+      setArchiveProbeObserver((probedId) => {
+        if (probedId !== id) return;
+        setArchiveProbeObserver(null);
+        setActiveTab(id, { focusContent: false });
+      });
+      return true;
+    },
+    async runArchiveSweepsConcurrently() { return Promise.all([runArchiveSweep(), runArchiveSweep()]); },
+    /** The 30-second timer's fan-out: one archive sweep per window runtime,
+     *  set-aside Spaces included. */
+    async runArchiveSweepInEveryWindow() { return runArchiveSweepInEveryWindow(); },
+    archiveEntries() { return archive.listArchive({ now: Date.now() }); },
+    archiveNoticePending() { return archive.pendingNotice(); },
+    restoreArchived(id) { return restoreArchivedEntry(id); },
+    setSleepThresholdOverride(ms) { return setSleepThresholdOverride(ms); },
+    /** Falsifiability hook: only an OS process count proves a discarded view
+     * released its renderer rather than merely disappearing from the tab map. */
+    tabProcessCount() {
+      return app.getAppMetrics().filter((process) => process.type === 'Tab').length;
+    },
+
+    // ---- isolation between scenarios ----
+    async reset() {
+      refs.workspaceTestAction('reset');
+      clearFocusObservation();
+      injectedSends = null;
+      setSendsSource(null);
+      activeTabImportFixtureName = null;
+      // Keep the current deletion lifecycle authoritative: it settles native
+      // visibility and closes profile windows before clearing their sessions.
+      // Pre-closing them here races asynchronous native/view teardown.
+      for (const profile of localProfileSnapshots()) {
+        if (profile.id === 'default') continue;
+        await deleteNamedLocalProfile(profile.id, profile.name);
+      }
+      for (const runtime of windowRuntimeSnapshots()) {
+        if (runtime.id !== 'primary') closeWindowRuntimeAction(runtime.id);
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      // Do not let a scenario inherit retained page state. Quiet imported tabs
+      // are viewless and have no snapshot, so waking hundreds of them merely to
+      // delete them makes the stress scenario's cleanup slower than the product
+      // operation itself. Only retained snapshot state needs an explicit wake
+      // before teardown; closeTab safely removes the other quiet records.
+      for (const [id, tab] of tabs) {
+        if (tab.asleep && getSleepSnapshots().has(id)) await wakeTab(id);
+      }
+      getSleepSnapshots().clear();
+      getPermissionPrompts().clear();
+      setTestCursorPoint(null);
+      setTestCursorSamplingUnavailable(false);
+      beforeUnloadProbes.clear();
+      // Start Page pins outlive history by design; no scenario inherits them.
+      for (const pin of startPagePins.listPins()) startPagePins.unpin(pin.url);
+      setSleepThresholdOverride(null);
+      // No scenario inherits another's open surface.
+      hideOverlay({ refocusContent: false });
+      hideUtilitySheet();
+      pushRemoteDevices([]);
+      // A device a scenario renamed shows its published name again.
+      for (const id of Object.keys(settings.getDeviceNames())) settings.setDeviceName(id, '');
+      settings.setLinkRoutes([]);
+      setWindowContentSize(1280, 800);
+      // A fresh tab first so closing the rest never empties the window.
+      const keep = createTab(newTabUrl());
+      setActiveTab(keep, { focusContent: false });
+      // A reset is not a user closing tabs: recording here would leak entries
+      // into the next scenario, and the last eligible close would park a live
+      // WebContentsView for the whole grace window — corrupting both the
+      // reopen list and the quiet-tabs renderer-count baseline.
+      for (const id of [...tabs.keys()]) if (id !== keep) closeTab(id, { record: false });
+      // Entries a scenario recorded through its own closes are cleared here,
+      // including parked renderers and their independent expiry timers.
+      clearClosedEntries();
+      getGroups().length = 0;
+      history.clearHistory();
+      archive.clearArchive();
+      archive.resetNoticeForTest();
+      setArchiveGraceUntil(0);
+      refs.setFirstRunPendingForTest(false);
+      for (const b of bookmarks.listBookmarks()) bookmarks.removeBookmark(b.id);
+      settings.setSettings({
+        searchEngine: 'duckduckgo',
+        searchEngineTemplate: '',
+        searchSuggestions: true,
+        adblockEnabled: true,
+        homePage: '',
+        theme: 'system',
+        tabLayout: 'island',
+        newtabLayout: 'billboard',
+        verticalTabsWidth: 248,
+        verticalTabsTextSize: 'default',
+        miniWindowShortcut: 'off',
+        islandSize: 'default',
+        appIcon: 'sunrise',
+        adblockExceptions: [],
+        bangsEnabled: true,
+        customBangs: [],
+        onePasswordEnabled: false,
+        onePasswordAccount: '',
+        tabSleep: '1h',
+        tabArchive: 'off',
+        islandHoverOpen: false,
+        islandTabIcons: false,
+        launchSunrise: false,
+        linkRoutesInApp: false,
+        islandAutoHide: false,
+        islandAutoHideStyle: 'float',
+        surfaceStyle: 'sunrise',
+        // The launch-time auto-complete records false; F36-2 seeds true and
+        // relies on Skip to overwrite it — a failure before Skip must not
+        // leak that seed into later scenarios.
+        usagePing: false,
+      });
+      settings.setPatron(null);
+      clearRecentBangsAndIcons();
+      bangIcons.resetForTest();
+      clearTestSearchSuggestionFixture();
+      setTestSearchNavigationCapture(false);
+      broadcastTabs();
+    },
+  };
+
+  // Mechanical, generic wrap — every method installed above is rebound to
+  // the owning runtime at call time, not just the ones a hand-picked list
+  // would remember to cover. None of these methods use `this`, so replacing
+  // each with an arrow-function wrapper is behavior-preserving.
+  if (typeof bindRoot === 'function') {
+    for (const key of Object.keys(globalThis.__blanc)) {
+      const fn = globalThis.__blanc[key];
+      if (typeof fn === 'function') globalThis.__blanc[key] = bindRoot(fn);
+    }
+  }
+  installTestCallBridge(globalThis, globalThis.__blanc);
+}
+
+module.exports = { install };

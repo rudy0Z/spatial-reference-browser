@@ -1,0 +1,40 @@
+node_modules/
+# Rebuilt from pinned sources during npm install/ci; its manifest stays tracked.
+/src/main/assets/adblock-engine-seed.bin
+dist/
+dist-ecs/
+# Ad-hoc local build output (`--dir=dist-local-…`). `dist/` does not cover these,
+# and unpacked electron-builder output runs ~330 MB per directory.
+dist-local*
+out/
+.cache/
+*.log
+.DS_Store
+brand/
+.superpowers/
+.playwright-cli/
+output/
+
+# Local press-outreach drafts (do not commit)
+docs/press-release-blanc-desktop.md
+docs/press-outreach-plan.md
+# Raw benchmark output is machine- and session-specific. Commit the specific
+# report you intend to cite in public, not every exploratory run.
+bench/memory/results/
+bench/tab-import/.hf-cache/
+bench/tab-import/results/
+.astro/
+site/.parity/
+site/.parity-shots/
+.fontenv/
+# Blubird is a licensed commercial typeface: the website (and the wordmark) may
+# use it, but the font files must never be redistributed, and this repository is
+# public. Install them locally with `npm run site:fonts -- /path/to/Blubird.zip`
+# (see site/CLAUDE.md).
+site/public/fonts/blubird/
+/src/renderer/pages/Blubird*
+# The licensed zip, or anything unpacked from it, anywhere in the tree.
+Blubird*.zip
+
+# Wrangler's local dev and dry-run state (can hold the machine's IP geolocation).
+.wrangler/

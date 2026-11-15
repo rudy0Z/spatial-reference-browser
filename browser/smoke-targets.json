@@ -1,0 +1,33 @@
+[ {
+   "description": "",
+   "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/664994BFEFD1F8B13FDD01EFD786B4E0",
+   "id": "664994BFEFD1F8B13FDD01EFD786B4E0",
+   "title": "Example Domain",
+   "type": "page",
+   "url": "https://example.com/",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/664994BFEFD1F8B13FDD01EFD786B4E0"
+}, {
+   "description": "",
+   "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/994C13D4D671D63D97E814212CD2105C",
+   "id": "994C13D4D671D63D97E814212CD2105C",
+   "title": "Spatial",
+   "type": "page",
+   "url": "blanc-chrome://index/",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/994C13D4D671D63D97E814212CD2105C"
+}, {
+   "description": "",
+   "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/AF5C386286CC62472555749908EEE7F6",
+   "id": "AF5C386286CC62472555749908EEE7F6",
+   "title": "New Tab",
+   "type": "page",
+   "url": "blanc://newtab/",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/AF5C386286CC62472555749908EEE7F6"
+}, {
+   "description": "",
+   "devtoolsFrontendUrl": "/devtools/inspector.html?ws=127.0.0.1:9222/devtools/page/BCEDED1EAD9653FDB38CC15ADA9D6A14",
+   "id": "BCEDED1EAD9653FDB38CC15ADA9D6A14",
+   "title": "Spatial Overlay",
+   "type": "page",
+   "url": "blanc-chrome://overlay/",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/BCEDED1EAD9653FDB38CC15ADA9D6A14"
+} ]

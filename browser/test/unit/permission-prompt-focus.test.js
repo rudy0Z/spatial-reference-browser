@@ -1,0 +1,239 @@
+'use strict';
+
+// A site decides when its permission prompt appears, so the prompt must never
+// take the keyboard from whatever the person is typing into: a keystroke
+// meant for the page could otherwise answer the prompt, and a Block answer is
+// persisted for the origin (permissions.js saveDecision).
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+const { showOverlayView } = require('../../src/main/overlay-view-lifecycle');
+
+const ROOT = path.join(__dirname, '../..');
+const promptSource = fs.readFileSync(path.join(ROOT, 'src/renderer/permission.js'), 'utf8');
+
+function fakeElement(id) {
+  const listeners = new Map();
+  return {
+    id,
+    hidden: true,
+    textContent: '',
+    focusCalls: 0,
+    focus() { this.focusCalls += 1; },
+    toggleAttribute(name, force) { if (name === 'hidden') this.hidden = !!force; },
+    dataset: {},
+    // The prompt sentence is built from text nodes plus a host element (F44).
+    replaceChildren(...nodes) { this.textContent = nodes.map((node) => node.textContent ?? node.data).join(''); },
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    dispatch(type, event = {}) {
+      const full = { preventDefault() {}, ...event };
+      for (const fn of listeners.get(type) ?? []) fn(full);
+    },
+  };
+}
+
+/** Runs the real permission.js against a minimal DOM and preload bridge. */
+function loadPromptDocument() {
+  const ids = ['permissionBar', 'permissionText', 'permissionGlyphs', 'permGlyphMic',
+    'permGlyphCam', 'permAllowBtn', 'permBlockBtn'];
+  const elements = Object.fromEntries(ids.map((id) => [id, fakeElement(id)]));
+  const document = fakeElement('document');
+  document.getElementById = (id) => elements[id] ?? null;
+  document.createTextNode = (data) => ({ data });
+  document.createElement = (tag) => fakeElement(tag);
+  const answers = [];
+  let deliver = null;
+  const window = {
+    browserAPI: {
+      respondPermission: (id, allow) => answers.push([id, allow]),
+      onPermissionPrompt: (callback) => { deliver = callback; },
+    },
+  };
+  // The prompt's text comes from the interface catalog, as every chrome
+  // document loads it (strings.js + i18n.js); English here.
+  const { createTranslator } = require('../../src/renderer/pages/i18n.js');
+  const strings = require('../../src/renderer/pages/strings.en.js');
+  const t = createTranslator({ locale: 'en', messages: strings.messages });
+  vm.runInNewContext(promptSource, { document, window, URL, blancI18n: { t, parts: t.parts } });
+  assert.ok(deliver, 'permission.js did not subscribe to prompts');
+  return { elements, document, answers, deliver };
+}
+
+const GEOLOCATION = { id: 11, origin: 'https://maps.example', permission: 'geolocation', mediaTypes: [] };
+
+test('clicking Block answers the shown prompt with a denial', () => {
+  // Positive control: proves the harness can observe an answer, so the
+  // Escape test below cannot pass just because nothing is wired up.
+  const { elements, answers, deliver } = loadPromptDocument();
+  deliver(GEOLOCATION);
+  assert.equal(elements.permissionBar.hidden, false);
+  assert.equal(elements.permissionText.textContent, 'maps.example wants to know your location');
+  elements.permBlockBtn.dispatch('click');
+  assert.deepEqual(answers, [[11, false]]);
+});
+
+test('showing a prompt leaves keyboard focus where it was', () => {
+  const { elements, deliver } = loadPromptDocument();
+  deliver(GEOLOCATION);
+  deliver({ id: 12, origin: 'https://call.example', permission: 'media', mediaTypes: ['audio', 'video'] });
+  elements.permAllowBtn.dispatch('click'); // advances to the queued media prompt
+  assert.equal(elements.permissionText.textContent, 'call.example wants to use your camera and microphone');
+  const focused = Object.values(elements).filter((element) => element.focusCalls > 0).map((element) => element.id);
+  assert.deepEqual(focused, []);
+});
+
+test('Escape does not answer a pending prompt', () => {
+  const { document, elements, answers, deliver } = loadPromptDocument();
+  deliver(GEOLOCATION);
+  document.dispatch('keydown', { key: 'Escape' });
+  assert.deepEqual(answers, []);
+  assert.equal(elements.permissionBar.hidden, false, 'the prompt must stay up until answered');
+});
+
+const mainSource = fs.readFileSync(path.join(ROOT, 'src/main/main.js'), 'utf8');
+const attachStart = mainSource.indexOf('function attachPermissionView(');
+const attachEnd = mainSource.indexOf('\n}', attachStart) + 2;
+const attachSource = attachStart >= 0 ? mainSource.slice(attachStart, attachEnd) : null;
+
+test('attachPermissionView is liftable from main.js', () => {
+  assert.ok(attachSource, 'attachPermissionView not found — update this test');
+});
+
+const ensureStart = mainSource.indexOf('function ensurePermissionView(');
+const ensureEnd = mainSource.indexOf('\n}', ensureStart) + 2;
+const ensureSource = ensureStart >= 0 ? mainSource.slice(ensureStart, ensureEnd) : null;
+
+test('ensurePermissionView is liftable from main.js', () => {
+  assert.ok(ensureSource, 'ensurePermissionView not found — update this test');
+});
+
+function fakeWebContents(id) {
+  // Electron's WebContents is an EventEmitter; keep its event semantics real.
+  const wc = new (require('node:events').EventEmitter)();
+  Object.assign(wc, {
+    id,
+    focusCalls: 0,
+    focus() { wc.focusCalls += 1; },
+    isDestroyed: () => false,
+    loadURL() {},
+    send() {},
+  });
+  return wc;
+}
+
+/** Creates a brand-new prompt view while `focused` holds the keyboard.
+ * `window` is what is on screen; by default nothing on it reports focus, so
+ * the choice falls back to Electron's getFocusedWebContents(). */
+function createPromptView(focused, window = null) {
+  const runtime = { permissionView: null, permissionPrompts: new Map(), window };
+  const sandbox = {
+    rt: () => runtime,
+    WebContentsView: class { constructor() { this.webContents = fakeWebContents(99); } setBackgroundColor() {} },
+    CHROME_PARTITION: 'blanc-chrome',
+    CHROME_PERMISSION_URL: 'blanc-chrome://permission/',
+    path,
+    __dirname: path.join(ROOT, 'src/main'),
+    windowRuntimes: { registerChromeSurface() {}, unregisterChromeSurface() {} },
+    bindWindowRuntime: (_owner, fn) => fn,
+    lockPrivilegedNavigation() {},
+    installChromeShortcuts() {},
+    webContents: { getFocusedWebContents: () => focused },
+    onScreenFocusedContents: require('../../src/main/focused-contents').onScreenFocusedContents,
+    setImmediate,
+  };
+  vm.createContext(sandbox);
+  return vm.runInContext(`${ensureSource}; ensurePermissionView();`, sandbox);
+}
+
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test('a brand-new prompt view hands the keyboard straight back to the page', async () => {
+  // Electron focuses a newly created view the moment it is attached.
+  const page = fakeWebContents(5);
+  const view = createPromptView(page);
+  view.webContents.emit('focus');
+  await nextTurn();
+  assert.equal(page.focusCalls, 1);
+});
+
+test('the hand-back waits until the prompt has finished taking focus', async () => {
+  // On Windows and Linux a focus() made inside the new view's focus event is
+  // overridden as Chromium finishes moving focus to it, and the prompt keeps
+  // the keyboard (checked with real keystrokes for v1.41.0).
+  const page = fakeWebContents(5);
+  const view = createPromptView(page);
+  view.webContents.emit('focus');
+  assert.equal(page.focusCalls, 0, 'focus() inside the focus event is lost on Windows and Linux');
+  await nextTurn();
+  assert.equal(page.focusCalls, 1);
+});
+
+test('once the prompt has loaded, clicking into it keeps the keyboard there', async () => {
+  const page = fakeWebContents(5);
+  const view = createPromptView(page);
+  view.webContents.emit('focus');
+  await nextTurn();
+  view.webContents.emit('did-finish-load');
+  view.webContents.emit('focus'); // the person clicks Allow or Block
+  await nextTurn();
+  assert.equal(page.focusCalls, 1, 'a deliberate click must not bounce focus back to the page');
+});
+
+test('a hidden tab still reporting focus never takes the keyboard back from the page', async () => {
+  // On macOS a tab detached while focused can keep reporting it, and
+  // Electron's getFocusedWebContents() then names that tab first.
+  const stale = Object.assign(fakeWebContents(43), { isFocused: () => true });
+  const page = Object.assign(fakeWebContents(45), { isFocused: () => true });
+  const window = {
+    isDestroyed: () => false,
+    webContents: Object.assign(fakeWebContents(1), { isFocused: () => false }),
+    contentView: { children: [{ webContents: stale, getVisible: () => false }, { webContents: page, getVisible: () => true }] },
+  };
+  const view = createPromptView(stale, window);
+  view.webContents.emit('focus');
+  await nextTurn();
+  assert.deepEqual({ page: page.focusCalls, stale: stale.focusCalls }, { page: 1, stale: 0 });
+});
+
+test('nothing held the keyboard, so nothing is handed back', async () => {
+  const view = createPromptView(null);
+  assert.doesNotThrow(() => view.webContents.emit('focus'));
+  await nextTurn();
+});
+
+for (const platform of ['linux', 'darwin']) {
+  test(`${platform}: attaching the prompt view shows it without focusing it`, () => {
+    const added = [];
+    const view = {
+      focusCalls: 0,
+      bounds: null,
+      visible: false,
+      setBounds(bounds) { this.bounds = bounds; },
+      setVisible(value) { this.visible = value; },
+      webContents: { focus() { view.focusCalls += 1; } },
+    };
+    const runtime = { window: { contentView: { addChildView: (child) => added.push(child) } }, permissionViewAttached: false };
+    let cancelledReclaim = false;
+    const sandbox = {
+      cancelAddressBarFocusReclaim: () => { cancelledReclaim = true; },
+      hasLiveWindow: () => true,
+      ensurePermissionView: () => view,
+      permissionViewBounds: () => ({ x: 0, y: 736, width: 560, height: 84 }),
+      rt: () => runtime,
+      showOverlayView: (window, child) => showOverlayView(window, child, platform),
+    };
+    vm.createContext(sandbox);
+    vm.runInContext(`${attachSource}; attachPermissionView();`, sandbox);
+    assert.deepEqual(added, [view], 'the prompt view must be attached');
+    assert.equal(view.visible, true, 'a prompt hidden after the last request must show again');
+    assert.equal(runtime.permissionViewAttached, true);
+    assert.equal(cancelledReclaim, true);
+    assert.equal(view.focusCalls, 0);
+  });
+}

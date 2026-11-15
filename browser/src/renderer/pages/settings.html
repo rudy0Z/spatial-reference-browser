@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; font-src 'self';" />
+  <script src="strings.js"></script>
+  <script src="i18n.js"></script>
+  <title data-i18n="settings.page.title">Settings</title>
+  <link rel="icon" type="image/png" href="icon-sunrise.png" />
+  <link rel="stylesheet" href="pages.css" />
+  <link rel="stylesheet" href="settings.css" />
+</head>
+<body class="sheet">
+  <div class="page">
+    <nav class="page-nav">
+      <a href="blanc://settings/" class="current" data-i18n="pagesNav.settings">Settings</a>
+      <a href="blanc://bookmarks/" data-i18n="pagesNav.bookmarks">Favorites</a>
+      <a href="blanc://history/" data-i18n="pagesNav.history">History</a>
+      <a href="blanc://downloads/" data-i18n="pagesNav.downloads">Downloads</a>
+    </nav>
+    <h1 data-i18n="settings.page.heading">Settings</h1>
+
+    <div class="settings-shell">
+      <nav class="settings-nav">
+        <a href="#group-general" data-group="general" data-i18n="settings.nav.general">General</a>
+        <a href="#group-sync" data-group="sync" data-i18n="settings.nav.sync">Sync</a>
+        <a href="#group-profiles" data-group="profiles" data-i18n="settings.nav.profiles">Profiles</a>
+        <a href="#group-privacy" data-group="privacy" data-i18n="settings.nav.privacy">Privacy &amp; Security</a>
+        <a href="#group-trust" data-group="trust" data-i18n="settings.nav.trust">About &amp; Trust</a>
+        <a href="#group-diagnostics" data-group="diagnostics" data-i18n="settings.nav.diagnostics">Diagnostics</a>
+        <a href="#group-patron" data-group="patron" data-i18n="settings.nav.patron">Patron</a>
+        <a href="#group-help" data-group="help" data-i18n="settings.nav.help">Help</a>
+      </nav>
+
+      <div class="settings-content">
+        <section class="settings-group" id="group-general">
+          <h2 class="group-title" data-i18n="settings.general.title">General</h2>
+          <div class="settings-card settings-card--mixed">
+            <h3 class="card-title" data-i18n="settings.general.cards.island">Island</h3>
+            <div class="setting" id="tabLayoutSetting">
+              <div class="label">
+                <span data-i18n="settings.general.tabLayout.label">Tab layout</span>
+                <span class="hint" data-i18n="settings.general.tabLayout.hint">Keep tabs in the Island or show them in a left rail; search and commands always stay in the Island</span>
+              </div>
+              <select id="tabLayout" aria-label="Tab layout" data-i18n-aria-label="settings.general.tabLayout.label">
+                <option value="island" data-i18n="settings.general.tabLayout.island">Island</option>
+                <option value="vertical" data-i18n="settings.general.tabLayout.vertical">Vertical tabs</option>
+              </select>
+            </div>
+
+            <div class="setting" id="islandSizeSetting">
+              <div class="label">
+                <span data-i18n="settings.general.islandSize.label">Island size</span>
+                <span class="hint" id="islandSizeHint" data-i18n="settings.general.islandSize.hint">Make the Island and its buttons bigger. The page moves down to make room.</span>
+              </div>
+              <select id="islandSize" aria-label="Island size" aria-describedby="islandSizeHint" data-i18n-aria-label="settings.general.islandSize.label">
+                <option value="default" data-i18n="settings.general.islandSize.default">Default</option>
+                <option value="large" data-i18n="settings.general.islandSize.large">Large</option>
+                <option value="extra-large" data-i18n="settings.general.islandSize.extraLarge">Extra large</option>
+              </select>
+            </div>
+
+            <div class="setting" id="verticalTabsTextSizeSetting">
+              <div class="label">
+                <span data-i18n="settings.general.verticalTabsTextSize.label">Vertical tab text size</span>
+                <span class="hint" id="verticalTabsTextSizeHint" data-i18n="settings.general.verticalTabsTextSize.hint">Make tab titles and group names easier to read in the vertical tab sidebar.</span>
+              </div>
+              <select id="verticalTabsTextSize" aria-label="Vertical tab text size" aria-describedby="verticalTabsTextSizeHint" data-i18n-aria-label="settings.general.verticalTabsTextSize.label">
+                <option value="default" data-i18n="settings.general.verticalTabsTextSize.default">Default</option>
+                <option value="large" data-i18n="settings.general.verticalTabsTextSize.large">Large</option>
+                <option value="extra-large" data-i18n="settings.general.verticalTabsTextSize.extraLarge">Extra large</option>
+              </select>
+            </div>
+
+            <div class="setting" id="islandHoverOpenSetting">
+              <div class="label">
+                <span data-i18n="settings.general.islandHoverOpen.label">Open the Island on hover</span>
+                <span class="hint" id="islandHoverOpenHint" data-i18n="settings.general.islandHoverOpen.hint">Rest the pointer on the Island’s address to open it without clicking.</span>
+              </div>
+              <label class="toggle"><input id="islandHoverOpen" type="checkbox" aria-label="Open the Island on hover" aria-describedby="islandHoverOpenHint" data-i18n-aria-label="settings.general.islandHoverOpen.label"/><span class="track"></span></label>
+            </div>
+
+            <div class="setting" id="islandAutoHideSetting">
+              <div class="label">
+                <span data-i18n="settings.general.islandAutoHide.label">Auto-hide the Island</span>
+                <span class="hint" id="islandAutoHideHint" data-i18n="settings.general.islandAutoHide.hint">Let pages fill the window. Move the pointer to the top edge, or open search and commands, to bring the Island back.</span>
+              </div>
+              <label class="toggle"><input id="islandAutoHide" type="checkbox" aria-label="Auto-hide the Island" aria-describedby="islandAutoHideHint" data-i18n-aria-label="settings.general.islandAutoHide.label"/><span class="track"></span></label>
+            </div>
+
+            <div class="setting" id="islandAutoHideStyleSetting" hidden>
+              <div class="label">
+                <span data-i18n="settings.general.islandAutoHideStyle.label">When the Island comes back</span>
+                <span class="hint" id="islandAutoHideStyleHint" data-i18n="settings.general.islandAutoHideStyle.hint">Float it over the page, or move the page down to make room.</span>
+              </div>
+              <select id="islandAutoHideStyle" aria-label="When the Island comes back" aria-describedby="islandAutoHideStyleHint" data-i18n-aria-label="settings.general.islandAutoHideStyle.label">
+                <option value="float" data-i18n="settings.general.islandAutoHideStyle.float">Float over the page</option>
+                <option value="push" data-i18n="settings.general.islandAutoHideStyle.push">Push the page down</option>
+              </select>
+            </div>
+
+            <div class="setting" id="islandSiteColorsSetting">
+              <div class="label">
+                <span data-i18n="settings.general.islandSiteColors.label">Match site colors</span>
+                <span class="hint" id="islandSiteColorsHint" data-i18n="settings.general.islandSiteColors.hint">Tint the Island bar with the color of the page you’re on. Off keeps it on your theme’s background.</span>
+              </div>
+              <label class="toggle"><input id="islandSiteColors" type="checkbox" aria-label="Match site colors" aria-describedby="islandSiteColorsHint"  data-i18n-aria-label="settings.general.islandSiteColors.label"/><span class="track"></span></label>
+            </div>
+
+            <div class="setting" id="islandTabIconsSetting">
+              <div class="label">
+                <span data-i18n="settings.general.islandTabIcons.label">Show site icons on the Island</span>
+                <span class="hint" id="islandTabIconsHint" data-i18n="settings.general.islandTabIcons.hint">Show each tab’s site icon instead of a dot. Icons take more room, so fewer tabs fit.</span>
+              </div>
+              <label class="toggle"><input id="islandTabIcons" type="checkbox" aria-label="Show site icons on the Island" aria-describedby="islandTabIconsHint" data-i18n-aria-label="settings.general.islandTabIcons.label"/><span class="track"></span></label>
+            </div>
+
+            <div class="setting" id="searchPriorityResultsSetting">
+              <div class="label">
+                <span data-i18n="settings.general.searchPriorityResults.label">Search priority results</span>
+                <span class="hint" id="searchPriorityResultsHint" data-i18n="settings.general.searchPriorityResults.hint">As you type, show search suggestions above your tabs, groups, Spaces, Favorites and history.</span>
+              </div>
+              <label class="toggle"><input id="searchPriorityResults" type="checkbox" aria-label="Search priority results" aria-describedby="searchPriorityResultsHint" data-i18n-aria-label="settings.general.searchPriorityResults.label"/><span class="track"></span></label>
+            </div>
+          </div>
+
+          <div class="settings-card settings-card--mixed">
+            <h3 class="card-title" data-i18n="settings.general.cards.appearance">Appearance</h3>
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.general.theme.label">Theme</span>
+                <span class="hint" data-i18n="settings.general.theme.hint">System follows your macOS/Windows theme</span>
+              </div>
+              <select id="theme">
+                <option value="system" data-i18n="settings.general.theme.system">System</option>
+                <option value="light" data-i18n="settings.general.theme.light">Light</option>
+                <option value="dark" data-i18n="settings.general.theme.dark">Dark</option>
+              </select>
+            </div>
+
+            <div class="setting" id="surfaceStyleSetting">
+              <div class="label">
+                <span data-i18n="settings.general.surfaceStyle.label">Surface style</span>
+                <span class="hint" id="surfaceStyleHint" data-i18n="settings.general.surfaceStyle.hint">The look of Spatial’s own pages. Neutral swaps the cream and gold for plain ink and gray.</span>
+              </div>
+              <select id="surfaceStyle" aria-label="Surface style" aria-describedby="surfaceStyleHint" data-i18n-aria-label="settings.general.surfaceStyle.label">
+                <option value="sunrise" data-i18n="settings.general.surfaceStyle.sunrise">Sunrise</option>
+                <option value="neutral" data-i18n="settings.general.surfaceStyle.neutral">Neutral</option>
+              </select>
+            </div>
+
+            <div class="setting" id="launchSunriseSetting">
+              <div class="label">
+                <span data-i18n="settings.general.launchSunrise.label">Play the Sunrise when Spatial opens</span>
+                <span class="hint" id="launchSunriseHint" data-i18n="settings.general.launchSunrise.hint">The first start page after launch draws the Sunrise once. Skipped when your system reduces motion.</span>
+              </div>
+              <label class="toggle"><input id="launchSunrise" type="checkbox" aria-label="Play the Sunrise when Spatial opens" aria-describedby="launchSunriseHint" data-i18n-aria-label="settings.general.launchSunrise.label"/><span class="track"></span></label>
+            </div>
+
+            <div class="setting" id="darkWebsitesSetting">
+              <div class="label">
+                <span data-i18n="settings.general.darkWebsites.label">Dark websites</span>
+                <span class="hint" id="darkWebsitesHint" data-i18n="settings.general.darkWebsites.hint">While Spatial is dark, darken websites that have no dark mode of their own. Uses the open-source Dark Reader engine.</span>
+              </div>
+              <label class="toggle"><input id="darkWebsites" type="checkbox" aria-label="Dark websites" aria-describedby="darkWebsitesHint"  data-i18n-aria-label="settings.general.darkWebsites.label"/><span class="track"></span></label>
+            </div>
+
+            <div id="darkWebsitesExceptionsBlock" class="site-list-block">
+              <p class="section-hint" data-i18n="settings.general.sitesListedHereKeep">
+                Sites listed here keep their own colors. Type /dark-site on a site to add or remove it.
+              </p>
+              <div class="site-list">
+                <div id="darkExceptionList" class="site-list-rows"></div>
+                <div class="site-list-add">
+                  <input id="darkExceptionInput" type="text" placeholder="example.com" aria-label="Site to keep in its own colors"  data-i18n-ignore="placeholder" data-i18n-aria-label="settings.general.darkExceptionInput.ariaLabel"/>
+                  <button id="darkExceptionAdd" data-i18n="settings.general.darkExceptionAdd">Add</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="setting" id="pageZoomSetting">
+              <div class="label">
+                <span data-i18n="settings.general.pageZoom.label">Default page zoom</span>
+                <span class="hint" id="pageZoomHint" data-i18n="settings.general.pageZoom.hint">The size web pages open at. Zooming in or out on a site saves a size just for that site.</span>
+              </div>
+              <select id="pageZoom" aria-label="Default page zoom" aria-describedby="pageZoomHint" data-i18n-aria-label="settings.general.pageZoom.label"></select>
+            </div>
+
+            <div id="siteZoomBlock" class="site-list-block" hidden>
+              <p class="section-hint" data-i18n="settings.general.siteZoom.hint">These sites have their own zoom. Remove one to go back to the default.</p>
+              <div class="site-list">
+                <div id="siteZoomList" class="site-list-rows"></div>
+              </div>
+              <button id="siteZoomClear" type="button" class="site-list-clear" data-i18n="settings.general.siteZoom.clearAll">Clear all</button>
+            </div>
+
+            <div class="setting" id="appIconSetting">
+              <div class="label">
+                <span data-i18n="settings.general.appIconSetting.label">App icon</span>
+                <span class="hint" id="appIconHint" data-i18n="settings.general.appIconSetting.hint">Choose the Spatial icon shown by your system</span>
+              </div>
+              <div class="icon-scroller">
+                <div id="appIconGrid" class="icon-grid" role="radiogroup" aria-label="App icon" data-i18n-aria-label="settings.general.appIconSetting.label"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-card settings-card--mixed">
+            <h3 class="card-title" data-i18n="settings.general.cards.startPage">Start Page</h3>
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.general.newtabLayout.label">New tab layout</span>
+                <span class="hint" data-i18n="settings.general.newtabLayout.hint">How the new tab page arranges itself; switchable from its footer too</span>
+              </div>
+              <select id="newtabLayout" aria-label="New tab layout" data-i18n-aria-label="settings.general.newtabLayout.label">
+                <option value="ledger" data-i18n="settings.general.newtabLayout.ledger">ledger</option>
+                <option value="billboard" data-i18n="settings.general.newtabLayout.billboard">billboard</option>
+                <option value="shelf" data-i18n="settings.general.newtabLayout.shelf">shelf</option>
+                <option value="tally" data-i18n="settings.general.newtabLayout.tally">tally</option>
+              </select>
+            </div>
+
+            <div class="setting" id="dynamicWallpaperSetting">
+              <div class="label">
+                <span data-i18n="settings.general.newtabDynamicWallpaper.label">Time-of-day wallpaper</span>
+                <span class="hint" id="dynamicWallpaperHint" data-i18n="settings.general.newtabDynamicWallpaper.hint">Wallpaper follows this machine’s local time.</span>
+              </div>
+              <label class="toggle"><input id="newtabDynamicWallpaper" type="checkbox" aria-label="Time-of-day wallpaper" aria-describedby="dynamicWallpaperHint"  data-i18n-aria-label="settings.general.newtabDynamicWallpaper.label"/><span class="track"></span></label>
+            </div>
+
+            <div class="setting" id="customWallpaperSetting">
+              <div class="label">
+                <span data-i18n="settings.general.newtabCustomWallpaper.label">Start Page image</span>
+                <span class="hint" id="customWallpaperHint" data-i18n="settings.general.newtabCustomWallpaper.hint">Shown on this device only, never in private tabs. Spatial keeps a smaller copy without location or camera details.</span>
+              </div>
+              <button id="customWallpaperChoose" type="button" data-i18n="newtab.wallpaper.choose">Choose image…</button>
+              <button id="customWallpaperRemove" type="button" hidden data-i18n="newtab.wallpaper.remove">Remove</button>
+              <label class="toggle"><input id="newtabCustomWallpaper" type="checkbox" aria-label="Start Page image" aria-describedby="customWallpaperHint" data-i18n-aria-label="settings.general.newtabCustomWallpaper.label"/><span class="track"></span></label>
+            </div>
+
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.general.homePage.label">New tab page</span>
+                <span class="hint" data-i18n="settings.general.homePage.hint">Leave empty for the built-in new tab page</span>
+              </div>
+              <input id="homePage" type="url" placeholder="blanc://newtab/"  data-i18n-ignore="placeholder"/>
+            </div>
+          </div>
+
+          <div class="settings-card settings-card--mixed">
+            <h3 class="card-title" data-i18n="settings.general.cards.search">Search</h3>
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.general.searchEngine.label">Search engine</span>
+                <span class="hint" data-i18n="settings.general.searchEngine.hint">Used when the address bar input isn't a URL</span>
+              </div>
+              <select id="searchEngine"></select>
+            </div>
+
+            <div class="setting" id="searchEngineCustomRow" hidden>
+              <div class="label">
+                <span id="searchEngineTemplateLabel" data-i18n="settings.general.searchEngineTemplate.label">Custom search address</span>
+                <span class="hint" id="searchEngineTemplateHint" data-i18n="settings.general.searchEngineTemplate.hint">Paste the search address with %s where your search words go, for example https://searx.example.org/search?q=%s. It syncs with your other settings.</span>
+                <span class="hint field-error" id="searchEngineTemplateError" role="alert" hidden data-i18n="settings.general.searchEngineTemplateError">That address isn't valid — your previous search engine is still in use.</span>
+              </div>
+              <input id="searchEngineTemplate" type="url" autocomplete="off" spellcheck="false" placeholder="https://search.example.com/search?q=%s" aria-labelledby="searchEngineTemplateLabel" aria-describedby="searchEngineTemplateHint"  data-i18n-ignore="placeholder"/>
+            </div>
+
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.general.bangs.label">Bangs</span>
+                <span class="hint" data-i18n="settings.general.bangs.hint">Type ! followed by a site's code to search that site directly, for example !w for Wikipedia or !yt for YouTube. Type ! alone to see them. It syncs with your other settings.</span>
+              </div>
+              <label class="toggle">
+                <input id="bangsEnabled" type="checkbox" />
+                <span class="track"></span>
+              </label>
+            </div>
+
+            <div id="customBangsBlock" class="site-list-block">
+              <div class="label custom-bangs-head">
+                <span data-i18n="settings.general.customBangs.label">Your bangs</span>
+                <span class="hint" data-i18n="settings.general.customBangs.hint">Syncs with your other settings; the device that saves last wins.</span>
+                <span class="hint" id="customBangReplaces" hidden></span>
+                <span class="hint field-error" id="customBangError" role="alert" hidden></span>
+              </div>
+              <div class="site-list">
+                <div id="customBangList" class="site-list-rows"></div>
+                <div class="site-list-add custom-bang-add">
+                  <input id="customBangCode" type="text" placeholder="code" maxlength="32" autocomplete="off" spellcheck="false" aria-label="Code" data-i18n-placeholder="settings.general.customBangs.code" data-i18n-aria-label="settings.general.customBangs.code"/>
+                  <input id="customBangName" type="text" placeholder="Name" maxlength="60" autocomplete="off" aria-label="Name" data-i18n-placeholder="settings.general.customBangs.name" data-i18n-aria-label="settings.general.customBangs.name"/>
+                  <input id="customBangTemplate" type="url" placeholder="https://search.example.com/?q=%s" autocomplete="off" spellcheck="false" aria-label="Address with %s" data-i18n-ignore="placeholder" data-i18n-aria-label="settings.general.customBangs.address"/>
+                  <button id="customBangAdd" data-i18n="settings.general.customBangs.add">Add</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.general.searchSuggestions.label">Search suggestions</span>
+                <span class="hint" data-i18n="settings.general.searchSuggestions.hint">Send eligible typed prefixes to your selected search provider, including Google if selected. Private tabs and recognized sensitive-looking input are excluded. Submitting a search sends the completed query even when suggestions are off.</span>
+              </div>
+              <label class="toggle">
+                <input id="searchSuggestions" type="checkbox" />
+                <span class="track"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-card settings-card--mixed">
+            <h3 class="card-title" data-i18n="settings.general.cards.browsing">Browsing</h3>
+            <div class="setting" id="tabSwitchOrderSetting">
+              <div class="label">
+                <span data-i18n="settings.general.tabSwitchOrder.label">Switch tabs with Ctrl+Tab</span>
+                <span class="hint" id="tabSwitchOrderHint" data-i18n="settings.general.tabSwitchOrder.hint">Hold Ctrl and press Tab to go back through the tabs you used last, then let go of Ctrl to switch. Esc stays where you are.</span>
+              </div>
+              <select id="tabSwitchOrder" aria-label="Switch tabs with Ctrl+Tab" aria-describedby="tabSwitchOrderHint" data-i18n-aria-label="settings.general.tabSwitchOrder.label">
+                <option value="recent" data-i18n="settings.general.tabSwitchOrder.recent">In the order you used them</option>
+                <option value="list" data-i18n="settings.general.tabSwitchOrder.list">In the order of the tab list</option>
+              </select>
+            </div>
+
+            <div class="setting" id="miniWindowSetting">
+              <div class="label">
+                <span data-i18n="settings.general.miniWindow.label">Mini window shortcut</span>
+                <span class="hint" id="miniWindowHint" data-i18n="settings.general.miniWindow.hint">Opens a small Spatial window over the app you're in, while Spatial is running. A mini window isn't saved, and closes after an hour unused. Open in Spatial keeps it.</span>
+                <span class="hint" id="miniWindowStatus" role="status" data-i18n="settings.general.miniWindow.unavailable" hidden>Another app is using this shortcut, or your desktop doesn't allow it. Choose another.</span>
+              </div>
+              <select id="miniWindowShortcut" aria-label="Mini window shortcut" aria-describedby="miniWindowHint miniWindowStatus" data-i18n-aria-label="settings.general.miniWindow.label">
+                <option value="off" data-i18n="settings.general.miniWindow.off">Off</option>
+              </select>
+            </div>
+
+            <div class="setting" id="tabSleepSetting">
+              <div class="label">
+                <span data-i18n="settings.general.tabSleep.label">Quiet inactive tabs</span>
+                <span class="hint" data-i18n="settings.general.tabSleep.hint">Spatial frees the memory of tabs you have not opened in a while, and reloads them when you come back to them.</span>
+              </div>
+              <select id="tabSleep" aria-label="Quiet inactive tabs" data-i18n-aria-label="settings.general.tabSleep.label">
+                <option value="off" data-i18n="settings.general.tabSleep.off">Off</option>
+                <option value="30m" data-i18n="settings.general.tabSleep.30m">After 30 minutes</option>
+                <option value="1h" data-i18n="settings.general.tabSleep.1h">After 1 hour</option>
+                <option value="6h" data-i18n="settings.general.tabSleep.6h">After 6 hours</option>
+              </select>
+            </div>
+
+            <div class="setting" id="tabArchiveSetting">
+              <div class="label">
+                <span data-i18n="settings.general.tabArchive.label">Archive inactive tabs</span>
+                <span class="hint" data-i18n="settings.general.tabArchive.hint">Spatial closes loose tabs you haven't opened in a while and keeps them in your Archive for 30 days. Pinned tabs and tab groups are never archived.</span>
+              </div>
+              <select id="tabArchive" aria-label="Archive inactive tabs" data-i18n-aria-label="settings.general.tabArchive.label">
+                <option value="off" data-i18n="settings.general.tabArchive.off">Off</option>
+                <option value="12h" data-i18n="settings.general.tabArchive.12h">After 12 hours</option>
+                <option value="1d" data-i18n="settings.general.tabArchive.1d">After 1 day</option>
+                <option value="7d" data-i18n="settings.general.tabArchive.7d">After 7 days</option>
+                <option value="30d" data-i18n="settings.general.tabArchive.30d">After 30 days</option>
+              </select>
+            </div>
+
+            <div class="setting" id="mouseGesturesSetting">
+              <div class="label">
+                <span data-i18n="settings.general.mouseGesturesEnabled.label">Mouse gestures</span>
+                <span class="hint" data-i18n="settings.general.mouseGesturesEnabled.hint">With a mouse, hold the right button and drag, then release. On a trackpad, hold Alt/Option (⌥), click and hold with one finger, then drag.</span>
+              </div>
+              <label class="toggle"><input id="mouseGesturesEnabled" type="checkbox" aria-label="Enable mouse gestures"  data-i18n-aria-label="settings.general.mouseGesturesEnabled.ariaLabel"/><span class="track"></span></label>
+            </div>
+
+            <div id="mouseGestureEditor" class="gesture-editor" hidden>
+              <div class="gesture-editor-heading">
+                <span data-i18n="settings.general.assignedGestures">Assigned gestures</span>
+              </div>
+              <div id="mouseGestureRows" class="gesture-rows"></div>
+              <div class="gesture-editor-actions">
+                <button id="mouseGestureAdd" class="gesture-add" type="button" data-i18n="settings.general.mouseGestureAdd">Add gesture</button>
+                <button id="mouseGestureReset" class="gesture-reset" type="button" data-i18n="settings.general.mouseGestureReset">Restore defaults</button>
+              </div>
+              <div id="mouseGestureComposer" class="gesture-composer" hidden>
+                <p data-i18n="settings.general.drawUpToThree">Draw up to three directions, then choose an action.</p>
+                <div id="mouseGesturePad" class="gesture-pad" role="group" aria-label="Draw a new gesture with the primary button" data-i18n-aria-label="settings.general.mouseGesturePad.ariaLabel">
+                  <span id="mouseGesturePadPrompt" data-i18n="settings.general.mouseGesturePadPrompt">Press and drag here</span>
+                </div>
+                <div class="gesture-composer-actions">
+                  <label for="mouseGestureAction" data-i18n="settings.general.action">Action</label>
+                  <select id="mouseGestureAction"></select>
+                  <button id="mouseGestureSave" type="button" disabled data-i18n="settings.general.mouseGestureSave">Save gesture</button>
+                  <button id="mouseGestureCancel" type="button" data-i18n="settings.general.mouseGestureCancel">Cancel</button>
+                </div>
+              </div>
+              <p id="mouseGestureMessage" class="gesture-message" role="status" aria-live="polite"></p>
+            </div>
+
+            <div class="setting" id="uiLanguageSetting" hidden>
+              <div class="label">
+                <span data-i18n="settings.language.label">Language</span>
+                <span class="hint" data-i18n="settings.language.hint">Translations are machine-generated.</span>
+              </div>
+              <select id="uiLanguage" aria-label="Language" data-i18n-aria-label="settings.language.label"></select>
+              <button id="uiLanguageRelaunch" type="button" hidden data-i18n="settings.language.relaunch">Relaunch to apply</button>
+            </div>
+
+            <div class="setting" id="defaultBrowserSetting">
+              <div class="label">
+                <span data-i18n="settings.general.defaultBrowserBtn.label">Default browser</span>
+                <span class="hint" id="defaultBrowserHint" data-i18n="settings.general.defaultBrowserBtn.hint">Open web links from other apps in Spatial</span>
+              </div>
+              <button id="defaultBrowserBtn" data-i18n="settings.general.defaultBrowserBtn">Make default…</button>
+              <span id="defaultBrowserState" hidden data-i18n="settings.general.defaultBrowserState">Spatial is your default browser</span>
+            </div>
+
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.general.showWelcomeTour.label">Welcome tour</span>
+                <span class="hint" data-i18n="settings.general.showWelcomeTour.hint">Replay the first-run walkthrough; saved choices stay put</span>
+              </div>
+              <button id="showWelcomeTour" type="button" data-i18n="settings.general.showWelcomeTour">Show welcome tour</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-group" id="group-sync">
+          <h2 class="group-title" data-i18n="settings.sync.title">Sync</h2>
+            <div id="syncSetup" class="settings-card sync-settings-card">
+              <header class="sync-setup-header">
+                <h3 id="syncSetupTitle" data-i18n="settings.sync.off.title">Sync your Spatial</h3>
+                <p id="syncSetupIntro" data-i18n="settings.sync.off.body">Favorites, settings and, if you choose, open tabs, end-to-end encrypted.</p>
+              </header>
+              <div id="syncPaths" class="sync-paths" aria-label="Choose how to set up Sync" data-i18n-aria-label="settings.sync.syncPaths.ariaLabel">
+                <!-- Sync without a passphrase (design 2026-10-28 §5.2): one press
+                     makes a random account; the code path sits right under it. -->
+                <div class="sync-turn-on" id="syncTurnOnRow">
+                  <div class="sync-turn-on-actions">
+                    <button id="syncTurnOn" type="button" data-i18n="settings.sync.off.turnOn">Turn on Sync</button>
+                    <!-- Design 2026-10-28 §6.1: shown only where iPhone pairing is offered. -->
+                    <button id="syncConnectIphone" type="button" hidden data-i18n="settings.sync.connectIphone">Connect your iPhone</button>
+                  </div>
+                  <p class="section-hint" id="syncTurnOnStatus" role="status"></p>
+                </div>
+                <p class="sync-paths-label" data-i18n="settings.sync.off.haveCode">Already sync on another device?</p>
+                <button id="syncPathCode" class="sync-path" type="button">
+                  <svg class="sync-path-icon" viewBox="0 0 48 48" aria-hidden="true">
+                    <rect x="5" y="10" width="25" height="19" rx="2"></rect>
+                    <path d="M2 33h31"></path>
+                    <rect x="35" y="15" width="9" height="20" rx="2"></rect>
+                    <path d="M25 40c6 3 13 1 16-3M40 9c-6-3-13-1-16 3"></path>
+                  </svg>
+                  <span class="sync-path-copy">
+                    <strong data-i18n="settings.sync.off.addWithCode">Add this device with a code</strong>
+                    <span data-i18n="settings.sync.addThisDeviceHint">Get a code from a device that already syncs: Settings → Sync → Add another device.</span>
+                  </span>
+                  <span class="sync-path-arrow" aria-hidden="true">→</span>
+                </button>
+                <details class="sync-other-ways" id="syncOtherWays">
+                  <summary data-i18n="settings.sync.off.otherWays">Other ways</summary>
+                  <button id="syncPathJoin" class="sync-path sync-path-plain" type="button">
+                    <span class="sync-path-copy">
+                      <strong data-i18n="settings.sync.off.usePassphrase">Use a sync name and passphrase</strong>
+                    </span>
+                    <span class="sync-path-arrow" aria-hidden="true">→</span>
+                  </button>
+                  <button id="syncPathStart" class="sync-path sync-path-plain" type="button">
+                    <span class="sync-path-copy">
+                      <strong data-i18n="settings.sync.off.startWithPassphrase">Start with a name and passphrase</strong>
+                      <span data-i18n="settings.sync.startOnlyFirstDevice">Only for your first device. If you already sync elsewhere, add this device from there instead.</span>
+                    </span>
+                    <span class="sync-path-arrow" aria-hidden="true">→</span>
+                  </button>
+                </details>
+              </div>
+              <form id="syncCodeForm" class="sync-form" hidden>
+                <ol class="sync-guide">
+                  <li class="sync-guide-step" data-step="1">
+                    <span class="sync-step-number" aria-hidden="true">1</span>
+                    <svg class="sync-guide-icon" viewBox="0 0 48 48" aria-hidden="true">
+                      <rect x="8" y="14" width="32" height="20" rx="3"></rect>
+                      <path d="M14 24h4M22 24h4M30 24h4"></path>
+                    </svg>
+                    <label class="sync-field">
+                      <strong data-i18n="settings.sync.setup.codeTitle">Enter the code from your other device</strong>
+                      <input id="syncCode" class="sync-code-input" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" />
+                      <span class="hint" id="syncCodeHint" data-i18n="settings.sync.setup.codeHint">It’s good for ten minutes.</span>
+                    </label>
+                  </li>
+                  <li class="sync-guide-step sync-guide-finish" data-step="2">
+                    <span class="sync-step-number" aria-hidden="true">2</span>
+                    <svg class="sync-guide-icon" viewBox="0 0 48 48" aria-hidden="true">
+                      <rect x="4" y="15" width="23" height="17" rx="2"></rect>
+                      <path d="M2 36h27M34 12h10v24H34zM37 32h4"></path>
+                      <path d="M26 10c5-3 10-2 13 0M39 10l-3-3M22 39c5 3 10 2 13 0M22 39l3 3"></path>
+                    </svg>
+                    <div class="sync-guide-content">
+                      <strong data-i18n="settings.sync.setup.connect">Connect</strong>
+                      <p data-i18n="settings.sync.setup.codeFinishHint">Your favorites and settings arrive right after. Open tabs stay private to this device until you choose to share them.</p>
+                      <div class="toolbar-row">
+                        <button id="syncCodeSubmit" type="submit" data-i18n="settings.sync.setup.connect">Connect</button>
+                        <button id="syncCodeBack" type="button" class="quiet" data-i18n="settings.sync.syncBack">Back</button>
+                      </div>
+                      <p class="section-hint"><button id="syncUsePassphrase" type="button" class="link-button" data-i18n="settings.sync.setup.usePassphrase">Use my sync name and passphrase instead</button></p>
+                      <p class="section-hint" id="syncCodeStatus" role="status"></p>
+                    </div>
+                  </li>
+                </ol>
+              </form>
+              <form id="syncForm" class="sync-form" hidden>
+                <ol class="sync-guide">
+                  <li class="sync-guide-step" data-step="1">
+                    <span class="sync-step-number" aria-hidden="true">1</span>
+                    <svg class="sync-guide-icon" viewBox="0 0 48 48" aria-hidden="true">
+                      <path d="M13 16h26v22H13z"></path>
+                      <path d="M18 16v-3a6 6 0 0 1 12 0v3"></path>
+                      <text class="sync-icon-word" x="26" y="30" text-anchor="middle">you</text>
+                    </svg>
+                    <label class="sync-field">
+                      <strong data-i18n="settings.sync.giveYourSyncA">Give your sync a name</strong>
+                      <input id="syncHandle" type="text" autocomplete="off" spellcheck="false" maxlength="64" />
+                      <span class="hint" id="syncHandleHint"></span>
+                    </label>
+                  </li>
+                  <li class="sync-guide-step" data-step="2">
+                    <span class="sync-step-number" aria-hidden="true">2</span>
+                    <svg class="sync-guide-icon" viewBox="0 0 48 48" aria-hidden="true">
+                      <rect x="12" y="20" width="24" height="20" rx="3"></rect>
+                      <path d="M17 20v-5a7 7 0 0 1 14 0v5"></path>
+                      <circle cx="24" cy="29" r="2"></circle>
+                      <path d="M24 31v4"></path>
+                    </svg>
+                    <label class="sync-field">
+                      <strong data-i18n="settings.sync.chooseAPassphrase">Choose a passphrase</strong>
+                      <input id="syncPassphrase" type="password" autocomplete="off" />
+                      <span class="hint" id="syncPassphraseHint"></span>
+                      <span class="sync-trust-note" data-i18n="settings.sync.iYourPassphraseStays">
+                        <span class="sync-info-mark" aria-hidden="true">i</span>
+                        Your passphrase stays on your devices. It’s never sent to Spatial.
+                      </span>
+                    </label>
+                  </li>
+                  <li class="sync-guide-step sync-guide-finish" data-step="3">
+                    <span class="sync-step-number" aria-hidden="true">3</span>
+                    <svg class="sync-guide-icon" viewBox="0 0 48 48" aria-hidden="true">
+                      <rect x="4" y="15" width="23" height="17" rx="2"></rect>
+                      <path d="M2 36h27M34 12h10v24H34zM37 32h4"></path>
+                      <path d="M26 10c5-3 10-2 13 0M39 10l-3-3M22 39c5 3 10 2 13 0M22 39l3 3"></path>
+                    </svg>
+                    <div class="sync-guide-content">
+                      <strong id="syncFinishTitle" data-i18n="settings.sync.syncFinishTitle">Turn on Sync</strong>
+                      <p id="syncFinishHint" data-i18n="settings.sync.syncFinishHint">You’re ready — your favorites and settings will sync securely across your devices.</p>
+                      <div class="toolbar-row" id="syncSubmitRow">
+                        <button id="syncSubmit" type="submit" data-i18n="settings.sync.syncSubmit">Turn on sync</button>
+                        <button id="syncBack" type="button" class="quiet" data-i18n="settings.sync.syncBack">Back</button>
+                      </div>
+                      <div id="syncNotFound" hidden>
+                        <p class="section-hint" data-i18n="settings.sync.nothingWasFoundUnder">Nothing was found under that name and passphrase. Check for typos, including capital letters, then try again.</p>
+                        <div class="toolbar-row">
+                          <button id="syncTryAgain" type="button" data-i18n="settings.sync.syncTryAgain">Try again</button>
+                          <button id="syncStartNew" type="button" class="quiet" data-i18n="settings.sync.syncStartNew">Start a new sync with these</button>
+                        </div>
+                      </div>
+                      <p class="section-hint" id="syncSetupStatus" role="status"></p>
+                    </div>
+                  </li>
+                </ol>
+              </form>
+            </div>
+          <!-- On state (redesign 2026-10-27): who you are and what syncs, then
+               your devices, then everything rarer one level deeper. Element
+               ids are the ones settings.js and settings-shared-spaces.js drive. -->
+          <div id="syncActive" hidden>
+            <div class="settings-card sync-hero">
+              <div class="sync-hero-main">
+                <span class="sync-avatar" id="syncAvatar" aria-hidden="true"></span>
+                <div class="sync-hero-text">
+                  <span class="page-sr-only" data-i18n="settings.sync.syncName">Sync name</span>
+                  <strong class="sync-hero-name" id="syncStatusHandle" data-i18n-ignore=""></strong>
+                  <span class="sync-hero-status" id="syncStatusLine"><span class="sync-status-dot" aria-hidden="true"></span><span id="syncStatusData"></span></span>
+                  <span class="sync-active-status" id="syncActiveStatus" role="status"></span>
+                </div>
+                <button id="syncNow" data-i18n="settings.sync.syncNow">Sync now</button>
+              </div>
+              <div class="sync-error" id="syncStatusErrorRow" hidden>
+                <p><strong data-i18n="settings.sync.lastError">Last error</strong> <span id="syncStatusError"></span></p>
+                <button id="syncEraseRetry" hidden data-i18n="settings.sync.tryAgain">Try again</button>
+              </div>
+              <h3 class="sync-section-label" id="syncWhatTitle" data-i18n="settings.sync.what.title">What syncs</h3>
+              <div class="sync-what-grid" role="list" aria-labelledby="syncWhatTitle">
+                <div class="sync-what" role="listitem">
+                  <svg class="sync-what-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20s-7-4.35-7-10a4 4 0 0 1 7-2.65A4 4 0 0 1 19 10c0 5.65-7 10-7 10z"/></svg>
+                  <span class="sync-what-text"><span class="sync-what-label" data-i18n="settings.sync.what.favorites">Favorites</span><span class="sync-what-state" data-i18n="settings.sync.what.always">Always on</span></span>
+                </div>
+                <div class="sync-what" role="listitem">
+                  <svg class="sync-what-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/><circle cx="9" cy="7" r="1.8"/><circle cx="15" cy="12" r="1.8"/><circle cx="8" cy="17" r="1.8"/></svg>
+                  <span class="sync-what-text"><span class="sync-what-label" data-i18n="settings.sync.what.settings">Settings</span><span class="sync-what-state" data-i18n="settings.sync.what.always">Always on</span></span>
+                </div>
+                <label class="sync-what sync-what-toggle" id="syncTabsShareSetting" role="listitem">
+                  <svg class="sync-what-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="8" width="16" height="11" rx="2"/><path d="M7 8V6.5A1.5 1.5 0 0 1 8.5 5h4A1.5 1.5 0 0 1 14 6.5V8"/></svg>
+                  <span class="sync-what-text"><span class="sync-what-label" id="syncTabsShareLabel" data-i18n="settings.sync.what.tabs">Open tabs</span><span class="sync-what-state" id="syncTabsShareHint" data-i18n="settings.sync.what.tabsHint">From this device</span></span>
+                  <span class="toggle"><input id="syncTabsShare" type="checkbox" aria-labelledby="syncTabsShareLabel" aria-describedby="syncTabsShareHint" /><span class="track"></span></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="settings-card sync-devices-card">
+              <div class="sync-card-head">
+                <h3 class="sync-section-label" id="syncDevicesTitle" data-i18n="settings.sync.devices.title">Devices</h3>
+                <button id="syncAddDevice" type="button" class="sync-add" data-i18n="settings.sync.devices.add">Add device</button>
+              </div>
+              <p class="sync-panel-notice" id="syncPairingNotice" role="status"></p>
+              <ul class="sync-device-list" id="syncDeviceList" aria-labelledby="syncDevicesTitle">
+                <li class="sync-device sync-device-self">
+                  <span class="sync-device-icon" id="syncThisDeviceIcon" aria-hidden="true"></span>
+                  <span class="sync-device-text">
+                    <input id="syncDeviceName" class="sync-device-name" type="text" maxlength="80" autocomplete="off" spellcheck="false" aria-label="This device’s name" aria-describedby="syncDeviceNameHint" data-i18n-aria-label="settings.sync.deviceName" data-i18n-ignore="placeholder" />
+                    <span class="sync-device-meta"><span class="sync-badge" data-i18n="settings.sync.devices.thisDevice">This device</span> <span id="syncThisDevicePlatform"></span></span>
+                    <span class="sync-device-name-hint" id="syncDeviceNameHint" data-i18n="settings.sync.deviceNameHint">How your other devices list this one. Leave empty to use the computer’s name.</span>
+                  </span>
+                </li>
+              </ul>
+              <p class="sync-devices-missing" data-i18n="settings.sync.devices.missing">Don’t see a device? Update Spatial on it, or turn on Open tabs there.</p>
+            </div>
+
+            <!-- Design 2026-10-28 §5.4: only on the device that started a sync
+                 without a passphrase, until its recovery code is saved. -->
+            <div class="settings-card sync-recovery-prompt" id="syncRecoveryPrompt" hidden>
+              <strong data-i18n="settings.sync.recoveryPrompt.title">Keep a way back in</strong>
+              <p data-i18n="settings.sync.recoveryPrompt.body">This sync has no passphrase. If you ever lose all your devices, its recovery code is the only way to reach your synced data. Save it in your password manager.</p>
+              <div class="sync-panel-actions">
+                <button id="syncRecoveryPromptCopy" type="button" data-i18n="settings.sync.recoveryPrompt.copy">Copy recovery code</button>
+                <button id="syncRecoveryPromptNotNow" type="button" class="quiet" data-i18n="settings.sync.recoveryPrompt.notNow">Not now</button>
+              </div>
+              <p class="sync-panel-notice" id="syncRecoveryPromptNote" role="status"></p>
+            </div>
+
+            <details class="settings-card sync-more">
+              <summary class="sync-more-summary">
+                <span class="sync-more-text"><span class="sync-more-title" data-i18n="settings.sync.more.title">More options</span><span class="sync-more-hint" data-i18n="settings.sync.more.hint">Recovery code, joining another sync, and turning sync off</span></span>
+                <svg class="sync-more-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3.75 4 4.25-4 4.25"/></svg>
+              </summary>
+              <div class="setting sync-action">
+                <div class="label">
+                  <span id="syncSwitchLabel" data-i18n="settings.sync.switch.open">Connect to a different sync with a code</span>
+                  <span class="hint" id="syncSwitchHint" data-i18n="settings.sync.switch.hint">Moves this device to another sync, using a code from one of that sync’s devices.</span>
+                </div>
+                <button id="syncSwitchOpen" type="button" aria-describedby="syncSwitchLabel syncSwitchHint" data-i18n="settings.sync.switch.enterCode">Enter code</button>
+                <form id="syncSwitch" class="sync-panel sync-switch" hidden>
+                  <strong id="syncSwitchName"></strong>
+                  <p class="sync-panel-body" id="syncSwitchBody"></p>
+                  <label class="inline-check"><input id="syncSwitchWipe" type="checkbox" /> <span id="syncSwitchWipeLabel"></span></label>
+                  <label class="sync-field">
+                    <strong data-i18n="settings.sync.setup.codeTitle">Enter the code from your other device</strong>
+                    <input id="syncSwitchCode" class="sync-code-input" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" />
+                  </label>
+                  <div class="sync-panel-actions">
+                    <button id="syncSwitchSubmit" type="submit" class="danger" data-i18n="settings.sync.switch.connect">Connect</button>
+                    <button id="syncSwitchCancel" type="button" class="quiet" data-i18n="settings.sync.pairing.cancel">Cancel</button>
+                  </div>
+                  <p class="sync-panel-notice" id="syncSwitchNotice" role="status"></p>
+                </form>
+              </div>
+              <div class="setting sync-action">
+                <div class="label">
+                  <span id="syncRecoveryLabel" data-i18n="settings.sync.recovery.title">Recovery code</span>
+                  <span class="hint" id="syncRecoveryHint" data-i18n="settings.sync.recovery.hint">Lets a device join this sync when none of your other devices is at hand. Keep it in your password manager.</span>
+                  <span class="hint sync-recovery-note" id="syncRecoveryNote" role="status"></span>
+                </div>
+                <button id="syncRecoveryCopy" type="button" aria-describedby="syncRecoveryLabel syncRecoveryHint" data-i18n="settings.sync.recovery.copyShort">Copy</button>
+              </div>
+              <div class="setting sync-action sync-turn-off">
+                <div class="label">
+                  <span id="syncTurnOffLabel" data-i18n="settings.sync.turnOff.title">Turn off sync</span>
+                  <span class="hint" id="syncTurnOffHint" data-i18n="settings.sync.turnOff.hint">This device stops syncing. Its favorites and settings stay as they are.</span>
+                  <label class="inline-check"><input id="syncWipe" type="checkbox" /> <span data-i18n="settings.sync.syncWipe">Also delete synced data</span></label>
+                </div>
+                <button id="syncDisable" class="danger" aria-describedby="syncTurnOffLabel syncTurnOffHint" data-i18n="settings.sync.syncDisable">Turn off</button>
+              </div>
+            </details>
+
+          </div>
+          <!-- The sheet sits outside #syncActive: Connect your iPhone opens it
+               with Sync off, and a modal inside a hidden ancestor opens at 0×0. -->
+          <!-- Add device: a modal sheet, because showing the code is a task
+               of its own. Esc or Cancel ends it (settings.js). -->
+          <dialog class="sync-sheet" id="syncPairingDialog" aria-labelledby="syncPairingTitle">
+            <!-- Connect your iPhone with Sync off (design 2026-10-28 §6.2):
+                 nothing is created until Continue. -->
+            <div id="syncPairingStart" class="sync-pairing" hidden>
+              <h2 class="sync-sheet-title" id="syncPairingStartTitle" data-i18n="settings.sync.connectIphone">Connect your iPhone</h2>
+              <p class="sync-pairing-instruction" id="syncPairingStartBody" data-i18n-ignore=""></p>
+              <div id="syncPairingNotReady" class="sync-pairing-not-ready" hidden>
+                <p class="sync-pairing-instruction" data-i18n="settings.sync.sheet.notReady">Sync is on, but couldn’t reach the server yet. Spatial will keep trying.</p>
+                <span class="sync-panel-actions">
+                  <button id="syncPairingStartRetry" type="button" data-i18n="settings.sync.tryAgain">Try again</button>
+                  <button id="syncPairingNotReadyCancel" type="button" class="quiet" data-i18n="settings.sync.pairing.cancel">Cancel</button>
+                </span>
+              </div>
+              <p class="sync-panel-notice" id="syncPairingStartNotice" role="status"></p>
+              <div class="sync-panel-actions" id="syncPairingStartActions">
+                <button id="syncPairingContinue" type="button" data-i18n="settings.sync.sheet.continue">Continue</button>
+                <button id="syncPairingStartCancel" type="button" class="quiet" data-i18n="settings.sync.pairing.cancel">Cancel</button>
+              </div>
+              <p class="sync-pairing-already" id="syncPairingAlready">
+                <span data-i18n="settings.sync.sheet.alreadySync">Already sync on another computer?</span>
+                <button id="syncPairingAddThisFirst" type="button" class="link-button" data-i18n-ignore=""></button>
+              </p>
+            </div>
+            <!-- Connect your iPhone while the code is on its way. -->
+            <div id="syncPairingMaking" class="sync-pairing" hidden>
+              <h2 class="sync-sheet-title" data-i18n="settings.sync.connectIphone">Connect your iPhone</h2>
+              <p class="sync-pairing-instruction" role="status" data-i18n="settings.sync.sheet.makingCode">Making a code…</p>
+              <span class="sync-panel-actions">
+                <button id="syncPairingMakingCancel" type="button" class="quiet" data-i18n="settings.sync.pairing.cancel">Cancel</button>
+              </span>
+            </div>
+            <div id="syncPairing" class="sync-pairing" hidden>
+              <h2 class="sync-sheet-title" id="syncPairingTitle" data-i18n-ignore="">Add another device</h2>
+              <!-- The same code as a link Spatial for iPhone scans (§6.2); the
+                   code rides in the fragment, which no server sees. -->
+              <svg id="syncPairingQr" class="sync-pairing-qr" hidden aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg"><path></path></svg>
+              <p class="sync-pairing-instruction" id="syncPairingInstruction" data-i18n="settings.sync.pairing.instruction">On your other device, open Settings → Sync, choose Add this device to my sync, and enter this code.</p>
+              <p class="sync-pairing-ortype" id="syncPairingOrType" hidden data-i18n="settings.sync.sheet.orType">Or type it in Settings → Sync:</p>
+              <div class="sync-pairing-code" id="syncPairingCode" data-i18n-ignore="" aria-live="polite"></div>
+              <div class="sync-panel-actions">
+                <span class="sync-pairing-remaining" id="syncPairingRemaining"></span>
+                <button id="syncPairingCopy" type="button" data-i18n="settings.sync.pairing.copy">Copy</button>
+                <button id="syncPairingCancel" type="button" class="quiet" data-i18n="settings.sync.pairing.cancel">Cancel</button>
+              </div>
+            </div>
+            <!-- The same sheet once the device that took the code arrives
+                 (design 2026-10-28 §6.4): its content changes in place. -->
+            <div id="syncPairingJoined" class="sync-pairing sync-pairing-joined" hidden>
+              <h2 class="sync-sheet-title" id="syncPairingJoinedTitle" data-i18n-ignore=""></h2>
+              <p class="sync-pairing-instruction" data-i18n="settings.sync.sheet.joinedBody">Your favorites and settings are on it now. Its open tabs stay private to it until you choose to share them there.</p>
+              <div id="syncPairingQuestion" class="sync-panel" hidden>
+                <strong data-i18n="settings.sync.sheet.spacesQuestion">Keep Spaces and groups in sync with it?</strong>
+                <p class="sync-panel-body" data-i18n="sharedSpaces.pairDetail">Turning this on lets this device change shared Spaces across your sync account.</p>
+                <div class="sync-panel-actions">
+                  <button id="syncPairingSpacesOn" type="button" data-i18n="sharedSpaces.confirm">Turn on</button>
+                  <button id="syncPairingSpacesNotNow" type="button" class="quiet" data-i18n="sharedSpaces.notNow">Not now</button>
+                </div>
+              </div>
+              <p id="syncPairingRecovery" class="sync-pairing-recovery" hidden>
+                <span data-i18n="settings.sync.recoveryPrompt.title">Keep a way back in</span>
+                <button id="syncPairingRecoveryCopy" type="button" class="link-button" data-i18n="settings.sync.recoveryPrompt.copy">Copy recovery code</button>
+              </p>
+              <div class="sync-panel-actions">
+                <button id="syncPairingDone" type="button" data-i18n="settings.sync.sheet.done">Done</button>
+              </div>
+            </div>
+          </dialog>
+        </section>
+
+        <section class="settings-group" id="group-profiles">
+          <h2 class="group-title" data-i18n="settings.profiles.title">Profiles</h2>
+          <div class="settings-card settings-card--content">
+            <p class="section-hint" data-i18n="settings.profiles.namedProfilesKeepSeparate">
+              Named profiles keep separate cookies, site data, Favorites, history, downloads, and remembered permissions. Device settings and Patron status stay shared; Sync belongs to Personal only.
+            </p>
+            <div class="toolbar-row">
+              <input id="newProfileName" type="text" placeholder="New profile name" maxlength="40" autocomplete="off"  data-i18n-placeholder="settings.profiles.newProfileName.placeholder"/>
+              <button id="newProfileCreate" data-i18n="settings.profiles.newProfileCreate">Create profile window</button>
+            </div>
+            <p class="section-hint" id="profilesStatus" role="status" aria-live="polite"></p>
+            <div id="profilesList" class="row-list"></div>
+          </div>
+          <div class="settings-card settings-card--content" id="linkRoutesCard" hidden>
+            <h3 class="card-title" data-i18n="settings.linkRoutes.title">Open links from other apps</h3>
+            <p class="section-hint" data-i18n="settings.linkRoutes.hint">When another app opens a link in Spatial, the first rule that matches decides the profile, and optionally the Space, it opens in. Rules stay on this device.</p>
+            <div id="linkRoutesList" class="link-route-list"></div>
+            <div class="link-route-row link-route-fallback" data-i18n="settings.linkRoutes.fallback">Everything else: the window you used last</div>
+            <div class="toolbar-row link-route-toolbar">
+              <button type="button" id="linkRouteAdd" data-i18n="settings.linkRoutes.add">Add rule</button>
+            </div>
+            <div class="setting link-route-in-app">
+              <div class="label">
+                <span data-i18n="settings.linkRoutes.inApp.label">Also for links I open in a new tab</span>
+                <span class="hint" id="linkRoutesInAppHint" data-i18n="settings.linkRoutes.inApp.hint">A link you open in a new tab from a page follows a rule that points at another profile or Space. Links in private tabs and sign-in pop-ups stay where they are.</span>
+              </div>
+              <label class="toggle"><input id="linkRoutesInApp" type="checkbox" aria-label="Also for links I open in a new tab" aria-describedby="linkRoutesInAppHint" data-i18n-aria-label="settings.linkRoutes.inApp.label"/><span class="track"></span></label>
+            </div>
+            <p class="section-hint" id="linkRoutesStatus" role="status" aria-live="polite"></p>
+          </div>
+        </section>
+
+        <section class="settings-group" id="group-privacy">
+          <h2 class="group-title" data-i18n="settings.privacy.title">Privacy &amp; Security</h2>
+          <div class="settings-card settings-card--mixed">
+            <h3 class="card-title" data-i18n="settings.privacy.blocking.title">Blocking</h3>
+            <div class="setting" id="blockingProviderSetting">
+              <div class="label">
+                <span data-i18n="settings.privacy.adblockProvider.label">Blocking provider</span>
+                <span class="hint" data-i18n="settings.privacy.adblockProvider.hint">Changes take effect after restarting Spatial. uBlock Origin protects regular tabs. Spatial’s browser engine can load uBO only in saved sessions, so private sessions stay in memory and use Spatial Blocker. Each provider keeps separate site settings.</span>
+              </div>
+              <select id="adblockProvider">
+                <option value="blanc">Spatial Blocker</option>
+                <option value="ublock-origin">uBlock Origin</option>
+              </select>
+            </div>
+            <p class="section-hint" id="blockingProviderStatus" role="status" aria-live="polite"></p>
+            <div class="toolbar-row" id="ublockTools" hidden>
+              <button id="ublockDashboard" data-i18n="settings.privacy.ublockDashboard">uBlock Origin settings</button>
+              <button id="ublockLogger" data-i18n="settings.privacy.ublockLogger">Logger</button>
+            </div>
+            <div class="toolbar-row" id="blockingRecovery" hidden>
+              <button id="ublockRetry" hidden data-i18n="settings.privacy.ublockRetry">Retry</button>
+              <button id="ublockUseSpatial" hidden data-i18n="settings.privacy.ublockUseBlanc">Use Spatial Blocker after restart</button>
+              <button id="ublockContinue" hidden data-i18n="settings.privacy.ublockContinue">Continue without blocking</button>
+            </div>
+            <p class="section-hint" id="ublockLimits" hidden data-i18n="settings.privacy.ublockLimits">Filter lists update automatically. Executable resources update with Spatial releases; custom resource URLs and cloud storage are unavailable. Turning blocking off removes cosmetic CSS; reload a page to undo changes already made by scriptlets.</p>
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.privacy.adblockEnabled.label">Block ads &amp; trackers</span>
+                <span class="hint" data-i18n="settings.privacy.adblockEnabled.hint">Stops ads and the hidden trackers that follow you from site to site. On by default.</span>
+              </div>
+              <label class="toggle">
+                <input id="adblockEnabled" type="checkbox" />
+                <span class="track"></span>
+              </label>
+            </div>
+
+            <div id="adblockExceptionsBlock" class="site-list-block">
+              <p class="section-hint" data-i18n="settings.privacy.sitesListedHereLoad">
+                Sites listed here load with ad-blocking turned off, e.g. for sites that break under it.
+              </p>
+              <div class="site-list">
+                <div id="exceptionList" class="site-list-rows"></div>
+                <div class="site-list-add">
+                  <input id="exceptionInput" type="text" placeholder="example.com"  data-i18n-ignore="placeholder"/>
+                  <button id="exceptionAdd" data-i18n="settings.privacy.exceptionAdd">Add</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-card">
+            <h3 class="card-title" data-i18n="settings.privacy.callsAndConnections.title">Calls and connections</h3>
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.privacy.webrtcPolicy.label">IP address in video calls</span>
+                <span class="hint" data-i18n="settings.privacy.webrtcPolicy.hint">Standard limits calls to your default network route. If a call stutters or won't connect, try Compatibility; it can reveal local network addresses to the site. Strict is for application-proxy users.</span>
+              </div>
+              <select id="webrtcPolicy">
+                <option value="standard" data-i18n="settings.privacy.webrtcPolicy.standard">Standard (recommended)</option>
+                <option value="compatibility" data-i18n="settings.privacy.webrtcPolicy.compatibility">Compatibility — widest call support, less IP privacy</option>
+                <option value="strict" data-i18n="settings.privacy.webrtcPolicy.strict">Strict — stronger for proxy users, but can break some video calls</option>
+              </select>
+            </div>
+
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.privacy.webrtcAudioBuffer.label">Call audio</span>
+                <span class="hint" data-i18n="settings.privacy.webrtcAudioBuffer.hint">Automatic keeps conversation delay as low as possible. Stable targets about 400 ms of receive buffering. Resilient targets about 1 second for severe crackling or chopped speech, making back-and-forth conversation slower. Start a new call after changing it.</span>
+              </div>
+              <select id="webrtcAudioBuffer">
+                <option value="automatic" data-i18n="settings.privacy.webrtcAudioBuffer.automatic">Automatic (lowest latency)</option>
+                <option value="stable" data-i18n="settings.privacy.webrtcAudioBuffer.stable">Stable — smoother playback, about 400 ms buffer</option>
+                <option value="resilient" data-i18n="settings.privacy.webrtcAudioBuffer.resilient">Resilient — high stability, about 1 second buffer</option>
+              </select>
+            </div>
+
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.privacy.secureDns.label">Encrypted DNS</span>
+                <span class="hint" data-i18n="settings.privacy.secureDns.hint">Encrypts the behind-the-scenes lookups that turn a web address into a connection, so someone sniffing those lookups can't read the names. It does not hide the sites you visit from your network, and it makes the DNS provider someone you trust. Automatic uses encryption when it can and may fall back to ordinary DNS — safe to leave on. If a Wi-Fi login page won't load, switch to Automatic or Off temporarily.</span>
+              </div>
+              <select id="secureDns">
+                <option value="auto" data-i18n="settings.privacy.secureDns.auto">Automatic (recommended)</option>
+                <option value="off" data-i18n="settings.privacy.secureDns.off">Off — use your system setting (best with a VPN)</option>
+                <option value="cloudflare" data-i18n-ignore="">Cloudflare</option>
+                <option value="quad9" data-i18n="settings.privacy.secureDns.quad9">Quad9 — also blocks known malware sites</option>
+                <option value="mullvad" data-i18n-ignore="">Mullvad</option>
+                <option value="custom" data-i18n="settings.privacy.secureDns.custom">Custom provider…</option>
+              </select>
+            </div>
+
+            <div class="setting" id="secureDnsCustomRow" hidden>
+              <div class="label">
+                <span id="secureDnsTemplateLabel" data-i18n="settings.privacy.secureDnsTemplate.label">Custom provider address</span>
+                <span class="hint" id="secureDnsTemplateHint" data-i18n="settings.privacy.secureDnsTemplate.hint">The secure DNS address your provider gave you (an https:// link), e.g. https://dns.nextdns.io/&lt;profile&gt;.</span>
+                <span class="hint field-error" id="secureDnsError" role="alert" hidden data-i18n="settings.privacy.secureDnsError">That address isn't valid — the previous provider is still in use.</span>
+              </div>
+              <input id="secureDnsTemplate" type="url" autocomplete="off" spellcheck="false" placeholder="https://your-provider.example/dns-query" aria-labelledby="secureDnsTemplateLabel" aria-describedby="secureDnsTemplateHint"  data-i18n-ignore="placeholder"/>
+            </div>
+          </div>
+
+          <div class="settings-card settings-card--mixed" id="onePasswordSettings" hidden>
+            <h3 class="card-title">1Password</h3>
+            <p class="section-hint" data-i18n="settings.privacy.fillAMatchingLogin">
+              Fill a matching Login item from your installed 1Password app when you ask. While this is on, Spatial checks pages for a login form so the island can offer Fill — it never reads what you type and never contacts 1Password until you ask.
+            </p>
+            <div class="setting">
+              <div class="label">
+                <span id="onePasswordAppLabel" data-i18n="settings.privacy.onePasswordOpenApp.label">1Password app</span>
+                <span class="hint" id="onePasswordAppHint"></span>
+              </div>
+              <button id="onePasswordOpenApp" type="button" hidden data-i18n="settings.privacy.onePasswordOpenApp">Open 1Password</button>
+            </div>
+            <div class="setting">
+              <div class="label">
+                <span id="onePasswordEnabledLabel" data-i18n="settings.privacy.onePasswordEnabled.label">Fill logins from 1Password</span>
+                <span class="hint" id="onePasswordEnabledHint" data-i18n="settings.privacy.onePasswordEnabled.hint">In 1Password, open Settings → Developer and turn on Integrate with 1Password SDKs</span>
+              </div>
+              <label class="toggle">
+                <input id="onePasswordEnabled" type="checkbox" aria-labelledby="onePasswordEnabledLabel" aria-describedby="onePasswordEnabledHint" />
+                <span class="track"></span>
+              </label>
+            </div>
+            <div class="setting">
+              <div class="label">
+                <span id="onePasswordAccountLabel" data-i18n="settings.privacy.onePasswordAccount.label">1Password account</span>
+                <span class="hint" id="onePasswordAccountHint" data-i18n="settings.privacy.onePasswordAccount.hint">The email address you sign in to 1Password with. An account ID also works. Stored only on this device.</span>
+              </div>
+              <div class="toolbar-row">
+                <input id="onePasswordAccount" type="text" maxlength="200" autocomplete="off" spellcheck="false" placeholder="you@example.com" aria-labelledby="onePasswordAccountLabel" aria-describedby="onePasswordAccountHint"  data-i18n-ignore="placeholder"/>
+                <button id="onePasswordVerify" type="button" data-i18n="settings.privacy.onePasswordVerify">Verify</button>
+              </div>
+            </div>
+            <p class="section-hint"><span id="onePasswordVerifyState" role="status"></span></p>
+            <p class="section-hint" data-i18n="settings.privacy.useViewFill">Use View → Fill Login from 1Password or <code>/1password</code>. On Mac: ⌥⌘P. On Windows and Linux: Ctrl+Shift+P.</p>
+          </div>
+
+          <div class="settings-card settings-card--content" id="sitePermissionsCard">
+            <h3 class="card-title" data-i18n="settings.privacy.sitePermissions.title">Site permissions</h3>
+            <p class="section-hint" data-i18n="settings.privacy.sitesYouveAllowedOr">
+              Sites you've allowed or blocked from using your camera, microphone, location, or notifications.
+            </p>
+            <div id="permissionList" class="row-list"></div>
+          </div>
+
+          <div class="settings-card settings-card--mixed">
+            <h3 class="card-title" data-i18n="settings.privacy.usageAndData.title">Usage and data</h3>
+            <div class="setting">
+              <div class="label">
+                <span data-i18n="settings.privacy.usagePing.label">Help improve Spatial</span>
+                <span class="hint" data-i18n="settings.privacy.usagePing.hint">Counts active users and which start-page layouts and local features get used. Sends a random install and session id, app version, platform, architecture, coarse OS major, and fixed feature names; never URLs, searches, page content, or private-tab activity. This is pseudonymous measurement sent to a Spatial-owned Cloudflare collector. It stores a keyed hash of the install id; an optional Google Analytics mirror receives that hash and the same limited fields. Turn this off to stop future events.</span>
+              </div>
+              <label class="toggle">
+                <input id="usagePing" type="checkbox" />
+                <span class="track"></span>
+              </label>
+            </div>
+
+            <div class="toolbar-row settings-action-row settings-action-row--reset">
+              <button id="resetInstallId" data-i18n="settings.privacy.resetInstallId">Reset install ID</button>
+              <span id="resetInstallIdStatus" class="section-hint"></span>
+            </div>
+
+            <p class="section-hint settings-action-note" data-i18n="settings.privacy.removesCookiesCacheAnd">
+              Removes cookies, cache, and site data for every site. You'll be logged out of everything.
+            </p>
+            <div class="toolbar-row settings-action-row settings-action-row--clear">
+              <button id="clearBrowsingData" class="danger" data-i18n="settings.privacy.clearBrowsingData">Clear cookies, cache &amp; site data</button>
+              <span id="clearBrowsingDataStatus" class="section-hint"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-group" id="group-trust">
+          <h2 class="group-title" data-i18n="settings.trust.title">About &amp; Trust</h2>
+          <div class="settings-card settings-card--content trust-receipt" aria-live="polite">
+            <p class="section-hint" data-i18n="settings.trust.factsCheckedOnThis">Facts checked on this device. Opening this section makes no network request.</p>
+            <p class="section-hint" id="trustReceiptStatus" data-i18n="settings.trust.trustReceiptStatus">Checking the installed build…</p>
+            <dl class="trust-receipt-list" id="trustReceiptList" hidden></dl>
+            <div class="toolbar-row trust-receipt-links" id="trustReceiptLinks" hidden></div>
+          </div>
+        </section>
+
+        <section class="settings-group" id="group-diagnostics">
+          <h2 class="group-title" data-i18n="settings.diagnostics.title">Diagnostics</h2>
+          <div class="settings-card settings-card--content">
+            <p class="section-hint" data-i18n="settings.diagnostics.blancKeepsALocal">
+              Spatial keeps a local, 50-event crash ledger with timestamps, process type, and failure reason. It never includes URLs, page titles, history, profile names, account data, identifiers, quiet-tab state, or closed-tab state, and nothing is sent automatically.
+            </p>
+            <p class="section-hint" id="diagnosticsSummary" role="status" data-i18n="settings.diagnostics.diagnosticsSummary">Checking local crash history…</p>
+            <div class="toolbar-row">
+              <button id="diagnosticsExport" data-i18n="settings.diagnostics.diagnosticsExport">Export diagnostics…</button>
+              <button id="diagnosticsClear" class="danger" data-i18n="settings.diagnostics.diagnosticsClear">Clear crash history</button>
+              <span id="diagnosticsStatus" class="section-hint" role="status"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-group" id="group-patron">
+          <h2 class="group-title" id="patronTitle" data-i18n="settings.patron.title">Spatial Patron</h2>
+          <div class="settings-card settings-card--content">
+            <p class="section-hint" data-i18n="settings.patron.supportsBlanc">
+              Spatial Patron is how you support Spatial’s development. Every feature, including
+              Spatial Spaces, is free for everyone. A one-time founding license activates once,
+              with no further contact. A monthly or annual subscription checks in with Polar
+              about once a day — your license key and activation id only, never browsing
+              data — to confirm it’s still active.
+            </p>
+            <div class="toolbar-row" id="patronCheckoutRow">
+              <a id="patronCheckout" class="patron-checkout" href="https://buy.polar.sh/polar_cl_auwRq39Q2hIVLJwANEqFWgWuZ8DGjdJmEI4mE0JaNDf" data-i18n="settings.patron.patronCheckout">Become a Patron — $4/month or $30/year</a>
+            </div>
+            <p class="section-hint" id="patronActivateHint" data-i18n="settings.patron.patronActivateHint">
+              Already a Patron? Enter the license key available under Purchases in Polar to activate this device.
+            </p>
+            <div class="toolbar-row" id="patronActivateRow">
+              <input id="patronKey" type="text" placeholder="License key" autocomplete="off" spellcheck="false" maxlength="200"  data-i18n-placeholder="settings.patron.patronKey.placeholder"/>
+              <button id="patronActivate" data-i18n="settings.patron.patronActivate">Activate</button>
+            </div>
+            <p class="section-hint" id="patronStatus" role="status"></p>
+          </div>
+        </section>
+
+        <section class="settings-group" id="group-help">
+          <h2 class="group-title" data-i18n="settings.help.title">Help</h2>
+          <div class="settings-card settings-card--content" id="appAboutCard" hidden>
+            <h3 class="card-title" data-i18n="settings.help.aboutBlanc.title">About Spatial</h3>
+            <dl class="about-build-details">
+              <div><dt>Spatial</dt><dd id="aboutSpatial"></dd></div>
+              <div><dt>Electron</dt><dd id="aboutElectron"></dd></div>
+              <div><dt>Chromium</dt><dd id="aboutChromium"></dd></div>
+              <div><dt data-i18n="settings.help.platform">Platform</dt><dd id="aboutPlatform"></dd></div>
+              <div><dt data-i18n="settings.help.architecture">Architecture</dt><dd id="aboutArchitecture"></dd></div>
+            </dl>
+            <p class="section-hint" data-i18n="settings.help.blancUsesChromiumThrough">Spatial uses Chromium through Electron to render websites. Updates to Electron and Chromium arrive with new Spatial releases and replace the whole app. Applying an update requires restarting Spatial.</p>
+            <div class="toolbar-row"><button id="checkForUpdates" hidden data-i18n="settings.help.checkForUpdates">Check for updates…</button><span id="updateCheckStatus" class="section-hint" role="status"></span></div>
+            <div class="about-links">
+              <a href="https://blanc.day/trust" rel="noreferrer" data-i18n="settings.help.howBlancWorks">How Spatial works ↗</a>
+              <a href="https://github.com/bnfy/blanc" rel="noreferrer" data-i18n="settings.help.sourceCode">Source code ↗</a>
+              <a href="https://blanc.day/privacy" rel="noreferrer" data-i18n="settings.help.privacyPolicy">Privacy policy ↗</a>
+              <a href="https://blanc.day/changelog" rel="noreferrer" data-i18n="settings.help.releaseNotes">Release notes ↗</a>
+            </div>
+          </div>
+          <div class="settings-card settings-card--content" id="drmCard" hidden>
+            <h3 class="card-title" data-i18n="drm.title">Protected media</h3>
+            <p class="section-hint" id="drmStatus" role="status" aria-live="polite"></p>
+            <button id="drmRestart" hidden data-i18n="drm.restartButton">Restart Spatial</button>
+          </div>
+          <div class="settings-card settings-card--content" id="browserCompatibilityCard">
+            <h3 class="card-title" data-i18n="settings.help.extensionsAndPasswordManagers.title">Extensions and password managers</h3>
+            <p class="section-hint" data-i18n="settings.help.youCanBrowseChrome">You can browse Chrome Web Store pages, but Spatial cannot install Chrome extensions.</p>
+            <p class="section-hint" data-i18n="settings.help.onMacOSWindowsAnd">On macOS, Windows and Linux, Spatial offers explicit login fill from the installed 1Password app. This integration does not save passwords or fill automatically.</p>
+          </div>
+          <div class="settings-card settings-card--content">
+            <h3 class="card-title" data-i18n="settings.help.connectionsBlancCanMake.title">Connections Spatial can make</h3>
+            <p class="section-hint" data-i18n="settings.help.blancConnectsToWebsites">Spatial connects to websites you open and GitHub for app updates. Searches and enabled suggestions go to your selected search provider; DNS lookups use your system or selected DNS provider. Selecting Google sends searches and eligible suggestion prefixes to Google.</p>
+            <p class="section-hint" data-i18n="settings.help.enabledUsageMeasurementGoes">Enabled usage measurement goes to a Spatial-owned Cloudflare collector and, when configured, its Google Analytics mirror. Sync, Patron, 1Password and tab handoff make separate connections when configured or requested. This describes behavior; it is not a live network monitor.</p>
+            <a class="link-button" href="https://blanc.day/trust#connections" rel="noreferrer" data-i18n="settings.help.dataRecipientsAndControls">Data, recipients and controls ↗</a>
+          </div>
+          <div class="settings-card settings-card--content">
+            <p class="section-hint" data-i18n="settings.help.somethingBrokenOrWorking">
+              Something broken, or working in a way it shouldn’t? Reports go to Spatial’s
+              public issue tracker on GitHub. Saying which version you’re on, which operating
+              system, and what page you were looking at makes a report much faster to act on.
+            </p>
+            <div class="toolbar-row">
+              <a class="link-button" href="https://github.com/bnfy/blanc/issues/new/choose" rel="noreferrer" data-i18n="settings.help.reportAnIssue">Report an issue <span aria-hidden="true">↗</span></a>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+  <script src="bangs-catalog.js"></script>
+  <script src="bangs.js"></script>
+  <script src="sheet.js"></script>
+  <script src="settings-verify-model.js"></script>
+  <script src="settings-nav-model.js"></script>
+  <script src="settings-language-model.js"></script>
+  <script src="settings-sync-setup-model.js"></script>
+  <script src="qr-code.js"></script>
+  <script src="settings-sync-pairing-model.js"></script>
+  <script src="settings.js"></script>
+  <script src="settings-shared-spaces.js"></script>
+</body>
+</html>

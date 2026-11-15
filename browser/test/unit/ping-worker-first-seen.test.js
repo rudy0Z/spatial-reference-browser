@@ -1,0 +1,114 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+function fakeKv() {
+  const store = new Map();
+  return {
+    store,
+    async get(k) { return store.has(k) ? store.get(k) : null; },
+    async put(k, v) { store.set(k, v); },
+  };
+}
+async function bump(kv, key) {
+  const current = parseInt((await kv.get(key)) ?? '0', 10);
+  await kv.put(key, String(current + 1));
+}
+
+test('markFirstSeen', async (t) => {
+  const { markFirstSeen } = await import('../../cloudflare/ping-worker/src/first-seen.js');
+
+  await t.test('first ever ping counts the install as new and marks it', async () => {
+    const kv = fakeKv();
+    assert.equal(await markFirstSeen(kv, 'abc123', '2026-08-28', bump), true);
+    assert.equal(kv.store.get('new:day:2026-08-28'), '1');
+    assert.equal(kv.store.get('first:abc123'), '2026-08-28');
+  });
+
+  await t.test('subsequent pings are no-ops, even on later days', async () => {
+    const kv = fakeKv();
+    await markFirstSeen(kv, 'abc123', '2026-08-28', bump);
+    assert.equal(await markFirstSeen(kv, 'abc123', '2026-08-29', bump), false);
+    assert.equal(kv.store.get('new:day:2026-08-29'), undefined);
+    assert.equal(kv.store.get('first:abc123'), '2026-08-28');
+  });
+
+  await t.test('a backfilled marker suppresses counting entirely', async () => {
+    const kv = fakeKv();
+    await kv.put('first:old1', '2026-07'); // coarse month value from backfill
+    assert.equal(await markFirstSeen(kv, 'old1', '2026-08-28', bump), false);
+    assert.equal(kv.store.get('new:day:2026-08-28'), undefined);
+  });
+});
+
+test('markNextDayReturn', async (t) => {
+  const { markFirstSeen, markNextDayReturn } =
+    await import('../../cloudflare/ping-worker/src/first-seen.js');
+
+  await t.test('an install back the day after its first ping counts once', async () => {
+    const kv = fakeKv();
+    await markFirstSeen(kv, 'abc123', '2026-10-02', bump);
+    assert.equal(await markNextDayReturn(kv, 'abc123', '2026-10-03', '2026-10-02', bump), true);
+    assert.equal(await markNextDayReturn(kv, 'abc123', '2026-10-03', '2026-10-02', bump), false);
+    assert.equal(kv.store.get('return:d1:2026-10-02'), '1');
+  });
+
+  await t.test('the install day itself and later days never count', async () => {
+    const kv = fakeKv();
+    await markFirstSeen(kv, 'abc123', '2026-10-02', bump);
+    assert.equal(await markNextDayReturn(kv, 'abc123', '2026-10-02', '2026-10-01', bump), false);
+    assert.equal(await markNextDayReturn(kv, 'abc123', '2026-10-04', '2026-10-03', bump), false);
+    assert.deepEqual([...kv.store.keys()].filter((k) => k.startsWith('return:')), []);
+  });
+
+  await t.test('unknown and backfilled installs never count', async () => {
+    const kv = fakeKv();
+    await kv.put('first:old1', '2026-09'); // coarse month value from backfill
+    assert.equal(await markNextDayReturn(kv, 'old1', '2026-10-01', '2026-09-30', bump), false);
+    assert.equal(await markNextDayReturn(kv, 'nobody', '2026-10-03', '2026-10-02', bump), false);
+    assert.deepEqual([...kv.store.keys()].filter((k) => k.startsWith('return:')), []);
+  });
+});
+
+test('markWeekTwoReturn', async (t) => {
+  const { markFirstSeen, markWeekTwoReturn, daysSince } =
+    await import('../../cloudflare/ping-worker/src/first-seen.js');
+
+  await t.test('daysSince counts whole UTC days and rejects non-days', () => {
+    assert.equal(daysSince('2026-10-12', '2026-10-19'), 7);
+    assert.equal(daysSince('2026-10-28', '2026-11-04'), 7); // across a month end
+    assert.ok(Number.isNaN(daysSince('2026-07', '2026-10-19')));
+    assert.ok(Number.isNaN(daysSince(null, '2026-10-19')));
+  });
+
+  await t.test('a launch on day 7 through day 13 counts once per install', async () => {
+    const kv = fakeKv();
+    await markFirstSeen(kv, 'abc123', '2026-10-12', bump);
+    assert.equal(await markWeekTwoReturn(kv, 'abc123', '2026-10-19', bump), true);
+    assert.equal(await markWeekTwoReturn(kv, 'abc123', '2026-10-25', bump), false);
+    assert.equal(kv.store.get('return:w2:2026-10-12'), '1');
+  });
+
+  await t.test('the last day of the window still counts', async () => {
+    const kv = fakeKv();
+    await markFirstSeen(kv, 'abc123', '2026-10-12', bump);
+    assert.equal(await markWeekTwoReturn(kv, 'abc123', '2026-10-25', bump), true);
+  });
+
+  await t.test('days 0 to 6 and day 14 onwards never count', async () => {
+    const kv = fakeKv();
+    await markFirstSeen(kv, 'abc123', '2026-10-12', bump);
+    for (const day of ['2026-10-12', '2026-10-13', '2026-10-18', '2026-10-26', '2026-11-30']) {
+      assert.equal(await markWeekTwoReturn(kv, 'abc123', day, bump), false, day);
+    }
+    assert.equal(kv.store.get('return:w2:2026-10-12'), undefined);
+  });
+
+  await t.test('unknown and backfilled installs never count', async () => {
+    const kv = fakeKv();
+    assert.equal(await markWeekTwoReturn(kv, 'nobody', '2026-10-19', bump), false);
+    await kv.put('first:old1', '2026-07');
+    assert.equal(await markWeekTwoReturn(kv, 'old1', '2026-10-19', bump), false);
+    assert.deepEqual([...kv.store.keys()].filter((k) => k.startsWith('return:w2:')), []);
+  });
+});

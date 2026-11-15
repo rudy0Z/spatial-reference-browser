@@ -1,0 +1,8 @@
+{
+  "name": "blanc-newsletter-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "node deploy.mjs"
+  }
+}

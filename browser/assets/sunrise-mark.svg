@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The Spatial working-title mark, vector master. An isometric cube (three
+     faces of a spatial canvas) with a floating node window in the top face.
+     Pipeline note: this file keeps its historical sunrise-mark.svg filename
+     because scripts/build-brand-assets.js (sunriseMaster), the site lockup
+     tooling and the sunrise-mark.lock.json byte pins read that path; the
+     artwork inside is the Spatial mark. The 344-unit artwork is scaled 2.8x
+     and placed so the ink spans the same master box the previous artwork
+     used (90..930 on the 1024 canvas), so every derived crop in
+     build-brand-assets.js applies unchanged. Body shapes carry no fill
+     attribute (default black); class="cls-1" shapes are the white cutouts
+     (seam quads + node). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: #fff;
+      }
+    </style>
+  </defs>
+  <g transform="translate(104.76 30.4) scale(2.8)">
+    <path d="M145.455,22 L275.359,97 L275.359,247 L145.455,322 L15.551,247 L15.551,97 Z"/>
+    <path class="cls-1" d="M144.255,174.077 L19.547,102.077 L21.747,97.923 L146.655,169.923 Z"/>
+    <path class="cls-1" d="M144.255,169.923 L268.963,97.923 L271.363,102.077 L146.655,174.077 Z"/>
+    <path class="cls-1" d="M147.855,172 L147.855,316 L143.055,316 L143.055,172 Z"/>
+    <path class="cls-1" d="M145.455,81 L161.455,97 L145.455,113 L129.455,97 Z"/>
+  </g>
+</svg>

@@ -1,0 +1,880 @@
+const { app, protocol, net, ipcMain, session, dialog, shell, webContents } = require('electron');
+const { execFileSync } = require('node:child_process');
+const path = require('path');
+const fs = require('fs');
+const { pathToFileURL } = require('url');
+const bookmarks = require('./bookmarks');
+const { parseNetscapeBookmarks } = require('./bookmark-import');
+const { createBrowserDataImportService } = require('./browser-data-import');
+
+const MAX_IMPORT_BYTES = 20 * 1024 * 1024; // 20 MiB
+
+// Swaps an open page's stylesheet for a fresh copy (and so the current surface
+// style), removing the old one only once the new one has loaded, so the page
+// never shows unstyled. The query only defeats the link's own dedupe; the
+// handler resolves the file by name.
+const RESTYLE_SCRIPT = `(() => {
+  const old = document.querySelector('link[rel="stylesheet"][href^="pages.css"]');
+  if (!old) return;
+  const next = old.cloneNode();
+  next.href = 'pages.css?restyle=' + Date.now();
+  next.addEventListener('load', () => old.remove(), { once: true });
+  old.after(next);
+})()`;
+const history = require('./history');
+const archive = require('./archive');
+const downloads = require('./downloads');
+const settings = require('./settings');
+const wallpaper = require('./wallpaper');
+const { settingsForSource } = require('./wallpaper-model');
+const { settingsForClock, clockStyleFromSettings } = require('./start-clock-style');
+const { runOnePasswordVerify } = require('./onepassword-verify-flow');
+const { createDefaultBrowserStatus, requestDefaultBrowser } = require('./default-browser-status');
+const patron = require('./patron');
+const sync = require('./sync');
+const { syncErrorText } = require('./sync-messages');
+const telemetry = require('./telemetry');
+const diagnostics = require('./diagnostics');
+const { listDecisions, removeDecision } = require('./permissions');
+const { UTILITY_PAGES } = require('./utility-pages');
+const { resolvePagesAsset } = require('./pages-assets');
+const { stringsScriptFor } = require('./i18n');
+const { isTrustedPagesEvent } = require('./pages-ipc-trust');
+const { developmentBrandAssetPath } = require('./development-brand-preview');
+const { ublockBrandResourcePath } = require('./ublock-brand-resource');
+const { buildTrustReceipt, inspectLocalSignature } = require('./trust-receipt');
+
+function trustLinksForVersion(version) {
+  const release = encodeURIComponent(String(version));
+  return Object.freeze({
+    release: `https://github.com/bnfy/blanc/releases/tag/v${release}`,
+    verification: `https://github.com/bnfy/blanc/blob/v${release}/docs/release-verification.md`,
+    sbom: `https://github.com/bnfy/blanc/releases/download/v${release}/Blanc-${release}.cdx.json`,
+    provenance: 'https://github.com/bnfy/blanc/attestations',
+  });
+}
+
+// Internal chrome pages (bookmarks, history, downloads, settings, the new
+// tab page) are served over a dedicated `blanc://` scheme instead of
+// file:// so they get a real origin, and so ordinary web content can never
+// link into arbitrary local files.
+const PAGES_DIR = path.join(__dirname, '../renderer/pages');
+/** Must run before app 'ready'. */
+function registerPagesScheme() {
+  protocol.registerSchemesAsPrivileged([
+    ...(require('../../package.json').blancRuntime === 'ecs'
+      ? [require('./local-html-preview').LOCAL_HTML_SCHEME] : []),
+    { scheme: 'blanc', privileges: { standard: true, secure: true } },
+    { scheme: 'blanc-reader', privileges: { standard: true, secure: true } },
+    // The privileged strip + overlay cannot remain on file:// when the
+    // GrantFileProtocolExtraPrivileges fuse is disabled. Their handler is a
+    // separate, exact allowlist in chrome-protocol.js.
+    { scheme: 'blanc-chrome', privileges: { standard: true, secure: true } },
+  ]);
+}
+
+/** Call after app 'ready'. `hooks.onDataChanged` re-broadcasts tab state
+ * (e.g. so the star button updates when a bookmark is deleted from the
+ * bookmarks page). */
+function setupPages(hooks = {}) {
+  const t = (key, params) => hooks.i18n.t(key, params);
+  // Sync replies carry error codes; Settings gets their text as `message`
+  // and `status.lastError`, as before.
+  const syncStatus = (status) => status && { ...status, lastError: syncErrorText(status.lastError, t) };
+  const syncReply = ({ error, ...reply } = {}) => ({
+    ...reply,
+    ...(error === undefined ? {} : { message: syncErrorText(error, t) }),
+    ...(reply.status ? { status: syncStatus(reply.status) } : {}),
+  });
+  const trustLinks = trustLinksForVersion(app.getVersion());
+  const onePasswordAvailable = () => hooks.onePasswordAvailable?.() === true;
+  const recentTabOrderAvailable = () => hooks.recentTabOrderAvailable?.() === true;
+  const developmentBrandMarkPath = hooks.developmentBrandMarkPath ?? null;
+  const developmentDockIconPath = hooks.developmentDockIconPath ?? null;
+  const developmentDarkDockIconPath = hooks.developmentDarkDockIconPath ?? null;
+  // Test runs may point discovery at a throwaway synthetic home, but only in
+  // an unpackaged BLANC_TEST process. Production always uses the real OS home.
+  const testBrowserHome =
+    !app.isPackaged && process.env.BLANC_TEST === '1'
+      ? process.env.BLANC_TEST_BROWSER_HOME
+      : undefined;
+  const browserImport = hooks.browserImport ?? createBrowserDataImportService({
+    t,
+    homeDir: testBrowserHome,
+    env: testBrowserHome && process.platform === 'win32'
+      ? { ...process.env, LOCALAPPDATA: testBrowserHome }
+      : process.env,
+  });
+  let signatureInspection;
+  const localSignature = () => {
+    signatureInspection ??= inspectLocalSignature({
+      platform: process.platform,
+      packaged: app.isPackaged,
+      executablePath: process.execPath,
+    });
+    return signatureInspection;
+  };
+
+  // The active language's catalog for the virtual strings.js; main supplies it.
+  // Without the hook (isolated harnesses) pages get English.
+  const stringsScript = hooks.stringsScript ?? (() =>
+    stringsScriptFor({ source: fs.readFileSync(path.join(PAGES_DIR, 'strings.en.js'), 'utf8'), formatLocale: 'en', strict: false }));
+
+  // Both files are read once in a packaged build. A dev run reads them per
+  // request so an edited stylesheet shows on the next navigation.
+  const stylesheetCache = new Map();
+  const stylesheet = (surfaceStyle) => {
+    const key = surfaceStyle === 'neutral' ? 'neutral' : 'sunrise';
+    if (stylesheetCache.has(key)) return stylesheetCache.get(key);
+    let css = fs.readFileSync(path.join(PAGES_DIR, 'pages.css'), 'utf8');
+    if (key === 'neutral') css += '\n' + fs.readFileSync(path.join(PAGES_DIR, 'pages-neutral.css'), 'utf8');
+    if (app.isPackaged) stylesheetCache.set(key, css);
+    return css;
+  };
+  // A Surface style change restyles every open internal page (Start Pages,
+  // sheets, Mahjong) in place, with no reload to lose a game or a search.
+  let appliedSurfaceStyle = settings.getSettings().surfaceStyle;
+  settings.onSettingsChanged?.((s) => {
+    if (s.surfaceStyle === appliedSurfaceStyle) return;
+    appliedSurfaceStyle = s.surfaceStyle;
+    for (const wc of webContents?.getAllWebContents?.() ?? []) {
+      if (wc.isDestroyed() || !wc.getURL().startsWith('blanc://')) continue;
+      wc.executeJavaScript(RESTYLE_SCRIPT).catch(() => {});
+    }
+  });
+
+  const serveBlanc = (request) => {
+    const branding = ublockBrandResourcePath(request.url);
+    if (branding) return net.fetch(pathToFileURL(branding).toString(), { bypassCustomProtocolHandlers: true });
+    const { host, pathname } = new URL(request.url);
+    // The custom Start Page image is a userData file, so it is answered by
+    // its own exact name, never through the flat PAGES_DIR resolver below.
+    if (host === 'newtab' && wallpaper.isServedPath(pathname)) return wallpaper.serve();
+    // `blanc://bookmarks/` serves the page itself; any deeper path is a
+    // shared asset (pages.css, pages.js) resolved inside PAGES_DIR only.
+    // Unknown host → 404; malformed name on a known host → 400.
+    const asset = resolvePagesAsset(host, pathname);
+    if (asset.kind === 'error') {
+      return new Response(asset.status === 404 ? 'Not found' : 'Bad request', { status: asset.status });
+    }
+    if (asset.kind === 'strings') {
+      return new Response(stringsScript(), { headers: { 'content-type': 'text/javascript; charset=utf-8' } });
+    }
+    const name = asset.name;
+    // The stylesheet carries the surface style: Neutral appends its overrides
+    // in the same response, so there is no flash of the Sunrise palette. It
+    // is never cached by Chromium, or a page reloaded after a change would
+    // keep the old palette.
+    if (name === 'pages.css') {
+      return new Response(stylesheet(settings.getSettings().surfaceStyle), {
+        headers: { 'content-type': 'text/css; charset=utf-8', 'cache-control': 'no-store' },
+      });
+    }
+    const defaultPath = path.join(PAGES_DIR, name);
+    const resource = developmentBrandAssetPath({
+      name,
+      defaultPath,
+      brandMarkPath: developmentBrandMarkPath,
+      dockIconPath: developmentDockIconPath,
+      darkDockIconPath: developmentDarkDockIconPath,
+    });
+    return net.fetch(pathToFileURL(resource).toString(), { bypassCustomProtocolHandlers: true });
+  };
+
+  // The top-level `protocol` module binds only to the default session, so a
+  // tab in any other session gets no `blanc://` handler and loads blank —
+  // which is exactly what happened to private new tabs once private browsing
+  // moved to its own isolated `session.fromPartition`. Register the handler
+  // on every browsing session passed in. (The privileged-scheme registration
+  // in registerPagesScheme is process-global and needs no per-session repeat.)
+  const sessions = hooks.sessions?.length ? hooks.sessions : [session.defaultSession];
+  const expectedSessions = new Set();
+  const addSessions = (additional) => {
+    for (const ses of additional ?? []) {
+      if (!ses || expectedSessions.has(ses)) continue;
+      ses.protocol.handle('blanc', serveBlanc);
+      expectedSessions.add(ses);
+    }
+  };
+  addSessions(sessions);
+  // Every channel declares the exact internal host(s) that need it. The
+  // ownership hook then binds that host to the live utility sheet or new-tab
+  // WebContents; a URL-bearing renderer alone never gains authority.
+  const handle = (channel, hosts, fn) => {
+    const expectedHosts = new Set(Array.isArray(hosts) ? hosts : [hosts]);
+    ipcMain.handle(channel, (event, ...args) => {
+      const trusted = isTrustedPagesEvent(event, {
+        hosts: expectedHosts,
+        sessions: expectedSessions,
+        ownsSender: hooks.pageSurfaces?.owns ?? (() => false),
+      });
+      if (!trusted) {
+        throw new Error(`${channel}: denied for ${event.senderFrame?.url ?? event.sender.getURL()}`);
+      }
+      const run = hooks.runInPageRuntime ?? ((_event, work) => work());
+      return run(event, () => fn(...args));
+    });
+  };
+  const handleEvent = (channel, hosts, fn) => {
+    const expectedHosts = new Set(Array.isArray(hosts) ? hosts : [hosts]);
+    ipcMain.handle(channel, (event, ...args) => {
+      const trusted = isTrustedPagesEvent(event, {
+        hosts: expectedHosts,
+        sessions: expectedSessions,
+        ownsSender: hooks.pageSurfaces?.owns ?? (() => false),
+      });
+      if (!trusted) {
+        throw new Error(`${channel}: denied for ${event.senderFrame?.url ?? event.sender.getURL()}`);
+      }
+      const run = hooks.runInPageRuntime ?? ((_event, work) => work());
+      return run(event, () => fn(event, ...args));
+    });
+  };
+
+  handle('pages:surface:close', [...UTILITY_PAGES], () => hooks.utilitySheet.close());
+  // Settings opaque pickers arm Escape so main forwards it into the sheet
+  // instead of dismissing the sheet (see createUtilitySheet before-input-event).
+  handle('pages:surface:escape-arm', [...UTILITY_PAGES], (armed) => {
+    hooks.utilitySheet.setEscapeArmed?.(!!armed);
+  });
+
+  // The relay review is a distinct surface from Bring Your Tabs. The latter
+  // owns blanc://tab-import/ and its richer local-session organizer.
+  handle('pages:tab-handoff:get', 'tab-handoff', () =>
+    hooks.tabHandoff?.get?.() ?? { state: 'empty' });
+  handle('pages:tab-handoff:accept', 'tab-handoff', (destination) =>
+    hooks.tabHandoff?.accept?.(destination) ?? { ok: false, error: 'unavailable' });
+  handle('pages:tab-handoff:cancel', 'tab-handoff', () =>
+    hooks.tabHandoff?.cancel?.() ?? { ok: true });
+
+  handle('pages:bookmarks:capabilities', 'bookmarks', () => ({ editable: true }));
+  handle('pages:bookmarks:list', ['bookmarks', 'newtab'], () => bookmarks.listBookmarks());
+  // Start Page pins (start-page-pins.js): one device-local list that the
+  // Start Page and the Favorites page read and change; main tells both when it
+  // moves (pages:pins:changed).
+  handle('pages:pins:list', ['bookmarks', 'newtab'], () => hooks.startPins?.list?.() ?? { max: 0, pins: [] });
+  handleEvent('pages:pins:pin', ['bookmarks', 'newtab'], (event, url, title) =>
+    hooks.startPins?.pin?.(event.sender, { url, title }) ?? { ok: false, reason: 'unavailable' });
+  handleEvent('pages:pins:unpin', ['bookmarks', 'newtab'], (event, url) =>
+    hooks.startPins?.unpin?.(event.sender, url) ?? false);
+  handle('pages:bookmarks:remove', 'bookmarks', (id) => {
+    bookmarks.removeBookmark(id);
+    hooks.onDataChanged?.();
+  });
+  // The start page reports a stored favicon URL that failed to load, so
+  // it's cleared and stops being retried on future loads.
+  handle('pages:bookmarks:clear-favicon', ['bookmarks', 'newtab'], (url) => bookmarks.updateFavicon(url, null));
+
+  // newtab: the onboarding import step's "From a bookmarks file (HTML)…" row.
+  handle('pages:bookmarks:import', ['bookmarks', 'newtab'], async () => {
+    const parent = hooks.getMainWindow?.();
+    const picked = await dialog.showOpenDialog(parent ?? undefined, {
+      title: t('favorites.import.title'),
+      filters: [{ name: t('favorites.import.filter'), extensions: ['html', 'htm'] }],
+      properties: ['openFile'],
+    });
+    if (picked.canceled || !picked.filePaths.length) return { cancelled: true };
+    let file;
+    try {
+      file = await fs.promises.open(picked.filePaths[0], 'r');
+      const stat = await file.stat();
+      if (stat.size > MAX_IMPORT_BYTES) return { error: 'too-large' };
+      const html = await file.readFile('utf8');
+      const entries = parseNetscapeBookmarks(html);
+      if (!entries.length) return { error: 'empty' };
+      const { added, skipped } = bookmarks.importBookmarks(entries);
+      hooks.onDataChanged?.();
+      return { added, skipped };
+    } catch {
+      return { error: 'unreadable' };
+    } finally {
+      if (file) await file.close().catch(() => {});
+    }
+  });
+  handle('pages:bookmarks:browser-sources', ['bookmarks', 'newtab'], () => browserImport.listSources());
+  handle('pages:bookmarks:import-browser', ['bookmarks', 'newtab'], async (id) => {
+    const read = await browserImport.readSource(String(id ?? ''));
+    if (read.error) return { error: read.error };
+    const { added, skipped } = bookmarks.importBookmarks(read.entries);
+    hooks.onDataChanged?.();
+    return { added, skipped, source: read.source };
+  });
+
+  // Bring Your Tabs gets a separate, exact-host surface from F30 Favorites
+  // import. Selecting a profile reads its restorable open-tab session in
+  // main; the sheet receives only the opaque candidate projection.
+  handle('pages:tab-import:sources', 'tab-import', () => browserImport.listOpenTabSources());
+  handle('pages:tab-import:open-source', 'tab-import', async (id, options = {}) => {
+    const isCurrent = hooks.tabImport?.beginSourceRead?.() ?? (() => false);
+    const sourceId = String(id ?? '');
+    const read = await browserImport.readOpenTabs(sourceId, {
+      afterQuit: options?.afterQuit === true,
+    });
+    if (!isCurrent()) return { error: 'session-unavailable' };
+    if (read.error) {
+      return {
+        error: read.error,
+        recoverable: read.recoverable === true,
+        recoverableTabCount: Number(read.recoverableTabCount) || 0,
+      };
+    }
+    const opened = hooks.tabImport?.openSource?.({
+      sourceKind: 'chromium',
+      sourceLabel: read.source.label,
+      readCandidates: async () => read,
+    }) ?? { error: 'session-unavailable' };
+    if (opened.error) return opened;
+    const loaded = await hooks.tabImport?.loadCandidates?.(opened.sessionId)
+      ?? { error: 'session-unavailable' };
+    if (loaded.error) return loaded;
+    return {
+      ...opened,
+      ...loaded,
+      source: read.source,
+    };
+  });
+  handle('pages:tab-import:set-selection', 'tab-import', (sessionId, selection) =>
+    hooks.tabImport?.setSelection?.(
+      String(sessionId ?? ''),
+      selection ?? {},
+    ) ?? { error: 'session-unavailable' });
+  handle('pages:tab-import:suggest-source-groups', 'tab-import', (sessionId) =>
+    hooks.tabImport?.suggestSourceGroups?.(String(sessionId ?? ''))
+      ?? { error: 'session-unavailable' });
+  handle('pages:tab-import:suggest-embed', 'tab-import', (sessionId) =>
+    hooks.tabImport?.suggestEmbed?.(String(sessionId ?? ''))
+      ?? { error: 'session-unavailable' });
+  handle(
+    'pages:tab-import:submit-embeddings',
+    'tab-import',
+    (sessionId, generation, matrix) => hooks.tabImport?.submitEmbeddings?.(
+      String(sessionId ?? ''),
+      String(generation ?? ''),
+      matrix,
+    ) ?? { error: 'session-unavailable' },
+  );
+  handle('pages:tab-import:apply', 'tab-import', (sessionId, request) =>
+    hooks.tabImport?.apply?.(String(sessionId ?? ''), request ?? {})
+      ?? { error: 'apply-unavailable' });
+  handle('pages:tab-import:cancel', 'tab-import', (sessionId) =>
+    hooks.tabImport?.cancel?.(String(sessionId ?? '')) ?? { ok: false });
+
+  // F45 Arc Spaces import, on the same exact host. Main reads Arc's file (or
+  // one the person picks in a native dialog) and keeps it; the page receives
+  // only Space names, counts and opaque ids.
+  handle('pages:arc-import:detect', 'tab-import', () =>
+    hooks.arcImport?.detect?.() ?? { state: 'unsupported' });
+  handle('pages:arc-import:read', 'tab-import', (source) =>
+    hooks.arcImport?.read?.(source === 'file' ? 'file' : 'arc') ?? { error: 'unavailable' });
+  handle('pages:arc-import:apply', 'tab-import', (sessionId, request) =>
+    hooks.arcImport?.apply?.(String(sessionId ?? ''), request ?? {}) ?? { error: 'unavailable' });
+  handle('pages:arc-import:cancel', 'tab-import', (sessionId) =>
+    hooks.arcImport?.cancel?.(String(sessionId ?? '')) ?? { ok: false });
+
+  handle('pages:bookmarks:set-folder', 'bookmarks', (id, folder) => {
+    bookmarks.setBookmarkFolder(id, folder);
+    hooks.onDataChanged?.();
+  });
+  handle('pages:bookmarks:rename-folder', 'bookmarks', (oldName, newName) => {
+    bookmarks.renameFolder(oldName, newName);
+    hooks.onDataChanged?.();
+  });
+  handle('pages:bookmarks:remove-folder', 'bookmarks', (name) => {
+    bookmarks.removeFolder(name);
+    hooks.onDataChanged?.();
+  });
+
+  handle('pages:history:list', 'history', (opts) => history.listHistory(opts ?? {}));
+  handle('pages:history:remove', 'history', (url, visitedAt) => history.removeVisit(url, visitedAt));
+  handle('pages:history:clear', 'history', () => {
+    history.clearHistory();
+    hooks.onHistoryCleared?.();
+    // session.json's meta column holds the same titles; clearHistory() only
+    // owns history.json, so the main-process hook drops the persisted copy.
+  });
+
+  // F52 Tab Archive: the History sheet's Archived view. Restore goes through
+  // main, which opens the tab in the requesting window.
+  handle('pages:archive:list', 'history', (opts) => archive.listArchive({
+    query: typeof opts?.query === 'string' ? opts.query : '',
+    now: Date.now(),
+  }));
+  handle('pages:archive:restore', 'history', (id) => hooks.restoreArchived?.(typeof id === 'string' ? id : '') === true);
+  handle('pages:archive:forget', 'history', (id) => archive.forgetEntry(typeof id === 'string' ? id : ''));
+  handle('pages:archive:clear', 'history', () => archive.clearArchive());
+
+  handle('pages:downloads:list', 'downloads', () => downloads.listDownloads());
+  handle('pages:downloads:cancel', 'downloads', (id) => downloads.cancelDownload(id));
+  handle('pages:downloads:resume', 'downloads', (id) => downloads.resumeDownload(id));
+  handle('pages:downloads:retry', 'downloads', (id) => downloads.retryDownload(id));
+  handle('pages:downloads:open', 'downloads', (id) => downloads.openDownload(id));
+  handle('pages:downloads:show', 'downloads', (id) => downloads.showDownloadInFolder(id));
+  handle('pages:downloads:clear-finished', 'downloads', () => downloads.clearFinishedDownloads());
+
+  // The renderer never sees the license key or activation id — only the
+  // derived booleans. Internal pages are privileged, but least-privilege
+  // anyway (same reasoning as the preload's protocol re-check).
+  const clientSettings = () => {
+    // Strip both entitlement records out of `rest` (the renderer sees only
+    // derived booleans). `patron:` is aliased to `_patron` so it does not
+    // shadow the module-level `patron` (the network module) inside this scope.
+    const {
+      supporter: record,
+      patron: _patron,
+      _syncMeta,
+      _syncTieBreakers,
+      onePasswordEnabled,
+      onePasswordAccount,
+      presentationDefaultsResetVersion,
+      groupNamesRecasedVersion,
+      deviceNames,
+      // Which bangs were used is the Island's business, not the page's.
+      recentBangs: _recentBangs,
+      ...rest
+    } = settings.getSettings();
+    return {
+      ...rest,
+      ...(onePasswordAvailable() ? { onePasswordEnabled, onePasswordAccount } : {}),
+      patronActive: settings.isPatronActive(),
+      supporterActive: settings.isPatronActive(), // temporary alias until Phase 4 renames renderer refs
+      supporterActivatedAt: record?.activatedAt ?? null,
+    };
+  };
+
+  handle('pages:settings:get', 'settings', () => ({
+    settings: clientSettings(),
+    // Only non-secret metadata from this running process, never paths,
+    // environment variables, account details or persisted settings.
+    appInfo: {
+      blancVersion: app.getVersion(),
+      electronVersion: process.versions.electron,
+      chromiumVersion: process.versions.chrome,
+      platform: process.platform,
+      architecture: process.arch,
+    },
+    onePasswordAvailable: onePasswordAvailable(),
+    recentTabOrderAvailable: recentTabOrderAvailable(),
+    // Mini Window (#1138): the shortcut choices this platform offers and
+    // whether the chosen one is working ('off', 'on' or 'unavailable').
+    miniWindow: hooks.miniWindow?.status?.() ?? { choices: [], status: 'off' },
+    searchEngines: Object.fromEntries(
+      Object.entries(settings.SEARCH_ENGINES).map(([key, { label }]) => [key, label])
+    ),
+    appIcons: settings.APP_ICON_LABELS,
+    languages: hooks.i18n?.languagesInfo() ?? { active: 'en', system: 'en', options: [] },
+  }));
+  handle('pages:settings:check-for-updates', 'settings', () => hooks.checkForUpdates());
+  handle('pages:settings:drm-status', 'settings', () => hooks.drm?.status() ?? { enabled: false, state: 'unsupported', version: null, canRestart: false });
+  handle('pages:settings:drm-restart', 'settings', () => hooks.drm?.restart() ?? false);
+  handle('pages:blocking:status', 'settings', () => hooks.blocking?.status() ?? null);
+  handle('pages:blocking:retry', 'settings', () => hooks.blocking?.retry() ?? false);
+  handle('pages:blocking:open', 'settings', (tool) => hooks.blocking?.open(tool) ?? false);
+  handle('pages:settings:set', 'settings', (partial) => {
+    const next = partial && typeof partial === 'object' ? { ...partial } : {};
+    if (!onePasswordAvailable()) {
+      delete next.onePasswordEnabled;
+      delete next.onePasswordAccount;
+    }
+    settings.setSettings(next);
+    // Echo the persisted non-secret projection so the renderer can reflect the
+    // actual stored state (e.g. a rejected strict-custom DNS transition). Never
+    // raw getSettings() — that includes the supporter key.
+    return clientSettings();
+  });
+  // The only renderer write path for uiLanguage: sanitize() has no entry for
+  // it, so pages:settings:set drops it like any unknown key.
+  handle('pages:settings:language', 'settings', (code, restart) =>
+    hooks.i18n?.changeUiLanguage(code, { restart }) ?? false);
+  // F60 link routing. Targets are names and opaque ids only; the rules'
+  // only write path is settings.setLinkRoutes(), which validates the list.
+  handle('pages:settings:link-targets', 'settings', () =>
+    hooks.linkRoutes?.targets() ?? { profiles: [], spaces: [] });
+  handle('pages:settings:link-routes:set', 'settings', (routes) =>
+    settings.setLinkRoutes(Array.isArray(routes) ? routes : null));
+  handle('pages:settings:trust-receipt', 'settings', async () => {
+    const current = settings.getSettings();
+    const blocker = JSON.parse(fs.readFileSync(path.join(app.getAppPath(), 'adblock/sources/pinned.json'), 'utf8'));
+    const pkg = JSON.parse(fs.readFileSync(path.join(app.getAppPath(), 'package.json'), 'utf8'));
+    return buildTrustReceipt({
+      appInfo: {
+        version: app.getVersion(),
+        bundleBuild: pkg.build?.mac?.bundleVersion ?? app.getVersion(),
+        electron: process.versions.electron,
+        chromium: process.versions.chrome,
+        node: process.versions.node,
+        platform: process.platform,
+        architecture: process.arch,
+        packaged: app.isPackaged,
+      },
+      signature: await localSignature(),
+      blocker,
+      sync: syncStatus(sync.status()),
+      choices: current,
+      diagnostics: diagnostics.status(),
+      links: Object.keys(trustLinks).map((id) => ({
+        id,
+        label: t({ release: 'settings.trust.release', verification: 'settings.trust.verification', sbom: 'settings.trust.sbom', provenance: 'settings.trust.provenance' }[id]),
+      })),
+    });
+  });
+  handle('pages:settings:open-trust-link', 'settings', async (kind) => {
+    if (typeof kind !== 'string' || !Object.hasOwn(trustLinks, kind)) return { ok: false, error: 'unknown-link' };
+    await shell.openExternal(trustLinks[kind]);
+    return { ok: true };
+  });
+  handle('pages:settings:supporter-activate', 'settings', (key) => patron.activate(key, t));
+  if (onePasswordAvailable()) {
+    // App presence is a HINT (movable installs false-negative); Verify is
+    // the authoritative check. The verify flow persists first and replies
+    // only exact shapes — see onepassword-verify-flow.js.
+    handle('pages:settings:onepassword-status', 'settings', () => ({
+      appDetected: hooks.onePasswordAppDetected?.() === true,
+      supported: hooks.onePasswordDeviceSupported?.() !== false,
+    }));
+    handle('pages:settings:onepassword-verify', 'settings', (account) => runOnePasswordVerify({
+      account: typeof account === 'string' ? account : '',
+      saveAccount: (raw) => settings.setSettings({ onePasswordAccount: raw }).onePasswordAccount,
+      readStoredAccount: () => settings.getSettings().onePasswordAccount,
+      brokerVerify: (probed) => hooks.onePasswordVerify(probed),
+    }));
+    handle('pages:settings:open-onepassword-app', 'settings', () => {
+      hooks.openOnePasswordApp?.();
+      return true;
+    });
+  }
+
+  // Local-profile identity and destructive confirmation stay in main. The
+  // renderer receives only opaque ids, display names, and result messages.
+  handle('pages:profiles:list', 'settings', () => hooks.profiles?.list() ?? {
+    currentId: 'default',
+    profiles: [{ id: 'default', name: 'Personal', createdAt: 0 }],
+  });
+  handle('pages:profiles:create', 'settings', (name) =>
+    hooks.profiles?.create(String(name ?? '')) ?? null);
+  handle('pages:profiles:open', 'settings', (id) =>
+    hooks.profiles?.open(String(id ?? '')) ?? { ok: false });
+  handle('pages:profiles:rename', 'settings', (id, name) =>
+    hooks.profiles?.rename(String(id ?? ''), String(name ?? '')) ?? { ok: false });
+  handle('pages:profiles:remove', 'settings', (id, confirmation) =>
+    hooks.profiles?.remove(String(id ?? ''), String(confirmation ?? '')) ?? { ok: false });
+
+  // Sync: the passphrase arrives once on enable and never leaves main; every
+  // response is status-only (enabled/handle/lastSyncedAt/lastError) — no keys.
+  handle('pages:settings:shared-spaces-acknowledge','settings',id=>hooks.sharedSpaces?.acknowledge(id)??false);
+  handle('pages:settings:shared-spaces-open','settings',id=>hooks.sharedSpaces?.open(id)??{ok:false});
+  handle('pages:settings:shared-spaces-status','settings',()=>hooks.sharedSpaces?.status()??{offered:false});
+  handle('pages:settings:shared-spaces-preview','settings',options=>hooks.sharedSpaces?.preview({local:options?.local===true})??{offered:false});
+  handle('pages:settings:shared-spaces-apply','settings',payload=>hooks.sharedSpaces?.apply(payload??{})??{ok:false});
+  // iphonePairing: Connect your iPhone and the QR are offered in this build
+  // (design 2026-10-28 §9); openPairSheet: Finish setup asked for the sheet.
+  handle('pages:settings:sync-get', 'settings', () => ({
+    ...syncStatus(sync.status()),
+    iphonePairing: hooks.syncPairing?.offered?.() === true,
+    openPairSheet: hooks.syncPairing?.takeOpenSheet?.() === true,
+    platform: process.platform,
+  }));
+  handle('pages:settings:sync-enable', 'settings', async (payload) => {
+    const result = await sync.enable(payload ?? {});
+    // Persisted credentials complete the migration task even when the first
+    // pull failed (ok: false). The marker never clears if Sync is later off.
+    if (result?.status?.enabled === true) settings.setSettings({ syncMigrationCompleted: true });
+    return syncReply(result);
+  });
+  // Join-path probe: outcome-only reply, nothing persisted (see sync.preflight).
+  handle('pages:settings:sync-preflight', 'settings', async (payload) => syncReply(await sync.preflight(payload ?? {})));
+  handle('pages:settings:sync-disable', 'settings', async (opts) => syncReply(await sync.disable(opts ?? {})));
+  handle('pages:settings:sync-now', 'settings', () => sync.syncNow().then(() => syncStatus(sync.status())));
+  // Per-device consent for publishing this device's open tabs (spec §3) —
+  // lives in sync.json, never settings.json, so it cannot cross sync.
+  handle('pages:settings:sync-tabs-set', 'settings', (on) => sync.setSyncTabs(!!on));
+  handle('pages:settings:sync-device-name-set', 'settings', (name) => sync.setThisDeviceName(name));
+  // Names and platforms only: Settings → Sync's device list (sync.listDevices).
+  handle('pages:settings:sync-devices', 'settings', () => sync.listDevices());
+  // Device pairing (design 2026-10-16): the pairing code crosses to the page
+  // for display; the wrapped secret, the key and the recovery code never do.
+  handle('pages:settings:sync-pair-begin', 'settings', async () => syncReply(await sync.beginPairing()));
+  // Sync without a passphrase (design 2026-10-28 §5.1): the sync is named in
+  // the interface language; like enabling, it completes the moving-in task.
+  handle('pages:settings:sync-start-new', 'settings', async () => {
+    const result = await sync.startNew({ handle: t('settings.sync.defaultName') });
+    if (result?.status?.enabled === true) settings.setSettings({ syncMigrationCompleted: true });
+    return syncReply(result);
+  });
+  handle('pages:settings:sync-recovery-prompt-dismiss', 'settings', () => sync.dismissRecoveryPrompt());
+  // The sheet with a live code is visible (true) or not; main decides whether
+  // that window is focused enough to watch for the device that takes it.
+  handleEvent('pages:settings:sync-pair-watch', 'settings', (event, visible) => hooks.syncPairing?.watch(event.sender, visible === true) ?? false);
+  handle('pages:settings:sync-pair-cancel', 'settings', () => sync.cancelPairing());
+  handle('pages:settings:sync-pair-state', 'settings', () => sync.pairingState());
+  handle('pages:settings:sync-join-code', 'settings', async (code) => {
+    const result = await sync.joinWithCode(String(code ?? ''));
+    if (result?.status?.enabled === true) settings.setSettings({ syncMigrationCompleted: true });
+    return syncReply(result);
+  });
+  handle('pages:settings:sync-switch-code', 'settings', async (payload) => syncReply(
+    await sync.switchWithCode(String(payload?.code ?? ''), { wipeRemote: !!payload?.wipeRemote })
+  ));
+  handle('pages:settings:sync-recovery-code-copy', 'settings', async () => syncReply(await sync.copyRecoveryCode({
+    texts: {
+      message: t('settings.sync.recovery.dialogMessage'),
+      detail: t('settings.sync.recovery.dialogDetail'),
+      copy: t('settings.sync.recovery.dialogCopy'),
+      cancel: t('settings.sync.recovery.cancel'),
+    },
+  })));
+
+  handle('pages:app-version', 'newtab', () => app.getVersion());
+
+  // Help → Keyboard Shortcuts: the list is introspected from the live
+  // application menu in main.js, reached through a hook like startPage.
+  handle('pages:shortcuts:list', 'shortcuts', () => hooks.shortcuts?.list() ?? []);
+
+  // Start page (the ledger new tab): tab groups + the weekly blocked
+  // counter live in main.js, reached through hooks rather than a module.
+  handleEvent('pages:start:data', 'newtab', (event) => ({
+    groups: hooks.startPage?.groups() ?? [],
+    // Derived on demand from the active local profile's history. Private
+    // newtabs receive an empty list from the main-owned hook.
+    topSites: hooks.startPage?.topSites?.(event.sender) ?? [],
+    blockedThisWeek: hooks.startPage?.blockedThisWeek() ?? 0,
+    // Raw per-day counts drive the tally caption ("busiest day friday");
+    // the bar heights are normalized in main so the rule stays unit-tested.
+    blockedByDay: hooks.startPage?.blockedByDay?.() ?? [0, 0, 0, 0, 0, 0, 0],
+    blockedBarHeights: hooks.startPage?.blockedBarHeights?.() ?? [0, 0, 0, 0, 0, 0, 0],
+    remoteDevices: hooks.startPage?.remoteDevices() ?? [],
+    // Pages other devices sent here (M7b), opened or dismissed through the
+    // two handlers below; never in a private Start Page.
+    sentItems: hooks.startPage?.sentItemsFor?.(event.sender) ?? [],
+    // Least-privilege projection for the onboarding dialog: only the two
+    // settings it can change, so a replay shows what is actually saved.
+    onboarding: hooks.startPage?.onboardingState?.() ?? null,
+    // patronActive (for the start-page Patron callout) comes from the spread
+    // below: startPageStatus() supplies it, and the same function feeds the
+    // later pages:start:status push, so initial load and live updates agree.
+    ...hooks.startPage?.status?.(),
+    wallpaperVisible: hooks.startPage?.visibleFor?.(event.sender) === true,
+    // Play the Sunrise when Blanc opens (#1179): true for one Start Page per
+    // launch, decided in main (launch-sunrise.js).
+    launchSunrise: hooks.startPage?.launchSunriseFor?.(event.sender) === true,
+    // Per-tab: a private Start Page never receives the custom image.
+    wallpaper: hooks.startPage?.wallpaperFor?.(event.sender) ?? null,
+    // Per-tab guard: the shared status never carries profile or privacy.
+    migrationChecklist: hooks.startPage?.migrationChecklistFor?.(event.sender) ?? null,
+    // A utility sheet is a separate WebContentsView layered over this tab;
+    // document.hasFocus() in the covered renderer is not a reliable signal.
+    utilitySheetVisible: hooks.startPage?.utilitySheetVisibleFor?.(event.sender) === true,
+  }));
+  // Billboard asks for another bounded page only when local dismissals consume
+  // the initial candidate set. The hidden-hostname list stays in page storage
+  // and never crosses IPC.
+  handleEvent('pages:start:top-sites', 'newtab', (event, options) =>
+    hooks.startPage?.topSites?.(
+      event.sender,
+      options && typeof options === 'object' ? options : {},
+    ) ?? []);
+  // The footer layout switcher. The value is enum-validated by setSettings,
+  // so an unknown name is a no-op rather than an error.
+  handle(
+    'pages:start:set-layout',
+    'newtab',
+    (name) => hooks.startPage?.setLayout?.(String(name ?? '')),
+  );
+  // A narrow footer capability: persist only this boolean and return only
+  // its effective state. Never expose the settings or entitlement records.
+  handle('pages:start:set-dynamic-wallpaper', 'newtab', (enabled) => {
+    if (typeof enabled === 'boolean') settings.setSettings({ newtabDynamicWallpaper: enabled });
+    return settings.isDynamicWallpaperEnabled();
+  });
+  // F49 custom wallpaper. Replies carry only the sender's projection
+  // ({ source, hasImage, image }), never a file path or the image bytes.
+  const wallpaperReply = (event) => hooks.startPage?.wallpaperFor?.(event.sender) ?? null;
+  handleEvent('pages:start:wallpaper', ['newtab', 'settings'], (event) => wallpaperReply(event));
+  handleEvent('pages:start:set-wallpaper', ['newtab', 'settings'], (event, source) => {
+    const write = settingsForSource(source);
+    if (write) settings.setSettings(write);
+    return wallpaperReply(event);
+  });
+  // The Fade slider: only an integer 0–100 is saved; anything else is ignored.
+  handleEvent('pages:start:set-wallpaper-wash', ['newtab', 'settings'], (event, wash) => {
+    settings.setSettings({ newtabWallpaperWash: wash });
+    return wallpaperReply(event);
+  });
+  // The wash style (auto | light | dark | spotlight); anything else is ignored.
+  handleEvent('pages:start:set-wallpaper-style', ['newtab', 'settings'], (event, style) => {
+    settings.setSettings({ newtabWallpaperStyle: style });
+    return wallpaperReply(event);
+  });
+  // The Color wallpaper (synced): a Spaces preset id, a fill, and whether a
+  // window in a Space takes that Space's color. Anything else is ignored.
+  handleEvent('pages:start:set-wallpaper-color', 'newtab', (event, preset) => {
+    settings.setSettings({ newtabWallpaperColor: preset });
+    return wallpaperReply(event);
+  });
+  handleEvent('pages:start:set-wallpaper-fill', 'newtab', (event, fill) => {
+    settings.setSettings({ newtabWallpaperFill: fill });
+    return wallpaperReply(event);
+  });
+  handleEvent('pages:start:set-wallpaper-follow-space', 'newtab', (event, enabled) => {
+    if (typeof enabled === 'boolean') settings.setSettings({ newtabFollowSpaceColor: enabled });
+    return wallpaperReply(event);
+  });
+  // The Billboard clock's Font & Color (synced): any of font, weight, height,
+  // color, tone and style; each is validated on its own and anything else is
+  // ignored. The reply is the clock as now drawn.
+  handle('pages:start:set-clock', 'newtab', (partial) => {
+    const write = settingsForClock(partial);
+    return clockStyleFromSettings(Object.keys(write).length ? settings.setSettings(write) : settings.getSettings());
+  });
+  handleEvent('pages:start:choose-wallpaper', ['newtab', 'settings'], async (event) => {
+    let file = hooks.wallpaperTestFile?.() ?? null;
+    if (!file) {
+      const picked = await dialog.showOpenDialog(hooks.getMainWindow?.() ?? undefined, {
+        title: t('newtab.wallpaper.chooseTitle'),
+        filters: [{ name: t('newtab.wallpaper.filter'), extensions: ['jpg', 'jpeg', 'png'] }],
+        properties: ['openFile'],
+      });
+      if (picked.canceled || !picked.filePaths.length) return { cancelled: true, wallpaper: wallpaperReply(event) };
+      file = picked.filePaths[0];
+    }
+    const result = await wallpaper.importFile(file);
+    if (result.error) return { error: result.error, wallpaper: wallpaperReply(event) };
+    settings.setSettings({ newtabCustomWallpaper: true });
+    hooks.startPage?.wallpaperChanged?.();
+    return { ok: true, wallpaper: wallpaperReply(event) };
+  });
+  handleEvent('pages:start:remove-wallpaper', ['newtab', 'settings'], async (event) => {
+    await wallpaper.remove();
+    settings.setSettings({ newtabCustomWallpaper: false });
+    hooks.startPage?.wallpaperChanged?.();
+    return wallpaperReply(event);
+  });
+  handleEvent('pages:start:open-mahjong', 'newtab', (event, background) =>
+    hooks.startPage?.openMahjong?.(event.sender, background === true) === true);
+  handleEvent('pages:start:layout-used', 'newtab', (event, name) => {
+    if (!settings.NEWTAB_LAYOUTS.includes(name)) return false;
+    return hooks.telemetry?.newtabLayoutUsed?.(event.sender, name) === true;
+  });
+  handle(
+    'pages:start:focus-group',
+    'newtab',
+    (id) => hooks.startPage?.focusGroup(String(id)),
+  );
+  handle('pages:start:open-sent', 'newtab', (id) => hooks.startPage?.openSent?.(String(id)) === true);
+  handle('pages:start:dismiss-sent', 'newtab', (id) => hooks.startPage?.dismissSent?.(String(id)) === true);
+  // The moving-in checklist's "Make your first space" opens the Spaces menu.
+  handle('pages:start:open-spaces', 'newtab', () => hooks.startPage?.openSpaces?.() === true);
+  // Type-to-open from the start page. Main re-validates the character in
+  // openIslandTyping — the renderer's own gate is not trusted alone.
+  //
+  // Deliberately NOT String(char ?? '') like the neighbouring handlers: those
+  // coerce because their validators take strings by contract, but coercing
+  // here would turn a numeric 7 into a valid '7' and make the validator's own
+  // typeof check dead code. The payload is passed through untouched so the
+  // one validator sees what the renderer actually sent.
+  handle(
+    'pages:start:open-island',
+    'newtab',
+    (char) => hooks.startPage?.openIsland?.(char),
+  );
+  handle(
+    'pages:start:startup-retry',
+    'newtab',
+    () => hooks.startPage?.retryAdblock?.(),
+  );
+  handle(
+    'pages:start:startup-continue',
+    'newtab',
+    () => hooks.startPage?.continueWithoutAdblock?.(),
+  );
+  handle(
+    'pages:start:recover-session',
+    'newtab',
+    (choice) => hooks.startPage?.recoverSession?.(String(choice ?? '')),
+  );
+  handle(
+    'pages:start:privacy-complete',
+    'newtab',
+    (choices) => hooks.startPage?.completePrivacy?.(choices ?? {}),
+  );
+  // Moving-in checklist: open Settings at an allowlisted section (main owns
+  // the allowlist) and persist a one-time dismissal.
+  handleEvent('pages:start:shared-question','newtab',event=>hooks.startPage?.sharedQuestionFor(event.sender)??null);
+  handleEvent('pages:start:shared-question-answer','newtab',(event,id,on)=>hooks.startPage?.sharedQuestionAnswer(event.sender,id,!!on)??false);
+  handle('pages:start:open-settings', 'newtab', (section) => hooks.startPage?.openSettingsSection?.(section));
+  handle('pages:start:migration-checklist-dismiss', 'newtab', () => hooks.startPage?.dismissMigrationChecklist?.() === true);
+  // Patron upgrade pill: closing it snoozes it for 90 days (main owns the clock).
+  handle('pages:start:patron-callout-dismiss', 'newtab', () => hooks.startPage?.dismissPatronCallout?.() === true);
+  handle('pages:start:whats-new-dismiss', 'newtab', () => hooks.startPage?.dismissWhatsNew?.() === true);
+
+  // Standalone games invoke from their exact top-level document.
+  handleEvent('pages:mahjong:played', ['mahjong'], (event) =>
+    hooks.telemetry?.mahjongPlayed?.(event.sender) === true);
+
+  // The warning page names nothing: main resolves the sender's own tab and
+  // its recorded certificate failure (certificate spec §4.4).
+  handleEvent('pages:error:continue-unsafe', ['error'], (event) =>
+    hooks.errorPage?.continueUnsafe?.(event.sender) ?? { ok: false, error: 'no-certificate-error' });
+
+  // Shared with the first-day default-browser signal (default-browser-status.js).
+  const defaultBrowserStatus = createDefaultBrowserStatus({ app, platform: process.platform, execFileSync });
+  // newtab joined the allowlist for the onboarding dialog's first step; the
+  // canSet guard is identical for both senders.
+  handle('pages:default-browser:get', ['settings', 'newtab'], () => defaultBrowserStatus());
+  handle('pages:default-browser:set', ['settings', 'newtab'], () => {
+    requestDefaultBrowser({ app, platform: process.platform, shell });
+    hooks.defaultBrowserChanged?.();
+    return defaultBrowserStatus();
+  });
+
+  // Onboarding may change exactly these settings, live — never the whole
+  // settings surface. Values still pass setSettings' own validation.
+  handle('pages:start:onboarding-set', 'newtab', (partial) => {
+    const clean = {};
+    if (partial && typeof partial.adblockEnabled === 'boolean') clean.adblockEnabled = partial.adblockEnabled;
+    if (partial && typeof partial.theme === 'string') clean.theme = partial.theme;
+    if (Object.keys(clean).length) hooks.startPage?.applySettings?.(clean);
+    // F52 spec D5: the island step's Tab Archive offer — After 7 days or Off,
+    // and main accepts it only while first run is pending.
+    if (partial && (partial.tabArchive === '7d' || partial.tabArchive === 'off')) {
+      hooks.startPage?.offerTabArchive?.(partial.tabArchive);
+    }
+  });
+
+  // Replays the first-run walkthrough. Main creates and activates the tour
+  // tab — the sheet's own navigation is default-deny for blanc:// URLs, so a
+  // renderer-side location.href could never open it.
+  handle('pages:settings:welcome-tour', 'settings', () => hooks.startPage?.openWelcomeTour?.());
+
+  handle('pages:permissions:list', 'settings', () => listDecisions());
+  handle('pages:permissions:remove', 'settings', (key) => removeDecision(String(key)));
+
+  handle('pages:zoom:list', 'settings', () => hooks.pageZoom?.list() ?? []);
+  handle('pages:zoom:remove', 'settings', (site) => hooks.pageZoom?.remove(String(site)));
+  handle('pages:zoom:clear', 'settings', () => hooks.pageZoom?.clear());
+
+  // Privacy reset for the usage ping's per-install id (see telemetry.js) —
+  // from the next ping on, this install counts as brand new.
+  handle('pages:telemetry:reset-install-id', 'settings', () => telemetry.resetInstallId());
+
+  // This device-local ledger excludes browsing state and leaves main only
+  // through an explicit native save dialog opened from Settings.
+  handle('pages:diagnostics:status', 'settings', () => diagnostics.status());
+  handle('pages:diagnostics:export', 'settings', () =>
+    diagnostics.exportReport(hooks.getMainWindow?.(), t));
+  handle('pages:diagnostics:clear', 'settings', () => diagnostics.clear());
+
+  // The settings page promises "cookies, cache & site data" — clear both.
+  handle('pages:clear-browsing-data', 'settings', () => {
+    const browsingSessions = hooks.sessionsForCurrentRuntime?.()
+      ?? hooks.sessions
+      ?? [session.defaultSession];
+    return Promise.all(browsingSessions.flatMap((browsingSession) => [
+      browsingSession.clearStorageData(),
+      browsingSession.clearCache(),
+    ]));
+  });
+
+  return { addSessions };
+}
+
+module.exports = { registerPagesScheme, setupPages };

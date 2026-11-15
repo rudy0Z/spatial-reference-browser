@@ -1,0 +1,302 @@
+// Pure Reopen Closed Tab policy: which closes may hold a live view, how a
+// closed entry is shaped, and what of it a renderer may see. No electron
+// import — this file must stay requireable from `node --test` (precedent:
+// tab-sleep.js). The clock is injected, never read.
+// See docs/superpowers/specs/2026-08-16-reopen-closed-tab-design.md.
+
+const { captureSplits } = require('./split-model');
+const { cloneEntryMarks } = require('./certificate-history');
+const { recordTitle } = require('./inert-local-file');
+const { normalizeTabName } = require('./tab-name');
+const { pinnedHomeFor } = require('./pinned-home');
+
+/** Held views live this long before degrading to their snapshot (§2.1). */
+const CLOSED_GRACE_MS = 30_000;
+/** Recently closed is an undo buffer, not an archive. */
+const CLOSED_ENTRY_TTL_MS = 60 * 60 * 1000;
+/** Per-window entry cap, matching the old recentlyClosedUrls bound. */
+const MAX_CLOSED_ENTRIES = 25;
+/** At most one live held view per window; a newer close takes the hold. */
+const MAX_HELD_VIEWS = 1;
+
+let entrySeq = 0;
+const nextEntryId = () => `closed-${++entrySeq}`;
+
+function closedPinnedHome(tab) {
+  if (!tab?.pinned || tab.private || typeof tab.pinnedHomeUrl !== 'string') return null;
+  return pinnedHomeFor(tab.pinnedHomeUrl, {
+    localFile: tab.pinnedHomeUrl.startsWith('file:'),
+  });
+}
+
+/**
+ * Highest tier a closing tab qualifies for. 'refuse' means the close is not
+ * recorded at all (§2.1): private tabs, newtab, or no usable URL.
+ * The caller computes the family/prompt booleans — this module never sees
+ * the tabs Map or the prompt registry.
+ */
+function holdEligibility(tab, {
+  hasSnapshot = false,
+  promptPending = false,
+  openerAlive = false,
+  hasManagedChild = false,
+  popupChildCount = 0,
+} = {}) {
+  const url = typeof tab?.url === 'string' ? tab.url : '';
+  if (!url || tab?.private || url.startsWith('blanc://newtab')) return 'refuse';
+  if (!hasSnapshot) return 'url';
+  const anchorCount = tab.captureRecord?.anchors?.length ?? 0;
+  const demoted =
+    tab.capturing || tab.displayShareBlocking === true || anchorCount > 0        // grant truth, not the projection (§5.1a)
+    || promptPending                        // prompt-bearing closes are Tier 1 (§5.1b)
+    || tab.isLoading                        // an in-flight navigation can't be frozen (§3.4)
+    || tab.asleep || tab.sleeping || tab.waking
+    || tab.adopted || openerAlive || hasManagedChild || popupChildCount > 0; // §5.6
+  return demoted ? 'snapshot' : 'hold';
+}
+
+function mayParkTabView(tab) {
+  if (tab?.displayShareBlocking === true) return false;
+  if (tab?.capturing) return false;
+  if ((tab?.captureRecord?.anchors?.length ?? 0) > 0) return false;
+  return true;
+}
+
+/**
+ * Strip pageState from every entry unless the commit was a successful GET.
+ * pageState can carry the verbatim POST body of the submission that produced
+ * the page; restoring it would resubmit (§2.1.1). The stripping is deliberately
+ * applied to EVERY entry, not just the active one — trimSnapshot (tab-sleep.js)
+ * guarantees non-active entries carry no pageState, making the two forms
+ * behaviorally identical on real inputs. Strip-all is pure defense-in-depth
+ * against a future caller that violates that invariant. Runs on EVERY snapshot,
+ * held entries included, so a later downgrade needs no extra step.
+ */
+function sanitizeSnapshot(snapshot, { restorableCommit = false } = {}) {
+  if (!snapshot || !Array.isArray(snapshot.entries)) return null;
+  if (restorableCommit === true) return snapshot;
+  return {
+    ...snapshot,
+    entries: snapshot.entries.map(({ url, title }) => ({ url, title })),
+  };
+}
+
+/** One closed-tab entry. `view`/`heldAt`/`wcId` stay null here; only the
+ *  impure half may park a live view into them. */
+function buildTabEntry(tab, snapshot, slot = {}, now = 0) {
+  const pinnedHomeUrl = closedPinnedHome(tab);
+  // Spatial undo (Phase 3, spec step 4): the exact graph record the node had
+  // at close — uuid, coordinates, parent edge, child edges — so ⌘⇧T restores
+  // the NODE with its coordinates and edges, not merely a bare tab. Plain
+  // geometry data; it carries no page state and never reaches a renderer
+  // (projectEntries passes explicit fields only).
+  const spatial = tab.spatialNode && typeof tab.spatialNode === 'object' ? {
+    uuid: typeof tab.spatialNode.uuid === 'string' ? tab.spatialNode.uuid : null,
+    x: Number.isFinite(tab.spatialNode.x) ? tab.spatialNode.x : 0,
+    y: Number.isFinite(tab.spatialNode.y) ? tab.spatialNode.y : 0,
+    w: Number.isFinite(tab.spatialNode.w) ? tab.spatialNode.w : 0,
+    h: Number.isFinite(tab.spatialNode.h) ? tab.spatialNode.h : 0,
+    parentUuid: typeof tab.spatialNode.parentUuid === 'string' ? tab.spatialNode.parentUuid : null,
+    edges: Array.isArray(tab.spatialNode.edges) ? tab.spatialNode.edges.filter((uuid) => typeof uuid === 'string') : [],
+    viaAuth: tab.spatialNode.viaAuth === true,
+  } : null;
+  const entry = {
+    kind: 'tab',
+    ...(tab.sharedTabId ? {sharedTabId:tab.sharedTabId} : {}),
+    ...(tab.sharedRemoteClose ? {sharedRemoteClose:true} : {}),
+    id: nextEntryId(),
+    closedAt: now,
+    url: tab.url,
+    localFile: tab.localFile === true,
+    inheritsDocumentPolicy: tab.inheritsDocumentPolicy === true,
+    ...(spatial ? { spatial } : {}),
+    title: recordTitle(tab, typeof tab.title === 'string' && tab.title ? tab.title : tab.url),
+    customTitle: normalizeTabName(tab.customTitle),
+    ...(pinnedHomeUrl ? { pinnedHomeUrl } : {}),
+    favicon: typeof tab.favicon === 'string' ? tab.favicon : null,
+    pinned: !!tab.pinned,
+    muted: !!tab.muted,
+    groupId: tab.groupId ?? null,
+    groupName: slot.groupName ?? null,
+    index: Number.isInteger(slot.index) ? slot.index : 0,
+    snapshot: snapshot ?? null,
+    // Document-scoped fields a Tier 0 adoption must seed back (§3.3).
+    // adopted/openerTabId are absent by design: family tabs never hold (§5.6).
+    seed: {
+      usedMedia: !!tab.usedMedia,
+      historyEligible: tab.historyEligible !== false,
+      restorableCommit: tab.restorableCommit === true,
+      httpEntryCount: tab.httpEntryCount ?? 0,
+      deepScrolled: !!tab.deepScrolled,
+      // The document is older than its new record; stale async probes and
+      // snapshot work must be judged against the document's real generation.
+      navEpoch: tab.navEpoch ?? 0,
+      // The page was loaded past a certificate warning; adoption keeps the
+      // same navigation history, so it must keep saying so (certificate
+      // spec §4.6). Main-only, like the snapshot.
+      documentCertificateException: tab.documentCertificateException ?? null,
+      certificateEntryMarks: cloneEntryMarks(tab.certificateEntryMarks),
+    },
+    view: null,
+    heldAt: null,
+    wcId: null,
+    expiryTimer: null,
+  };
+  return entry;
+}
+
+/** A closed group's or split's members as recorded: private members are
+ *  dropped (never recorded), the rest keep what a reopen restores. */
+function closedMembers(members) {
+  return members
+    .filter((m) => !m.private)
+    .map((m) => {
+      const pinnedHomeUrl = closedPinnedHome(m);
+      return {
+        ...(m.sharedTabId ? { sharedTabId: m.sharedTabId } : {}),
+        url: m.url,
+        localFile: m.localFile === true,
+        inheritsDocumentPolicy: m.inheritsDocumentPolicy === true,
+        title: typeof m.title === 'string' && m.title ? m.title : m.url,
+        customTitle: normalizeTabName(m.customTitle),
+        ...(pinnedHomeUrl ? { pinnedHomeUrl } : {}),
+        favicon: typeof m.favicon === 'string' ? m.favicon : null,
+        pinned: !!m.pinned,
+        muted: !!m.muted,
+        snapshot: m.snapshot ?? null,
+      };
+    });
+}
+
+/** One entry for Close Split (Split View, F53): reopened whole, in order,
+ *  with its layout, at its place, back in its group if that still exists. */
+function buildSplitEntry(split, members, now = 0) {
+  return {
+    kind: 'split',
+    id: nextEntryId(),
+    closedAt: now,
+    split: {
+      layout: split.layout ?? null,
+      focusedIndex: Number.isInteger(split.focusedIndex) ? split.focusedIndex : 0,
+      index: Number.isInteger(split.index) ? split.index : 0,
+      groupId: typeof split.groupId === 'string' ? split.groupId : null,
+    },
+    tabs: closedMembers(members),
+    view: null,
+    heldAt: null,
+    wcId: null,
+    expiryTimer: null,
+  };
+}
+
+/** One entry for a whole group close (§2.2). Private members are dropped
+ *  from the record (never recorded) though the caller still closes them. */
+function buildGroupEntry(group, members, now = 0) {
+  return {
+    kind: 'group',
+    id: nextEntryId(),
+    closedAt: now,
+    group: {
+      id: group.id,
+      name: group.name,
+      collapsed: !!group.collapsed,
+      color: typeof group.color === 'string' ? group.color : null,
+      index: Number.isInteger(group.index) ? group.index : 0,
+    },
+    activeMemberIndex: Number.isInteger(group.activeMemberIndex) ? group.activeMemberIndex : 0,
+    tabs: closedMembers(members),
+    view: null,
+    heldAt: null,
+    wcId: null,
+    expiryTimer: null,
+  };
+}
+
+/** One entry for a bulk close ("Close Other Tabs"): all members restored by
+ *  one ⌘⇧T, no group created — each member rejoins its recorded group only if
+ *  it still exists at restore time (resolved by the caller). Private members
+ *  are dropped from the record, same as buildGroupEntry. */
+function buildBatchEntry(members, now = 0, splits = []) {
+  const kept = members.filter(member => !member.private);
+  const splitColumns = captureSplits(splits, kept.map(member => member.id));
+  return {
+    kind: 'batch',
+    ...(splitColumns.splits.length ? splitColumns : {}),
+    id: nextEntryId(),
+    closedAt: now,
+    tabs: members
+      .filter((m) => !m.private)
+      .map((m) => {
+        const pinnedHomeUrl = closedPinnedHome(m);
+        const member = {
+          ...(m.sharedTabId ? { sharedTabId: m.sharedTabId } : {}),
+          url: m.url,
+          localFile: m.localFile === true,
+          inheritsDocumentPolicy: m.inheritsDocumentPolicy === true,
+          title: typeof m.title === 'string' && m.title ? m.title : m.url,
+          customTitle: normalizeTabName(m.customTitle),
+          ...(pinnedHomeUrl ? { pinnedHomeUrl } : {}),
+          favicon: typeof m.favicon === 'string' ? m.favicon : null,
+          pinned: !!m.pinned,
+          muted: !!m.muted,
+          snapshot: m.snapshot ?? null,
+          groupId: m.groupId ?? null,
+        };
+        return member;
+      }),
+    view: null,
+    heldAt: null,
+    wcId: null,
+    expiryTimer: null,
+  };
+}
+
+/** Ids of entries whose hold has aged out. Always a downgrade, never a
+ *  destroy: every held entry carries its snapshot (§2.1). */
+function expireHolds(entries, { now, graceMs = CLOSED_GRACE_MS } = {}) {
+  return (entries ?? [])
+    .filter((e) => e?.view && Number.isFinite(e.heldAt) && now - e.heldAt >= graceMs)
+    .map((e) => e.id);
+}
+
+/** Closed-entry ids old enough to leave the undo buffer altogether. */
+function expireEntries(entries, { now, ttlMs = CLOSED_ENTRY_TTL_MS } = {}) {
+  return (entries ?? [])
+    .filter((entry) => Number.isFinite(entry?.closedAt) && now - entry.closedAt >= ttlMs)
+    .map((entry) => entry.id);
+}
+
+/** The ONLY shape a renderer may see (§4.1). Entries, page state, seeds,
+ *  slot metadata, and view references never cross this projection. */
+function projectEntries(entries) {
+  const pngFavicon = (value) =>
+    typeof value === 'string' && value.startsWith('data:image/png;base64,')
+      ? value
+      : null;
+  return (entries ?? []).map((e) => ({
+    id: e.id,
+    title: e.kind === 'group' ? e.group.name
+      : e.kind === 'batch' ? `${e.tabs.length} tabs`
+      : e.kind === 'split' ? e.tabs.map((m) => m.customTitle || m.title).join(' + ')
+      : (e.customTitle || e.title),
+    favicon: ['group', 'batch', 'split'].includes(e.kind) ? null : pngFavicon(e.favicon),
+    tabCount: ['group', 'batch', 'split'].includes(e.kind) ? e.tabs.length : 1,
+  }));
+}
+
+module.exports = {
+  buildSplitEntry,
+  holdEligibility,
+  mayParkTabView,
+  sanitizeSnapshot,
+  buildTabEntry,
+  buildGroupEntry,
+  buildBatchEntry,
+  expireHolds,
+  expireEntries,
+  projectEntries,
+  CLOSED_GRACE_MS,
+  CLOSED_ENTRY_TTL_MS,
+  MAX_CLOSED_ENTRIES,
+  MAX_HELD_VIEWS,
+};

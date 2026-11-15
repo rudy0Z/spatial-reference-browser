@@ -57,6 +57,7 @@ import ZenRail, { ZEN_RAIL_WIDTH } from './components/chrome/ZenRail'
 import SpatialCanvas from './components/canvas/SpatialCanvas'
 import MockWebReader from './components/viewport/MockWebReader'
 import { LIVE_POOL_LIMIT } from './lib/livePool'
+import { initSpatialBridge, spatialEnabled } from './lib/spatialBridge'
 import { useGraphStore } from './store/useGraphStore'
 import type { GraphStore } from './store/useGraphStore'
 import { useToastStore } from './store/useToastStore'
@@ -194,10 +195,11 @@ function App() {
   const activeNode = useGraphStore((state) => (state.activeNodeUuid ? (state.nodes[state.activeNodeUuid] ?? null) : null))
   const glanceOpen = useGraphStore((state) => state.glanceOpen)
 
-  /* --- §9 first run: seed the graph once, after hydration --- */
+  /* --- §9 first run: seed the graph once, after hydration ---
+   * Spatial shell: main owns the graph — the local seed is skipped there. --- */
   const ensureFirstRunSeed = useGraphStore((state) => state.ensureFirstRunSeed)
   useEffect(() => {
-    if (!hasHydrated) return
+    if (!hasHydrated || spatialEnabled) return
     ensureFirstRunSeed()
   }, [hasHydrated, ensureFirstRunSeed])
 
@@ -233,6 +235,26 @@ function App() {
   /* --- overlays (top-bar buttons + ⌘/Ctrl+/ + layered Esc) --- */
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [extensionsOpen, setExtensionsOpen] = useState(false)
+
+  /* --- Spatial shell bridge (real browser only; no-op under vite dev) ---
+   * Phase 3: when this document runs as blanc-chrome://spatial/, main owns
+   * the graph and the live WebContentsViews; the bridge hydrates the store,
+   * pushes ops, syncs the mode/layout and drives the z-order guard. */
+  const spatialHandleRef = useRef<ReturnType<typeof initSpatialBridge>>(null)
+  useEffect(() => {
+    const handle = initSpatialBridge()
+    spatialHandleRef.current = handle
+    return () => {
+      handle?.dispose()
+      spatialHandleRef.current = null
+    }
+  }, [])
+  useEffect(() => {
+    spatialHandleRef.current?.setShellOverlaysOpen(shortcutsOpen || extensionsOpen)
+  }, [shortcutsOpen, extensionsOpen])
+  useEffect(() => {
+    spatialHandleRef.current?.setRailWidth(railOpen ? ZEN_RAIL_WIDTH : 0)
+  }, [railOpen])
 
   /* --- Split View (two reader panes, 1px divider) --- */
   const [splitOpen, setSplitOpen] = useState(false)

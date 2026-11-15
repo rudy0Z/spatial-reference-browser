@@ -1,0 +1,190 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
+const { BROWSER_COMMAND_IDS, browserCommandDefinition, matchBrowserShortcut, installBrowserShortcuts, createBrowserCommandExecutor } = require('../../src/main/browser-shortcuts');
+const input = (key, modifiers = {}) => ({ type: 'keyDown', key, ...modifiers });
+
+test('every command names its menu label in the interface catalog', () => {
+  const en = require('../../copy/messages/en.json');
+  assert.ok(BROWSER_COMMAND_IDS.length >= 14);
+  for (const id of BROWSER_COMMAND_IDS) {
+    const { labelKey } = browserCommandDefinition(id, 'darwin');
+    assert.ok(Object.hasOwn(en, labelKey), `${id}: ${labelKey} is in en.json`);
+  }
+});
+
+test('Windows and Linux essentials and retained aliases dispatch to the same commands', () => {
+  for (const platform of ['win32', 'linux']) {
+    for (const [key, modifiers, command] of [
+      ['h', { control: true }, 'history'], ['y', { control: true }, 'history'],
+      ['j', { control: true }, 'downloads'], ['j', { control: true, shift: true }, 'downloads'],
+      ['d', { alt: true }, 'address'], ['l', { control: true }, 'address'],
+      ['F5', {}, 'reload'], ['r', { control: true }, 'reload'],
+      ['PageDown', { control: true }, 'next-tab-in-order'], ['Tab', { control: true }, 'next-tab'],
+      ['PageUp', { control: true }, 'previous-tab-in-order'], ['Tab', { control: true, shift: true }, 'previous-tab'],
+      [',', { control: true }, 'settings'], ['w', { control: true }, 'close-tab'],
+    ]) assert.equal(matchBrowserShortcut(input(key, modifiers), platform), command);
+  }
+});
+
+test('ordinary editing, Tab, composition, AltGr and extra modifiers pass through', () => {
+  for (const event of [input('Tab'), input('w'), input('w', { control: true, alt: true }),
+    input('h', { control: true, meta: true }), input('h', { control: true, shift: true }),
+    input('h', { control: true, isComposing: true }), input('h', { control: true, modifiers: ['altGraph'] }),
+    input('c', { control: true }), { type: 'keyUp', key: 'w', control: true }]) {
+    assert.equal(matchBrowserShortcut(event, 'win32'), null);
+  }
+  assert.equal(browserCommandDefinition('history', 'darwin').primary, 'CmdOrCtrl+Y');
+  assert.equal(browserCommandDefinition('downloads', 'darwin').primary, 'CmdOrCtrl+Shift+J');
+  assert.deepEqual(browserCommandDefinition('address', 'darwin').aliases, []);
+  assert.equal(matchBrowserShortcut(input('h', { meta: true }), 'darwin'), null);
+});
+
+test('input routing follows current ownership, suppresses menu duplicates and consumes repeats', () => {
+  const wc = Object.assign(new EventEmitter(), { id: 12, isDestroyed: () => false });
+  let owner = { id: 'first' }, owns = true, calls = [], prevented = 0;
+  installBrowserShortcuts({ webContents: wc, getRuntime: () => owner, ownsSurface: () => owns,
+    execute: (id, runtime) => { calls.push([id, runtime.id]); return true; }, platform: 'win32' });
+  const emit = extra => wc.emit('before-input-event', { preventDefault: () => prevented++ }, input('w', { control: true, ...extra }));
+  emit(); owner = { id: 'second' }; emit(); emit({ isAutoRepeat: true });
+  owns = false; emit(); owner = null; emit();
+  assert.deepEqual(calls, [['close-tab', 'first'], ['close-tab', 'second']]);
+  assert.equal(prevented, 3);
+  const mac = new EventEmitter();
+  installBrowserShortcuts({ webContents: mac, platform: 'darwin' });
+  assert.equal(mac.listenerCount('before-input-event'), 0);
+});
+
+test('the shared executor rejects closed and resident windows and unknown commands', () => {
+  const calls = [];
+  const execute = createBrowserCommandExecutor({ settings: runtime => calls.push(runtime.id) });
+  const runtime = { id: 'a', window: { isDestroyed: () => false } };
+  assert.equal(execute('settings', runtime), true);
+  for (const invalid of [null, {}, { ...runtime, closing: true }, { ...runtime, resident: true },
+    { ...runtime, window: { isDestroyed: () => true } }]) assert.equal(execute('settings', invalid), false);
+  assert.equal(execute('constructor', runtime), false);
+  assert.deepEqual(calls, ['a']);
+});
+
+
+test('macOS keeps detached-window creation and reopen menu actions', () => {
+  const calls = [];
+  const actions = Object.fromEntries(['new-window', 'new-tab', 'new-private-tab', 'reopen-tab', 'settings'].map(id => [id, () => calls.push(id)]));
+  const runtime = { id: 'mac', window: null };
+  const mac = createBrowserCommandExecutor(actions, { platform: 'darwin' });
+  for (const id of ['new-window', 'new-tab', 'new-private-tab', 'reopen-tab']) assert.equal(mac(id, runtime), true);
+  assert.equal(mac('settings', runtime), false);
+  assert.equal(createBrowserCommandExecutor(actions, { platform: 'win32' })('new-window', runtime), false);
+  assert.deepEqual(calls, ['new-window', 'new-tab', 'new-private-tab', 'reopen-tab']);
+});
+
+test('the action receives the webContents the key came from, or null from a menu', () => {
+  const seen = [];
+  const execute = createBrowserCommandExecutor({ reload: (runtime, sender) => seen.push([runtime.id, sender]) }, { platform: 'win32' });
+  const runtime = { id: 'w', window: { isDestroyed: () => false } };
+  assert.equal(execute('reload', runtime, 'page-wc'), true);
+  assert.equal(execute('reload', runtime), true);
+  assert.deepEqual(seen, [['w', 'page-wc'], ['w', null]]);
+
+  const wc = Object.assign(new EventEmitter(), { id: 3, isDestroyed: () => false });
+  const delivered = [];
+  installBrowserShortcuts({
+    webContents: wc, getRuntime: () => runtime, ownsSurface: () => true, platform: 'linux',
+    execute: (id, _runtime, sender) => { delivered.push([id, sender]); return true; },
+  });
+  wc.emit('before-input-event', { preventDefault() {} }, input('r', { control: true }));
+  assert.deepEqual(delivered, [['reload', wc]]);
+});
+
+test('Back and Forward are browser commands labelled from the pill', () => {
+  assert.equal(browserCommandDefinition('back', 'darwin').primary, 'CmdOrCtrl+[');
+  assert.equal(browserCommandDefinition('forward', 'darwin').primary, 'CmdOrCtrl+]');
+  assert.equal(browserCommandDefinition('back', 'darwin').labelKey, 'pill.back');
+  assert.equal(matchBrowserShortcut(input('[', { meta: true }), 'darwin'), 'back');
+  assert.equal(matchBrowserShortcut(input(']', { meta: true }), 'darwin'), 'forward');
+});
+
+test('Windows and Linux go Back and Forward with Alt+Left/Right and leave Ctrl+[ / ] to pages', () => {
+  // Gmail, Google Docs and code editors use Ctrl+[ / Ctrl+]; Chrome leaves
+  // them to the page on these platforms.
+  for (const platform of ['win32', 'linux']) {
+    assert.equal(browserCommandDefinition('back', platform).primary, 'Alt+Left');
+    assert.equal(browserCommandDefinition('forward', platform).primary, 'Alt+Right');
+    assert.equal(matchBrowserShortcut(input('ArrowLeft', { alt: true }), platform), 'back');
+    assert.equal(matchBrowserShortcut(input('ArrowRight', { alt: true }), platform), 'forward');
+    assert.equal(matchBrowserShortcut(input('[', { control: true }), platform), null);
+    assert.equal(matchBrowserShortcut(input(']', { control: true }), platform), null);
+    assert.equal(matchBrowserShortcut(input('ArrowLeft', { alt: true, control: true }), platform), null);
+  }
+});
+
+test('Copy Link is a browser command on every platform, under the Edit menu label', () => {
+  // Arc's Copy URL key; Chrome gives the same chord to DevTools' element
+  // picker everywhere, so no page expects to receive it.
+  for (const platform of ['darwin', 'win32', 'linux']) {
+    const definition = browserCommandDefinition('copy-link', platform);
+    assert.equal(definition.primary, 'CmdOrCtrl+Shift+C');
+    assert.deepEqual(definition.aliases, []);
+    assert.equal(definition.labelKey, 'tabMenu.copyLink');
+  }
+  assert.equal(matchBrowserShortcut(input('c', { meta: true, shift: true }), 'darwin'), 'copy-link');
+  assert.equal(matchBrowserShortcut(input('c', { control: true, shift: true }), 'darwin'), null);
+  for (const platform of ['win32', 'linux']) {
+    assert.equal(matchBrowserShortcut(input('c', { control: true, shift: true }), platform), 'copy-link');
+    assert.equal(matchBrowserShortcut(input('C', { control: true, shift: true }), platform), 'copy-link');
+    // Plain copy and the editing chords stay with the page.
+    assert.equal(matchBrowserShortcut(input('c', { control: true }), platform), null);
+    assert.equal(matchBrowserShortcut(input('c', { control: true, shift: true, alt: true }), platform), null);
+  }
+});
+
+test('Ctrl+PageDown/PageUp switch by list order on every platform; Ctrl+Tab has no alias', () => {
+  for (const platform of ['darwin', 'win32', 'linux']) {
+    assert.equal(browserCommandDefinition('next-tab-in-order', platform).primary, 'Ctrl+PageDown');
+    assert.equal(browserCommandDefinition('previous-tab-in-order', platform).primary, 'Ctrl+PageUp');
+    assert.deepEqual(browserCommandDefinition('next-tab', platform).aliases, []);
+    assert.deepEqual(browserCommandDefinition('previous-tab', platform).aliases, []);
+  }
+  assert.equal(browserCommandDefinition('next-tab-in-order', 'darwin').labelKey, 'menu.nextTabInOrder');
+});
+
+test('an unconsumed command reaches the page and its repeats run; consumed ones stay as before', () => {
+  const wc = Object.assign(new EventEmitter(), { id: 7, isDestroyed: () => false });
+  const runtime = { id: 'w' };
+  const calls = [];
+  installBrowserShortcuts({
+    webContents: wc, getRuntime: () => runtime, ownsSurface: () => true, platform: 'linux',
+    execute: (id) => { calls.push(id); return true; },
+    consumes: (id) => id !== 'next-tab',
+  });
+  let prevented = 0;
+  const emit = (key, extra = {}) => wc.emit('before-input-event', { preventDefault: () => prevented++ },
+    input(key, { control: true, ...extra }));
+  emit('Tab'); emit('Tab', { isAutoRepeat: true });
+  assert.deepEqual(calls, ['next-tab', 'next-tab'], 'Ctrl+Tab repeats step the pick');
+  assert.equal(prevented, 0, 'the press, and so its key releases, reach the page');
+  emit('w'); emit('w', { isAutoRepeat: true });
+  assert.deepEqual(calls, ['next-tab', 'next-tab', 'close-tab'], 'a consumed repeat still never runs');
+  assert.equal(prevented, 2);
+});
+
+test('a deferred command is left entirely to the menu accelerator', () => {
+  const wc = Object.assign(new EventEmitter(), { id: 7, isDestroyed: () => false });
+  const runtime = { id: 'w', switching: true };
+  const calls = [];
+  installBrowserShortcuts({
+    webContents: wc, getRuntime: () => runtime, ownsSurface: () => true, platform: 'linux',
+    execute: (id) => { calls.push(id); return true; },
+    defers: (id, owner) => id === 'close-tab' && owner.switching,
+  });
+  let prevented = 0;
+  const emit = (key) => wc.emit('before-input-event', { preventDefault: () => prevented++ }, input(key, { control: true }));
+  emit('w');
+  assert.deepEqual(calls, [], 'Ctrl+W during a switch neither runs here nor is consumed');
+  assert.equal(prevented, 0);
+  runtime.switching = false;
+  emit('w');
+  assert.deepEqual(calls, ['close-tab']);
+  assert.equal(prevented, 1);
+});

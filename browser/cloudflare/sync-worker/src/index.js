@@ -1,0 +1,520 @@
+// Blanc's E2EE profile-sync store. Holds ONLY AES-GCM ciphertext keyed by an
+// opaque accountId derived client-side from a passphrase we never see — this
+// Worker cannot decrypt or merge user data. The locator is a bearer capability;
+// account and raw client-IP rate counters remain in KV for up to 120 seconds.
+// This does not establish platform logging/metadata retention. See the design
+// spec in the main repo (docs/superpowers/specs/2026-07-07-profile-sync-design.md).
+
+const STORES = new Set(['bookmarks', 'settings', 'session', 'icons', 'sends', 'spaces', 'closed', 'shared']); // history may follow later
+const MAX_BLOB_BYTES = 512 * 1024;                 // favorites+settings are tiny; raise for history
+const MAX_REQUEST_BYTES = 513 * 1024;              // blob plus v1 JSON envelope
+const RATE_LIMIT = 30;                             // GETs per accountId per minute — anti-hammering of one account
+const IP_RATE_LIMIT = 120;                         // requests per client IP per minute — the anti-guessing throttle
+
+const blobKey = (a, s) => `blob:${a}:${s}`;
+
+// Device pairing (design 2026-10-16 §5.3): a sender parks its wrapped sync
+// secret under a code-derived id; the first GET returns it and deletes it.
+// The Worker never sees the code or any key. Ten minutes, a few hundred
+// bytes, and a per-IP read limit that makes guessing the 39-bit code
+// pointless within the window.
+const PAIR_TTL_SECONDS = 600;
+const PAIR_MAX_REQUEST_BYTES = 4096;
+const PAIR_GET_LIMIT = 10;                         // pair GETs per client IP per minute
+const pairKey = (id) => `pair:${id}`;
+
+// Activity marker (storage budget design 2026-10-05): any successful read or
+// write keeps the account alive; one untouched for a year expires, and the
+// daily cleanup then deletes its blobs. Refreshed at most every 30 days so a
+// busy account costs about one KV write a month. A separate key, because
+// extending an expiry on the blob itself would mean rewriting user data
+// during a GET, which can race with and undo a newer PUT.
+const SEEN_TTL_SECONDS = 365 * 24 * 60 * 60;
+const SEEN_REFRESH_MS = 30 * 24 * 60 * 60 * 1000;
+const seenKey = (a) => `seen:${a}`;
+const readMarker = (env, accountId) => env.SYNC.get(seenKey(accountId), { type: 'json' });
+
+async function touchAccount(env, accountId, marker, now = Date.now()) {
+  if (marker && now - marker.touchedAt < SEEN_REFRESH_MS) return;
+  await env.SYNC.put(seenKey(accountId), JSON.stringify({ touchedAt: now }), { expirationTtl: SEEN_TTL_SECONDS });
+}
+
+// Daily new-account budget (design 2026-10-05 §4.2). An account with no
+// marker is new; only new accounts are ever refused, so a flood can block
+// sign-ups for a day but never existing users. KV has no atomic increment,
+// so like bumpLimited this is an order-of-magnitude bound, not an exact one.
+const DEFAULT_NEW_ACCOUNT_DAILY_LIMIT = 10;
+const NEW_COUNTER_TTL_SECONDS = 2 * 24 * 60 * 60;
+const utcDay = (now) => new Date(now).toISOString().slice(0, 10);
+
+function limitFrom(value, fallback) {
+  const n = Number.parseInt(value ?? '', 10);
+  return Number.isSafeInteger(n) && n >= 0 ? n : fallback;
+}
+
+async function newAccountRefusal(env, now = Date.now()) {
+  const limit = limitFrom(env.NEW_ACCOUNT_DAILY_LIMIT, DEFAULT_NEW_ACCOUNT_DAILY_LIMIT);
+  const used = Number.parseInt((await env.SYNC.get(`new:${utcDay(now)}`)) ?? '0', 10);
+  if (used < limit) return null;
+  const midnight = new Date(now);
+  midnight.setUTCHours(24, 0, 0, 0);
+  return new Response(JSON.stringify({ error: 'busy' }), {
+    status: 503,
+    headers: {
+      'Content-Type': 'application/json',
+      'Retry-After': String(Math.max(1, Math.ceil((midnight.getTime() - now) / 1000))),
+    },
+  });
+}
+
+async function countNewAccount(env, now = Date.now()) {
+  const key = `new:${utcDay(now)}`;
+  const used = Number.parseInt((await env.SYNC.get(key)) ?? '0', 10);
+  await env.SYNC.put(key, String(used + 1), { expirationTtl: NEW_COUNTER_TTL_SECONDS });
+}
+
+// Daily cleanup (design 2026-10-05 §4.3). Deletes blobs whose account has no
+// live marker. Off unless CLEANUP_ENABLED is exactly "true", which is set only
+// after the backfill gives every existing account a marker. Bounded per run;
+// anything left is picked up the next day.
+const DEFAULT_CLEANUP_MAX_DELETES = 1000;
+
+async function listNames(env, prefix) {
+  const names = [];
+  let cursor;
+  do {
+    const page = await env.SYNC.list({ prefix, cursor });
+    for (const key of page.keys) names.push(key.name);
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return names;
+}
+
+async function cleanupInactive(env) {
+  // The quota rollout deliberately does not enable legacy listing-based
+  // cleanup. A future ledger-aware cleanup needs its own reviewed rollout.
+  if (env.ACCOUNT_QUOTA) return { skipped: true, deleted: 0 };
+  if (env.CLEANUP_ENABLED !== 'true') return { skipped: true, deleted: 0 };
+  const max = limitFrom(env.CLEANUP_MAX_DELETES, DEFAULT_CLEANUP_MAX_DELETES);
+  const live = new Set((await listNames(env, 'seen:')).map((name) => name.slice('seen:'.length)));
+  let deleted = 0;
+  for (const name of await listNames(env, 'blob:')) {
+    if (deleted >= max) break;
+    if (live.has(name.split(':')[1])) continue;
+    await env.SYNC.delete(name);
+    deleted += 1;
+  }
+  console.log(JSON.stringify({ event: 'sync-cleanup', deleted, live: live.size }));
+  return { skipped: false, deleted };
+}
+
+const json = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
+
+// KV has no atomic increment, so these counters are coarse (concurrent bursts
+// can under-count). A Durable Object is the drop-in upgrade for a hard limit.
+async function bumpLimited(env, key, max) {
+  const k = `${key}:${Math.floor(Date.now() / 60000)}`;
+  const n = parseInt((await env.SYNC.get(k)) ?? '0', 10);
+  if (n >= max) return true;
+  await env.SYNC.put(k, String(n + 1), { expirationTtl: 120 });
+  return false;
+}
+
+// Per-accountId GET limit — anti-hammering of a single account. It is NOT the
+// brute-force defense: a passphrase guess derives a *fresh* accountId, so
+// guessing is throttled per-IP (below), not per-account.
+const rateLimited = (env, accountId) => bumpLimited(env, `rl:${accountId}`, RATE_LIMIT);
+const ipRateLimited = (env, ip) => (ip ? bumpLimited(env, `ip:${ip}`, IP_RATE_LIMIT) : Promise.resolve(false));
+
+async function handleGet(env, accountId, store) {
+  if (await rateLimited(env, accountId)) return json({ error: 'rate-limited' }, 429);
+  const read = await readBlob(env, accountId, store);
+  if (read.response) return read.response;
+  const rec = read.record;
+  const capable=response=>{response.headers.set('X-Blanc-Space-Delete','1');return response;};
+  if (!rec) return capable(new Response('not found', { status: 404 }));
+  await touchAccount(env, accountId, await readMarker(env, accountId));
+  return capable(json({ version: rec.version, blob: rec.blob }));
+}
+
+// With the account object bound, every store is read there: a KV read can be
+// cached at this location for up to a minute, so a fixed store read from KV
+// could be older than the write another device just made (design 2026-11-02).
+async function readBlob(env, accountId, store) {
+  if (!dynamicStore(store) && !env.ACCOUNT_QUOTA) return { record: await env.SYNC.get(blobKey(accountId, store), { type: 'json' }) };
+  if (!env.ACCOUNT_QUOTA) return { response: unavailable('quota unavailable') };
+  try {
+    const object = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(accountId));
+    const read = async (extra) => {
+      const result = await object.fetch('https://quota.invalid/read', { method: 'POST', body: JSON.stringify({ accountId, store, ...extra }) });
+      return result.ok ? result.json() : { response: unavailable('quota unavailable') };
+    };
+    const first = await read();
+    // The object never reads KV (quota decisions stay free of it), so a fixed
+    // store it has no copy of yet is read here once and handed to it.
+    if (!first.missing) return first;
+    return await read({ kv: await env.SYNC.get(blobKey(accountId, store)) });
+  } catch { return { response: unavailable('quota unavailable') }; }
+}
+
+// Optimistic concurrency: reject if the caller's ifVersion isn't current.
+// Every store compares and commits inside the serialized account object; only
+// a Worker without one falls back to the KV read-then-write, which is not a
+// transaction and can lose racing writes.
+async function handlePut(env, accountId, store, body) {
+  if (dynamicStore(store) && !env.ACCOUNT_QUOTA) return unavailable('quota unavailable');
+  if (!body || typeof body.blob !== 'object' || body.blob === null) return json({ error: 'bad blob' }, 400);
+  if (new TextEncoder().encode(JSON.stringify(body.blob)).byteLength > MAX_BLOB_BYTES) return json({ error: 'too large' }, 413);
+  const marker = await readMarker(env, accountId);
+  if (!marker) {
+    const busy = await newAccountRefusal(env);
+    if (busy) return busy;
+  }
+  if (!dynamicStore(store) && !env.ACCOUNT_QUOTA) {
+    const read = await readBlob(env, accountId, store);
+    if (read.response) return read.response;
+    const cur = read.record;
+    if ((body.ifVersion ?? null) !== (cur?.version ?? null)) return json({ version: cur?.version ?? null, error: 'conflict' }, 409);
+  }
+  // The object compares a fixed store against its copy; the KV value read
+  // here is only adopted when it has none yet (an account last written
+  // before the object kept copies).
+  const kv = !dynamicStore(store) && env.ACCOUNT_QUOTA ? await env.SYNC.get(blobKey(accountId, store)) : undefined;
+  const version = crypto.randomUUID();
+  const stored = JSON.stringify({ version, blob: body.blob });
+  if (env.ACCOUNT_QUOTA) {
+    const quota = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(accountId));
+    const response = await quota.fetch('https://quota.invalid/write', { method: 'POST', body: JSON.stringify({ accountId, store, stored, version, ifVersion: body.ifVersion ?? null, kv }) });
+    if (response.status === 507) return json({ error: 'account-quota' }, 507);
+    if (response.status === 409 || response.status === 503) return response;
+    if (!response.ok) return json({ error: 'quota unavailable' }, 503);
+  } else await env.SYNC.put(blobKey(accountId, store), stored);
+  if (!marker) await countNewAccount(env);
+  await touchAccount(env, accountId, marker);
+  return json({ version });
+}
+
+async function handleDelete(env, accountId) {
+  if(env.ACCOUNT_QUOTA)return env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(accountId)).fetch('https://quota.invalid/delete-account',{method:'POST',body:JSON.stringify({accountId})});
+  return unavailable('quota unavailable');
+}
+
+async function handleStoreDelete(env, accountId, store) {
+  if (env.ACCOUNT_QUOTA) {
+    const response = await env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(accountId)).fetch('https://quota.invalid/delete-store', { method: 'POST', body: JSON.stringify({ accountId, store }) });
+    if (response.status === 409 || response.status === 503) return response;
+    if (!response.ok) return json({ error: 'quota unavailable' }, 503);
+  } else return unavailable('quota unavailable');
+  return new Response(null, { status: 204 });
+}
+
+const DEFAULT_ACCOUNT_QUOTA_BYTES = 20 * 1024 * 1024;
+const DEFAULT_ACCOUNT_QUOTA_STORES = 256;
+const QUOTA_KEY_OVERHEAD_BYTES = 256;
+const STORED_WRAPPER_BYTES = 58;
+const MAX_STORED_BYTES = MAX_BLOB_BYTES + STORED_WRAPPER_BYTES;
+const OLD_CHARACTER_STORES = new Set(['bookmarks', 'settings', 'session', 'icons']);
+const FIXED_RESERVATION_BYTES = [...STORES].reduce((sum, store) =>
+  sum + (OLD_CHARACTER_STORES.has(store) ? 3 : 1) * MAX_BLOB_BYTES + STORED_WRAPPER_BYTES + QUOTA_KEY_OVERHEAD_BYTES, 0);
+const dynamicStore = store => /^space-[0-9a-f]{32}$/.test(store);
+// How long a fixed-store copy adopted from KV keeps being checked against KV:
+// longer than a KV read can stay cached at a location (about 60 s).
+const PROVISIONAL_MS = 120000;
+const unavailable = error => json({ error }, 503);
+
+// Eight permanent reservations cover the verified fixed-only legacy universe,
+// including the older UTF-16 size cap. No KV read/list decides quota usage.
+// New Space ciphertext and its charge are one SQLite transaction. A late
+// request must reserve again; no external KV PUT can outlive its Space charge.
+export class AccountQuota {
+  static get fixedReservationBytes() { return FIXED_RESERVATION_BYTES; }
+  constructor(state, env) { this.state = state; this.env = env; this.initializing = null; this.tail = Promise.resolve(); }
+  async bootstrap(accountId) {
+    let ledger = await this.state.storage.get('ledger');
+    if (ledger !== undefined && ledger !== null) {
+      if (ledger.schema !== 2 || ledger.accountId !== accountId || typeof ledger.erasing !== 'boolean' ||
+          !ledger.stores || typeof ledger.stores !== 'object' || Array.isArray(ledger.stores) ||
+          Object.entries(ledger.stores).some(([store, row]) => !dynamicStore(store) || !row ||
+            !Number.isSafeInteger(row.bytes) || row.bytes < 0 || row.bytes > MAX_STORED_BYTES ||
+            row.intent !== undefined)) throw new Error('incompatible quota ledger');
+      return ledger;
+    }
+    ledger = { schema: 2, accountId, stores: {}, erasing: false };
+    await this.save(ledger);
+    return ledger;
+  }
+  async save(ledger) {
+    await this.state.storage.put('ledger', ledger);
+    this.initializing = Promise.resolve(ledger);
+  }
+  // The object's copy of a fixed store, which reads and conflict checks use
+  // instead of KV: the value under `fixed:<store>` and, apart, a small
+  // `fixedv:<store>` with its version, so a versions check reads no values.
+  //
+  // With no copy yet (written before this deploy, or before an epoch change),
+  // `kv` is the value the Worker read from KV. That read may be cached at its
+  // location for up to a minute, so an adopted copy stays provisional: each
+  // request asks for a fresh KV value again (undefined without one) until
+  // PROVISIONAL_MS after the first adoption, and a write through the object
+  // settles it at once. Copies carry FIXED_COPY_EPOCH: after a rollback to a
+  // Worker that wrote KV alone, rolling forward with a new epoch drops them.
+  epoch() { return String(this.env.FIXED_COPY_EPOCH ?? '1'); }
+  async fixedMeta(store, kv) {
+    const meta = await this.state.storage.get('fixedv:' + store), current = meta?.epoch === this.epoch() ? meta : null;
+    if (current && !current.provisional) return current;
+    if (kv === undefined) return undefined;
+    const adoptedAt = current?.adoptedAt ?? Date.now();
+    const next = { epoch: this.epoch(), version: kv ? JSON.parse(kv).version : null, provisional: Date.now() - adoptedAt < PROVISIONAL_MS, adoptedAt };
+    await this.putFixed(store, next, kv ?? null);
+    return next;
+  }
+  async fixedRecord(store, kv) {
+    const meta = await this.fixedMeta(store, kv);
+    if (meta === undefined) return undefined;
+    const stored = await this.state.storage.get('fixed:' + store);
+    return stored ? JSON.parse(stored) : null;
+  }
+  async putFixed(store, meta, stored) {
+    await this.state.storage.transaction(async tx => { await tx.put('fixed:' + store, stored); await tx.put('fixedv:' + store, meta); });
+  }
+  async commitBlob(ledger, store, stored) {
+    await this.state.storage.transaction(async tx => {
+      if (stored === null) await tx.delete('blob:' + store);
+      else await tx.put('blob:' + store, stored);
+      await tx.put('ledger', ledger);
+    });
+    this.initializing = Promise.resolve(ledger);
+  }
+  fetch(request) {
+    const result = this.tail.then(() => this.handle(request)).catch(async () => {
+      // Reload durable state after a failed persistence operation. Never
+      // publish a partially mutated in-memory ledger as the next request's base.
+      this.initializing = null;
+      try { if ((await this.state.storage.get('ledger'))?.erasing) return unavailable('quota erasure pending'); } catch {}
+      return unavailable('quota unavailable');
+    });
+    this.tail = result.then(() => {}, () => {});
+    return result;
+  }
+  async handle(request) {
+    if (request.method !== 'POST') return new Response('method not allowed', { status: 405 });
+    const path = new URL(request.url).pathname;
+    if (!['/read', '/write', '/delete-store', '/delete-account', '/versions'].includes(path)) return new Response('method not allowed', { status: 405 });
+    let body;
+    try { body = await request.json(); } catch { return json({ error: 'bad quota request' }, 400); }
+    if (!body || !/^[0-9a-f]{64}$/.test(body.accountId)) return json({ error: 'bad quota request' }, 400);
+    const byteLimit = limitFrom(this.env.ACCOUNT_STORAGE_QUOTA_BYTES, DEFAULT_ACCOUNT_QUOTA_BYTES);
+    const storeLimit = limitFrom(this.env.ACCOUNT_STORAGE_MAX_STORES, DEFAULT_ACCOUNT_QUOTA_STORES);
+    if (byteLimit < FIXED_RESERVATION_BYTES || storeLimit < STORES.size) return unavailable('invalid quota configuration');
+    // An unauthenticated miss must not create persistent account storage or
+    // bypass the PUT-only daily admission limit by allocating empty ledgers.
+    // A fixed store of an account the object hasn't met is answered from the
+    // KV value the Worker passes, as before the object existed, again without
+    // creating storage.
+    // Like a read, the versions check never creates a ledger.
+    if (path === '/versions' && !this.initializing && await this.state.storage.get('ledger') == null) return json({ stores: null });
+    if (path === '/read' && !this.initializing && await this.state.storage.get('ledger') == null) {
+      if (!STORES.has(body.store)) return json({ record: null });
+      return json(body.kv === undefined ? { missing: true } : { record: body.kv ? JSON.parse(body.kv) : null });
+    }
+    this.initializing ??= this.bootstrap(body.accountId);
+    const ledger = await this.initializing;
+    if (ledger.accountId !== body.accountId) return json({ error: 'wrong account' }, 400);
+    // Each fixed store's version; stores with no copy yet come back as
+    // `missing`, and the Worker asks again with their KV values (`kv`).
+    if (path === '/versions') {
+      const stores = {}, missing = [];
+      for (const store of STORES) {
+        const meta = await this.fixedMeta(store, body.kv?.[store]);
+        if (meta === undefined) missing.push(store); else stores[store] = meta.version;
+      }
+      return json(missing.length ? { missing } : { stores });
+    }
+    if (path === '/read') {
+      if (STORES.has(body.store)) {
+        const record = await this.fixedRecord(body.store, body.kv);
+        return json(record === undefined ? { missing: true } : { record });
+      }
+      if (!dynamicStore(body.store)) return json({ error: 'bad quota request' }, 400);
+      const stored = await this.state.storage.get('blob:' + body.store);
+      if (Boolean(stored) !== Boolean(ledger.stores[body.store])) throw new Error('inconsistent Space storage');
+      return json({ record: stored ? JSON.parse(stored) : null });
+    }
+    if (path === '/delete-account') {
+      const next = structuredClone(ledger); next.erasing = true; await this.save(next);
+      // Keep SQLite ciphertext + ledger until all legacy KV deletes succeed.
+      // Erasing blocks writes until retry; deleteAll then atomically erases all
+      // SQLite values and quota. It cannot leave a half-committed Space write.
+      const prefix = `blob:${body.accountId}:`;
+      const keys = new Set([...STORES, ...Object.keys(next.stores)].map(store => blobKey(body.accountId, store)));
+      // Supplement known keys for defense in depth, but never let a stale or
+      // unavailable listing omit ledger-known keys or decide their charges.
+      try { for (const key of await listNames(this.env, prefix)) if (key.startsWith(prefix)) keys.add(key); }
+      catch { /* Fixed reservations + durable dynamic keys remain authoritative. */ }
+      for (const key of keys) await this.env.SYNC.delete(key);
+      await this.env.SYNC.delete(seenKey(body.accountId));
+      await this.state.storage.deleteAll(); this.initializing = null;
+      return new Response(null, { status: 204 });
+    }
+    if (ledger.erasing) return unavailable('quota erasure pending');
+    if (path === '/delete-store') {
+      if (!dynamicStore(body.store)) return new Response('method not allowed', { status: 405 });
+      const before = ledger.stores[body.store];
+      const next = structuredClone(ledger);
+      if (before) { delete next.stores[body.store]; await this.commitBlob(next, body.store, null); }
+      return json({}, 200);
+    }
+    if (typeof body.store !== 'string' || (!STORES.has(body.store) && !dynamicStore(body.store)) || typeof body.stored !== 'string') return json({ error: 'bad quota request' }, 400);
+    const bytes = new TextEncoder().encode(body.stored).byteLength;
+    if (bytes > MAX_STORED_BYTES) return json({ error: 'too large' }, 413);
+    if (STORES.has(body.store)) {
+      // Unknown (no copy, no KV value passed: a caller that compared already,
+      // as the Worker did before the object kept copies) writes without a check.
+      const current = await this.fixedMeta(body.store, body.kv);
+      if (current !== undefined && (body.ifVersion ?? null) !== current.version) return json({ error: 'conflict', version: current.version }, 409);
+      // KV first, so a rollback to a Worker without copies finds every write
+      // the client was told succeeded; if it fails, the copy keeps the old
+      // value too. Requests are serialized, so no reader sees between them.
+      await this.env.SYNC.put(blobKey(body.accountId, body.store), body.stored);
+      await this.putFixed(body.store, { epoch: this.epoch(), version: body.version ?? JSON.parse(body.stored).version, provisional: false }, body.stored);
+      return json({}, 200); // The permanent reserve never changes.
+    }
+    const current = await this.state.storage.get('blob:' + body.store);
+    if (Boolean(current) !== Boolean(ledger.stores[body.store])) throw new Error('inconsistent Space storage');
+    const currentVersion = current ? JSON.parse(current).version : null;
+    if ((body.ifVersion ?? null) !== currentVersion) return json({ error: 'conflict', version: currentVersion }, 409);
+    const before = ledger.stores[body.store];
+    const nextBytes = FIXED_RESERVATION_BYTES + Object.values(ledger.stores).reduce((sum, row) => sum + row.bytes + QUOTA_KEY_OVERHEAD_BYTES, 0)
+      + (before ? bytes - before.bytes : bytes + QUOTA_KEY_OVERHEAD_BYTES);
+    const nextSlots = STORES.size + Object.keys(ledger.stores).length + (before ? 0 : 1);
+    if ((nextBytes > byteLimit || nextSlots > storeLimit) && !(before && bytes <= before.bytes)) return json({ error: 'account-quota' }, 507);
+    const next = structuredClone(ledger); next.stores[body.store] = { bytes };
+    await this.commitBlob(next, body.store, body.stored);
+    return json({}, 200);
+  }
+}
+
+// The change check (design 2026-11-02): each fixed store's version, never a
+// Space id. It costs one GET of the account's budget.
+async function handleVersions(env, accountId) {
+  if (await rateLimited(env, accountId)) return json({ error: 'rate-limited' }, 429);
+  if (!env.ACCOUNT_QUOTA) return unavailable('quota unavailable');
+  const object = env.ACCOUNT_QUOTA.get(env.ACCOUNT_QUOTA.idFromName(accountId));
+  const ask = async (extra) => {
+    const response = await object.fetch('https://quota.invalid/versions', { method: 'POST', body: JSON.stringify({ accountId, ...extra }) });
+    return response.ok ? response.json() : null;
+  };
+  try {
+    let answer = await ask();
+    if (answer?.missing) {
+      const kv = {};
+      for (const store of answer.missing) kv[store] = await env.SYNC.get(blobKey(accountId, store));
+      answer = await ask({ kv });
+    }
+    if (!answer || answer.missing) return unavailable('quota unavailable');
+    return json({ v: 1, stores: answer.stores });
+  } catch { return unavailable('quota unavailable'); }
+}
+
+async function readBoundedJson(request, maxBytes = MAX_REQUEST_BYTES) {
+  const declared = request.headers.get('Content-Length');
+  if (declared && /^\d+$/.test(declared) && Number(declared) > maxBytes) {
+    try { await request.body?.cancel(); } catch {}
+    return { response: json({ error: 'too large' }, 413) };
+  }
+  if (!request.body) return { response: json({ error: 'bad json' }, 400) };
+  const reader = request.body.getReader();
+  let size = 0;
+  const bytes = new Uint8Array(maxBytes);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        try { await reader.cancel(); } catch {}
+        return { response: json({ error: 'too large' }, 413) };
+      }
+      bytes.set(value, size - value.byteLength);
+    }
+    return { body: JSON.parse(new TextDecoder().decode(bytes.subarray(0, size))) };
+  } catch {
+    try { await reader.cancel(); } catch {}
+    return { response: json({ error: 'bad json' }, 400) };
+  } finally { reader.releaseLock(); }
+}
+
+async function handlePairPost(env, id, body) {
+  if (!body || typeof body.blob !== 'object' || body.blob === null) return json({ error: 'bad blob' }, 400);
+  if (await env.SYNC.get(pairKey(id))) return json({ error: 'exists' }, 409);
+  await env.SYNC.put(pairKey(id), JSON.stringify({ blob: body.blob }), { expirationTtl: PAIR_TTL_SECONDS });
+  return json({}, 201);
+}
+
+async function handlePairGet(env, id, ip) {
+  if (ip && await bumpLimited(env, `pairrl:${ip}`, PAIR_GET_LIMIT)) return json({ error: 'rate-limited' }, 429);
+  const rec = await env.SYNC.get(pairKey(id), { type: 'json' });
+  if (!rec) return json({ error: 'not-found' }, 404);
+  await env.SYNC.delete(pairKey(id));
+  return json({ blob: rec.blob });
+}
+
+async function handlePairDelete(env, id) {
+  await env.SYNC.delete(pairKey(id));
+  return new Response(null, { status: 204 });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const ip = request.headers.get('CF-Connecting-IP');
+    const pair = url.pathname.match(/^\/v1\/pair\/([0-9a-f]{64})$/);
+    if (pair) {
+      if (await ipRateLimited(env, ip)) return json({ error: 'rate-limited' }, 429);
+      const [, id] = pair;
+      if (request.method === 'GET') return handlePairGet(env, id, ip);
+      if (request.method === 'DELETE') return handlePairDelete(env, id);
+      if (request.method === 'POST') {
+        const parsed = await readBoundedJson(request, PAIR_MAX_REQUEST_BYTES);
+        if (parsed.response) return parsed.response;
+        return handlePairPost(env, id, parsed.body);
+      }
+      return new Response('method not allowed', { status: 405 });
+    }
+    const versions = url.pathname.match(/^\/v1\/versions\/([0-9a-f]{64})$/);
+    if (versions) {
+      if (await ipRateLimited(env, ip)) return json({ error: 'rate-limited' }, 429);
+      if (request.method !== 'GET') return new Response('method not allowed', { status: 405 });
+      return handleVersions(env, versions[1]);
+    }
+    const m = url.pathname.match(/^\/v1\/blob\/([0-9a-f]{64})(?:\/([^/]+))?$/);
+    if (!m) return new Response('not found', { status: 404 });
+    const [, accountId, store] = m;
+
+    // Per-IP throttle across ALL methods — the actual anti-guessing defense,
+    // and it also caps unauthenticated PUT/DELETE against a known accountId.
+    if (await ipRateLimited(env, ip)) {
+      return json({ error: 'rate-limited' }, 429);
+    }
+
+    if (request.method === 'DELETE' && !store) return handleDelete(env, accountId);
+    if (store && !STORES.has(store) && !/^space-[0-9a-f]{32}$/.test(store)) return new Response('unknown store', { status: 404 });
+    if (request.method === 'DELETE') return /^space-[0-9a-f]{32}$/.test(store) ? handleStoreDelete(env, accountId, store) : new Response('method not allowed', { status: 405 });
+    // GET/PUT address one store; only DELETE is account-wide. Requiring the
+    // segment stops a storeless PUT from writing an unwipeable orphan key.
+    if ((request.method === 'GET' || request.method === 'PUT') && !store) {
+      return new Response('store required', { status: 404 });
+    }
+    if (request.method === 'GET') return handleGet(env, accountId, store);
+    if (request.method === 'PUT') {
+      const parsed = await readBoundedJson(request);
+      if (parsed.response) return parsed.response;
+      return handlePut(env, accountId, store, parsed.body);
+    }
+    return new Response('method not allowed', { status: 405 });
+  },
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(cleanupInactive(env));
+  },
+};

@@ -1,0 +1,473 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+const { releaseTabView } = require('../../src/main/tab-view-lifecycle');
+
+// tab-view.js requires Electron and cannot be required here. Lift the real
+// function sources and run them in a sandbox, so these assert the shipped
+// code rather than a copy of it (same approach as settings-fanout-reload.test.js).
+const viewSource = fs.readFileSync(path.join(__dirname, '../../src/main/tab-view.js'), 'utf8');
+const mainSource = fs.readFileSync(path.join(__dirname, '../../src/main/main.js'), 'utf8');
+
+const liveViewContentsSource = viewSource.match(/const liveViewContents = \(view\) => \{[\s\S]*?\n\};/)?.[0];
+const liveContentsSource = viewSource.match(/const liveContents = \(tab\) => liveViewContents\(tab\?\.view\);/)?.[0];
+const createTabViewSource = viewSource.match(/function createTabView\(tab\) \{[\s\S]*?\n\}/)?.[0];
+const primeSource = viewSource.match(/function primeTabLoadingBackground\(view, tab\) \{[\s\S]*?\n\}/)?.[0];
+const wireSource = viewSource.match(/function wireTabView\(tab, view, \{ owner, adopted \}\) \{[\s\S]*?\n\}/)?.[0];
+const watchCursorForSource = mainSource.match(/function watchCursorFor\(wc, offset, bind\) \{[\s\S]*?\n\}/)?.[0];
+
+test('tab-view.js still exports the functions these tests lift', () => {
+  assert.ok(liveViewContentsSource, 'liveViewContents not found in tab-view.js — update this test with it');
+  assert.ok(liveContentsSource, 'liveContents not found in tab-view.js — update this test with it');
+  assert.ok(createTabViewSource, 'createTabView not found in tab-view.js — update this test with it');
+  assert.ok(primeSource, 'primeTabLoadingBackground not found in tab-view.js — update this test with it');
+});
+
+function loadLiveContents() {
+  const sandbox = {};
+  vm.runInNewContext(`${liveViewContentsSource}\n${liveContentsSource}\nthis.__tab = liveContents; this.__view = liveViewContents;`, sandbox);
+  return { liveContents: sandbox.__tab, liveViewContents: sandbox.__view };
+}
+
+test('liveContents refuses every not-live shape', () => {
+  const { liveContents } = loadLiveContents();
+  assert.equal(liveContents(undefined), null);
+  assert.equal(liveContents(null), null);
+  assert.equal(liveContents({}), null, 'a tab with no view');
+  assert.equal(liveContents({ view: null }), null, 'a quiet tab: view nulled');
+  // THE case this helper exists for: after wc.close(), WebContentsView.webContents
+  // reads back undefined — not a destroyed object — so any `.isDestroyed()`
+  // guard that dereferences first throws instead of guarding.
+  assert.equal(liveContents({ view: {} }), null, 'post-close: webContents is undefined');
+  assert.equal(
+    liveContents({ view: { webContents: { isDestroyed: () => true } } }),
+    null,
+    'an explicitly destroyed webContents'
+  );
+});
+
+test('liveContents returns the webContents itself when it is live', () => {
+  const { liveContents } = loadLiveContents();
+  const wc = { isDestroyed: () => false, marker: 'live' };
+  assert.equal(liveContents({ view: { webContents: wc } }), wc);
+});
+
+test('liveViewContents applies the same two-step check to non-tab views', () => {
+  const { liveViewContents } = loadLiveContents();
+  const wc = { isDestroyed: () => false, marker: 'utility-sheet' };
+  assert.equal(liveViewContents(undefined), null);
+  assert.equal(liveViewContents({}), null, 'post-close: webContents is undefined');
+  assert.equal(liveViewContents({ webContents: { isDestroyed: () => true } }), null);
+  assert.equal(liveViewContents({ webContents: wc }), wc);
+});
+
+test('main.js never dereferences cached utility-sheet webContents directly', () => {
+  assert.doesNotMatch(
+    mainSource,
+    /utilitySheetView(?:\.|\?\.)webContents/,
+    'utility sheets must go through liveUtilitySheet/liveViewContents'
+  );
+});
+
+function loadCreateTabView({ dark = false } = {}) {
+  const calls = [];
+  const primed = [];
+  const sandbox = {
+    nativeTheme: { shouldUseDarkColors: dark },
+    // The sandbox's objects are another realm's; copy them out for deepEqual.
+    primeLoadingBackground: (view, theme) => primed.push({ view, theme: { ...theme } }),
+    WebContentsView: class { constructor(opts) { calls.push(opts); this.opts = opts; } },
+    TAB_WEB_PREFERENCES: { preload: '/tab-preload.js', sandbox: true },
+    getNormalBrowsingSession: (profileId) => ({ partition: `normal:${profileId}` }),
+    getPrivateBrowsingSession: (profileId) => ({ partition: `private:${profileId}` }),
+    mayBuildFreshView: require('../../src/main/document-policy').mayBuildFreshView,
+  };
+  vm.runInNewContext(`${createTabViewSource}\n${primeSource}\nthis.__fn = createTabView;`, sandbox);
+  return { createTabView: sandbox.__fn, calls, primed, prefs: sandbox.TAB_WEB_PREFERENCES };
+}
+
+test('createTabView primes each new view with the tab\'s theme before any load', () => {
+  const light = loadCreateTabView();
+  const view = light.createTabView({ private: false });
+  assert.deepEqual(light.primed.map((p) => p.view), [view]);
+  assert.deepEqual(light.primed[0].theme, { dark: false, private: false });
+  const dark = loadCreateTabView({ dark: true });
+  dark.createTabView({ private: true });
+  dark.createTabView(undefined);
+  assert.deepEqual(dark.primed.map((p) => p.theme), [
+    { dark: true, private: true },
+    { dark: true, private: false },
+  ]);
+});
+
+test('createTabView puts an ordinary tab on its profile session', () => {
+  const { createTabView, calls, prefs } = loadCreateTabView();
+  const view = createTabView({ private: false, profileId: 'profile_work' });
+  assert.ok(view, 'must return a view');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].webPreferences.preload, prefs.preload);
+  assert.deepEqual(calls[0].webPreferences.session, { partition: 'normal:profile_work' });
+});
+
+test('createTabView puts a private tab on the private session', () => {
+  const { createTabView, calls } = loadCreateTabView();
+  createTabView({ private: true });
+  assert.equal(calls[0].webPreferences.preload, '/tab-preload.js', 'base prefs still spread in');
+  assert.deepEqual(calls[0].webPreferences.session, { partition: 'private:default' });
+});
+
+test('createTabView tolerates being called before the tab record exists', () => {
+  const { createTabView, calls, prefs } = loadCreateTabView();
+  createTabView(undefined);
+  assert.equal(calls[0].webPreferences.preload, prefs.preload);
+  assert.deepEqual(calls[0].webPreferences.session, { partition: 'normal:default' });
+});
+
+test('createTabView refuses a fresh view for a page-opened tab that is not inert', () => {
+  const { createTabView, calls } = loadCreateTabView();
+  assert.equal(createTabView({ private: true, profileId: 'work', inheritsDocumentPolicy: true }), null);
+  assert.equal(calls.length, 0, 'no WebContentsView is constructed');
+  // An inert tab's view only ever shows Blanc's explanation page.
+  assert.notEqual(createTabView({ profileId: 'work', inheritsDocumentPolicy: true, inert: true }), null);
+  assert.notEqual(createTabView({ profileId: 'work', inheritsDocumentPolicy: false }), null);
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(call.webPreferences.sandbox, true, 'the Electron process sandbox remains enabled');
+    assert.equal('openerSandboxFlags' in call.webPreferences, false, 'Electron 44.9 removed the preference');
+  }
+});
+
+test('the private-session ternary lives in tab-view.js and nowhere else', () => {
+  // main.js must import getPrivateBrowsingSession rather than keep its own —
+  // test-hook.js compares tab sessions against it by identity, so a second
+  // definition would silently report every private tab as "default".
+  assert.doesNotMatch(
+    mainSource,
+    /session\.fromPartition\((?:['"]private-browsing['"]|PRIVATE_PARTITION)\)/,
+    'main.js still defines the private partition — it must remain a tab-view.js singleton'
+  );
+  assert.ok(
+    !/webPreferences: isPrivate/.test(mainSource),
+    'main.js still constructs a tab view inline — createTab must call createTabView'
+  );
+});
+
+test('wireTabView is still present in tab-view.js', () => {
+  assert.ok(wireSource, 'wireTabView not found in tab-view.js — update this test with it');
+});
+
+test('managed WebContents teardown never strips Electron-owned listeners', () => {
+  assert.doesNotMatch(
+    `${mainSource}\n${viewSource}`,
+    /\.removeAllListeners\s*\(/,
+    'use exact wire/firewall bookkeeping; blanket removal breaks Electron visibility teardown'
+  );
+  assert.match(
+    mainSource,
+    /sleepTeardownInProgress = true;[\s\S]*?unwireTabView\(wc\);[\s\S]*?wc\.close\(/,
+    'quiet-tab teardown must unwire only Blanc listeners before close'
+  );
+});
+
+test('a queued mouse move does not calculate bounds after its window closes', () => {
+  assert.ok(watchCursorForSource, 'watchCursorFor not found in main.js — update this test with it');
+  let inputListener;
+  let offsetCalls = 0;
+  let proximityCalls = 0;
+  const sandbox = {
+    hasLiveWindow: () => false,
+    toWindowPoint: () => { throw new Error('closed-window geometry must not run'); },
+    updateIslandProximity: () => { proximityCalls += 1; },
+  };
+  vm.runInNewContext(`${watchCursorForSource}\nthis.__watch = watchCursorFor;`, sandbox);
+  sandbox.__watch(
+    { on: (_event, listener) => { inputListener = listener; } },
+    () => { offsetCalls += 1; throw new Error('closed-window bounds must not run'); },
+    (listener) => listener
+  );
+
+  assert.doesNotThrow(() => inputListener(null, { type: 'mouseMove', x: 4, y: 8 }));
+  assert.equal(offsetCalls, 0);
+  assert.equal(proximityCalls, 0);
+});
+
+test('document-ready has a favicon fallback when Chromium emits no favicon event', () => {
+  assert.match(wireSource, /wc\.on\('dom-ready',[\s\S]*?updateFaviconAfterDomReady/);
+});
+
+test('a late Chromium favicon event is followed by the declared quality pass', () => {
+  const start = wireSource.indexOf("wc.on('page-favicon-updated'");
+  const end = wireSource.indexOf("wc.on('dom-ready'", start);
+  const listener = wireSource.slice(start, end);
+  assert.match(listener, /pending\.finally\([\s\S]*?refineDeclaredStaticFavicon/);
+});
+
+test('the settled static-source check owns late favicon event refinement', () => {
+  const start = wireSource.indexOf("wc.on('page-favicon-updated'");
+  const end = wireSource.indexOf("wc.on('dom-ready'", start);
+  const listener = wireSource.slice(start, end);
+  assert.match(listener, /refineDeclaredStaticFavicon\(tab, wc, \{ setTabFavicon \}\)/);
+});
+
+for (const required of [
+  'installChromeShortcuts',
+  'watchCursorFor',
+  'setWebRTCIPHandlingPolicy',
+  'setAudioMuted',
+  'applyWindowOpenPolicy',
+  'attachContextMenu',
+]) {
+  test(`wireTabView performs ${required}`, () => {
+    assert.ok(wireSource.includes(required), `${required} must live inside wireTabView`);
+  });
+}
+
+test('every listener wireTabView registers opens with the stale-webContents guard', () => {
+  const guard = 'if (tab.sleeping || tab.view?.webContents !== wc) return;';
+  const guards = wireSource.split(guard).length - 1;
+  assert.ok(guards >= 16, `expected the guard on every listener, found ${guards}`);
+});
+
+test('main.js no longer registers tab listeners inline', () => {
+  const createTab = mainSource.match(/function createTab\(url = newTabUrl\(\)[\s\S]*?\n\}/)?.[0];
+  assert.ok(createTab, 'createTab not found in main.js — update this test with it');
+  assert.ok(
+    /wireTabView\(tab, view, \{ owner, adopted \}\)/.test(createTab),
+    'createTab must delegate all webContents wiring to wireTabView'
+  );
+  assert.ok(
+    !/wc\.on\('did-navigate'/.test(createTab),
+    'createTab still registers listeners inline — they belong in wireTabView'
+  );
+});
+
+test('main.js initialises tab-view exactly once, at module scope', () => {
+  assert.equal(
+    (mainSource.match(/^initTabView\(\{/gm) || []).length,
+    1,
+    'initTabView must be called exactly once, unindented (module scope)'
+  );
+});
+
+const detachSource = mainSource.match(/function detachTabView\(tab, \{ retainManagedRoot = false \} = \{\}\) \{[\s\S]*?\n\}/)?.[0];
+
+function loadDetachTabView({ focused = true, dead = false, owned = true, current = true, windowLive = true, rooted = false, platform = 'win32' } = {}) {
+  const calls = [];
+  const wc = {
+    isDestroyed: () => dead,
+    isFocused: () => focused,
+  };
+  const tab = { id: 'tab', view: { webContents: wc } };
+  const runtime = { window: { webContents: { focus: () => calls.push('focus-chrome') }, contentView: { removeChildView: (view) => {
+    assert.equal(view, tab.view);
+    calls.push('detach');
+  } } } };
+  const { liveContents } = loadLiveContents();
+  const sandbox = {
+    liveContents,
+    presentationView: target => target?.view,
+    tabs: new Map(current ? [[tab.id, tab]] : []),
+    windowRuntimes: { runtimeForTab: () => owned ? runtime : {} },
+    rt: () => runtime,
+    hasLiveWindow: () => windowLive,
+    rootManagedExtensionView: () => rooted,
+    releaseTabView: (window, view) => releaseTabView(window, view, platform),
+    setTabViewVisible: (target, visible) => {
+      assert.equal(target, tab);
+      assert.equal(visible, false);
+      calls.push('hide');
+    },
+  };
+  assert.ok(detachSource, 'update the native detach test if its function moves');
+  vm.runInNewContext(`${detachSource}\nthis.__detach = detachTabView;`, sandbox);
+  return { detach: options => sandbox.__detach(tab, options), calls };
+}
+
+test('tab detachment releases native focus and hides the live guest before removing its parent', () => {
+  const { detach, calls } = loadDetachTabView();
+  assert.equal(detach(), true);
+  assert.deepEqual(calls, ['focus-chrome', 'hide', 'detach']);
+});
+
+test('Linux hides a switched-away guest but keeps it window-owned (tab-view-lifecycle.js)', () => {
+  const { detach, calls } = loadDetachTabView({ platform: 'linux' });
+  assert.equal(detach(), true);
+  assert.deepEqual(calls, ['focus-chrome', 'hide']);
+});
+
+test('detaching an unfocused guest preserves focus on the permission or overlay surface', () => {
+  const { detach, calls } = loadDetachTabView({ focused: false });
+  assert.equal(detach(), true);
+  assert.deepEqual(calls, ['hide', 'detach']);
+});
+
+test('native detachment refuses dead, removed, foreign-owned, or windowless guests', () => {
+  for (const options of [{ dead: true }, { current: false }, { owned: false }, { windowLive: false }]) {
+    const { detach, calls } = loadDetachTabView(options);
+    assert.equal(detach(), false);
+    assert.deepEqual(calls, []);
+  }
+});
+
+const prepareCloseSource = mainSource.match(/function prepareTabViewForClose\(tab\) \{[\s\S]*?\n\}/)?.[0];
+
+function loadPrepareClose({ attached = true, focused = false, owned = true, current = true, dead = false, closing = false, platform = 'win32' } = {}) {
+  let destroyed = dead;
+  const calls = [], handlers = new Map(), deferred = [];
+  const wc = {
+    isDestroyed: () => destroyed, isFocused: () => focused,
+    setWindowOpenHandler: handler => handlers.set('popup', handler),
+    on: (event, handler) => handlers.set(event, handler),
+    once: (event, handler) => handlers.set(event, handler),
+  };
+  const tab = { id: 'tab', view: { webContents: wc } };
+  const window = { isDestroyed: () => false, webContents: { focus: () => calls.push('focus-chrome') }, contentView: {
+    children: attached ? [tab.view] : [],
+    addChildView: view => { calls.push('attach-hidden'); window.contentView.children.push(view); },
+    removeChildView: () => calls.push('detach'),
+  } };
+  const runtime = { window, closing };
+  const sandbox = {
+    rt: () => runtime, process: { platform }, setImmediate: task => deferred.push(task), tabs: new Map(current ? [[tab.id, tab]] : []),
+    windowRuntimes: { runtimeForTab: () => owned ? runtime : {} },
+    liveContents: target => target?.view && !destroyed ? wc : null,
+    liveViewContents: view => view === tab.view && !destroyed ? wc : null,
+    hasLiveWindow: () => true, isQuitting: false,
+    detachTabView: () => { calls.push('shutdown-detach'); return true; },
+    unwireTabView: () => calls.push('unwire'), matchBrowserShortcut: () => true,
+    setTabViewVisible: (target, visible) => { assert.equal(target, tab); assert.equal(visible, false); calls.push('hide'); },
+  };
+  assert.ok(prepareCloseSource);
+  vm.runInNewContext(`${prepareCloseSource}\nthis.prepare = prepareTabViewForClose;`, sandbox);
+  return { prepare: () => sandbox.prepare(tab), calls, handlers, runtime,
+    destroy: () => { destroyed = true; handlers.get('destroyed')?.(); },
+    drain: () => { for (const task of deferred.splice(0)) task(); } };
+}
+
+test('closing a detached owned guest roots its hidden view until destruction and denies browser/popup dispatch', () => {
+  const h = loadPrepareClose({ attached: false });
+  assert.equal(h.prepare(), true);
+  assert.deepEqual(h.calls, ['unwire', 'hide', 'attach-hidden']);
+  assert.equal(h.handlers.get('popup')().action, 'deny');
+  let prevented = false;
+  h.handlers.get('before-input-event')({ preventDefault: () => { prevented = true; } }, {});
+  assert.equal(prevented, true);
+  h.destroy(); assert.equal(h.calls.at(-1), 'attach-hidden', 'destruction must return before removal');
+  h.drain(); assert.equal(h.calls.at(-1), 'detach');
+});
+
+test('retired view cleanup refuses a replaced window and never steals an unfocused surface', () => {
+  const h = loadPrepareClose(); h.prepare();
+  h.runtime.window = {};
+  h.destroy(); h.drain();
+  assert.deepEqual(h.calls, ['unwire', 'hide']);
+});
+
+test('native close preparation rejects stale ownership and leaves closing-window teardown in charge', () => {
+  for (const options of [{ owned: false }, { current: false }]) {
+    const h = loadPrepareClose(options);
+    assert.equal(h.prepare(), false); assert.deepEqual(h.calls, []);
+  }
+  const h = loadPrepareClose({ closing: true }); h.prepare();
+  assert.deepEqual(h.calls, ['shutdown-detach']);
+});
+
+test('externally destroyed guest cleanup waits for its native destructor and macOS retains its established path', () => {
+  const dead = loadPrepareClose({ dead: true });
+  assert.equal(dead.prepare(), true); assert.deepEqual(dead.calls, []);
+  dead.drain(); assert.deepEqual(dead.calls, ['detach']);
+  const mac = loadPrepareClose({ platform: 'darwin' });
+  mac.prepare(); assert.deepEqual(mac.calls, ['shutdown-detach']);
+});
+
+
+test('switching away keeps a managed Aura tool rooted, while an explicit detach still removes it', () => {
+  const h = loadDetachTabView({ rooted: true });
+  assert.equal(h.detach({ retainManagedRoot: true }), true);
+  assert.deepEqual(h.calls, ['focus-chrome', 'hide']);
+  h.calls.length = 0;
+  assert.equal(h.detach(), true);
+  assert.deepEqual(h.calls, ['focus-chrome', 'hide', 'detach']);
+});
+
+const rootManagedSource = mainSource.match(/function rootManagedExtensionView\(tab\) \{[\s\S]*?\n\}/)?.[0];
+function loadManagedRoot({ platform = 'linux', managed = true, privateTab = false, owned = true, current = true, active = false, closing = false } = {}) {
+  const calls = [], deferred = [], handlers = [];
+  let dead = false;
+  const wc = { isDestroyed: () => dead, once: (event, fn) => { assert.equal(event, 'destroyed'); handlers.push(fn); } };
+  const tab = { id: 'tool', managedExtension: managed, private: privateTab, view: { webContents: wc } };
+  const newWindow = label => {
+    const result = { isDestroyed: () => false, contentView: { children: [] } };
+    result.contentView.addChildView = view => { calls.push(`attach-${label}`); result.contentView.children.push(view); };
+    result.contentView.removeChildView = view => { calls.push(`remove-${label}`); result.contentView.children.splice(result.contentView.children.indexOf(view), 1); };
+    return result;
+  };
+  let window = newWindow('first');
+  const runtime = { window, activeTabId: active ? tab.id : null, closing };
+  const { liveContents, liveViewContents } = loadLiveContents();
+  const sandbox = {
+    process: { platform }, isQuitting: false, managedExtensionRoots: new WeakMap(),
+    rt: () => runtime, hasLiveWindow: () => true, liveContents, liveViewContents,
+    tabs: new Map(current ? [[tab.id, tab]] : []), windowRuntimes: { runtimeForTab: () => owned ? runtime : {} },
+    setTabViewVisible: (target, visible) => { assert.equal(target, tab); assert.equal(visible, false); calls.push('hide'); },
+    setImmediate: fn => deferred.push(fn),
+  };
+  assert.ok(rootManagedSource);
+  vm.runInNewContext(`${rootManagedSource}\nthis.root = rootManagedExtensionView;`, sandbox);
+  return { root: () => sandbox.root(tab), calls, handlers, tab,
+    move: () => { window.contentView.children.length = 0; window = newWindow('second'); runtime.window = window; },
+    destroy: () => { dead = true; handlers.forEach(fn => fn()); },
+    drain: () => deferred.splice(0).forEach(fn => fn()),
+    replaceWindow: () => { runtime.window = newWindow('replacement'); },
+  };
+}
+
+test('managed Aura tool stays hidden and rooted through error URLs and removes its native view after destruction', () => {
+  const h = loadManagedRoot();
+  assert.equal(h.root(), true);
+  h.tab.url = 'blanc://error';
+  assert.equal(h.root(), true);
+  assert.deepEqual(h.calls, ['hide', 'attach-first', 'hide']);
+  assert.equal(h.handlers.length, 1, 'repeated switches must not accumulate destruction listeners');
+  h.destroy();
+  assert.equal(h.calls.at(-1), 'hide', 'native destruction must finish before removing the root');
+  h.replaceWindow(); h.drain();
+  assert.equal(h.calls.at(-1), 'remove-first', 'clean the actual root, never the replacement window');
+});
+
+test('managed tool root follows a moved view and never hides the active tab', () => {
+  const h = loadManagedRoot({ active: true });
+  h.root(); h.move(); h.root(); h.destroy(); h.drain();
+  assert.deepEqual(h.calls, ['attach-first', 'attach-second', 'remove-second']);
+  assert.equal(h.handlers.length, 1);
+});
+
+test('native tool rooting excludes websites, private tabs, macOS and stale ownership', () => {
+  for (const options of [{ managed: false }, { privateTab: true }, { platform: 'darwin' }, { owned: false }, { current: false }, { closing: true }]) {
+    const h = loadManagedRoot(options);
+    assert.equal(h.root(), false);
+    assert.deepEqual(h.calls, []);
+    assert.equal(h.handlers.length, 0);
+  }
+});
+
+test('certificate-error allows only through the exception store and never by default', () => {
+  const source = require('node:fs').readFileSync(require.resolve('../../src/main/tab-view.js'), 'utf8');
+  const handler = source.slice(source.indexOf("wc.on('certificate-error'"), source.indexOf("wc.once('destroyed'"));
+  assert.match(handler, /certificateExceptions\.matches\(wc\.session/);
+  assert.match(handler, /event\.preventDefault\(\);\s*setImmediate\(\(\) => callback\(true\)\);/);
+  assert.equal((handler.match(/callback\(true\)/g) ?? []).length, 1);
+});
+
+// Electron 45 emits certificate-error on the WebContents and then on app, both
+// reading a URL the request owns. Answering during the first emit frees it, and
+// the second emit crashes the browser (#1424).
+test('certificate-error never answers while Electron is still emitting the event', () => {
+  const source = require('node:fs').readFileSync(require.resolve('../../src/main/tab-view.js'), 'utf8');
+  const handler = source.slice(source.indexOf("wc.on('certificate-error'"), source.indexOf("wc.once('destroyed'"));
+  assert.equal(handler.replace(/setImmediate\(\(\) => callback\(true\)\);/, '').includes('callback('), false);
+});

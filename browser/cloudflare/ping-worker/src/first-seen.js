@@ -1,0 +1,127 @@
+// New-install counting: an install is "new" on the day its HASHED id is first
+// ever seen. first:<id> never expires — it IS the memory that the install
+// exists (value = first-seen bucket, informational only; backfill writes
+// coarse month values). new:day:* counters never expire — growth history,
+// same convention as active:*. Counter-before-marker ordering matches
+// markActive in index.js: a crash between the two risks a one-off overcount,
+// never a permanently lost count.
+export async function markFirstSeen(kv, hashedId, day, bumpFn) {
+  const firstKey = `first:${hashedId}`;
+  if ((await kv.get(firstKey)) !== null) return false;
+  await bumpFn(kv, `new:day:${day}`);
+  await kv.put(firstKey, day);
+  return true;
+}
+
+// First-day signals (docs/superpowers/specs/2026-10-09-first-day-retention-
+// signals-design.md). Three groups share one marker scheme:
+//   - eligible: written by the Worker itself when an install is first seen on
+//     an app version that can send the signals. It is the comparison group,
+//     so installs on older or community builds never count as "didn't".
+//   - default / browsed: sent by the app on the install day (Blanc is the
+//     default browser; three web pages opened).
+// Each group keeps a per-install marker d1sig:<group>:<D>:<hash> that only
+// has to outlive D+1 for the next-day join in markNextDayReturn, so it
+// expires after two days, plus a d1had:<group>:<D> counter that never
+// expires (growth history). Key families deliberately avoid the return:d1:
+// prefix, which /stats reads whole as day -> count.
+export const DAY_ONE_SIGNALS = Object.freeze(['default', 'browsed']);
+export const DAY_ONE_GROUPS = Object.freeze(['eligible', ...DAY_ONE_SIGNALS]);
+export const DAY_ONE_MARKER_TTL = 2 * 24 * 3600;
+
+async function markDayOneGroup(kv, hashedId, group, day, bumpFn) {
+  const markerKey = `d1sig:${group}:${day}:${hashedId}`;
+  if ((await kv.get(markerKey)) !== null) return false;
+  await bumpFn(kv, `d1had:${group}:${day}`);
+  await kv.put(markerKey, '1', { expirationTtl: DAY_ONE_MARKER_TTL });
+  return true;
+}
+
+// Called by the launch handler only when markFirstSeen just counted a new
+// install, so no first-seen check is needed here.
+export function markDayOneEligible(kv, hashedId, day, bumpFn) {
+  return markDayOneGroup(kv, hashedId, 'eligible', day, bumpFn);
+}
+
+// A signal counts only for an eligible install on its install day, so a
+// late, replayed or out-of-group event stores nothing and the "had" count
+// can never exceed the eligible count. The eligible marker is written by the
+// install's launch ping; KV can serve a cached "not found" for about 60 s at
+// the edge that read it, so a signal sent right after that ping could be
+// dropped. The desktop client therefore waits 2 minutes after its launch
+// report before sending either signal (src/main/day-one-signals.js).
+export async function markDayOneSignal(kv, hashedId, signal, day, bumpFn) {
+  if (!DAY_ONE_SIGNALS.includes(signal)) return false;
+  if ((await kv.get(`d1sig:eligible:${day}:${hashedId}`)) === null) return false;
+  return markDayOneGroup(kv, hashedId, signal, day, bumpFn);
+}
+
+// Next-day return: of the installs first seen on day D, how many launch again
+// on day D+1 (UTC). Counted on the install's first ping of D+1 — first:<id>
+// already records D, so only returners pay the extra marker write. The
+// return:d1:<D> counter never expires (growth history); the ret1: marker only
+// needs to outlive day D+1 for dedup, so it expires after two days. A
+// backfilled first: value is a coarse month and can never equal a day, so
+// pre-tracking installs are never counted.
+export const NEXT_DAY_RETURN_MARKER_TTL = 2 * 24 * 3600;
+
+export async function markNextDayReturn(kv, hashedId, day, prevDay, bumpFn) {
+  if ((await kv.get(`first:${hashedId}`)) !== prevDay) return false;
+  const markerKey = `ret1:${prevDay}:${hashedId}`;
+  if ((await kv.get(markerKey)) !== null) return false;
+  await bumpFn(kv, `return:d1:${prevDay}`);
+  await kv.put(markerKey, '1', { expirationTtl: NEXT_DAY_RETURN_MARKER_TTL });
+  // Split the return by first-day group: three reads, paid only by returners.
+  await Promise.all(DAY_ONE_GROUPS.map(async (group) => {
+    if ((await kv.get(`d1sig:${group}:${prevDay}:${hashedId}`)) !== null) {
+      await bumpFn(kv, `d1ret:${group}:${prevDay}`);
+    }
+  }));
+  return true;
+}
+
+// Week-two return: of the installs first seen on day D, how many launch again
+// on any day from D+7 through D+13 (UTC), the week where a habit either forms
+// or doesn't. Counted once per install on its first launch in that window.
+// first:<id> already records D for every install since new-install counting
+// began, so cohorts before the deploy count as soon as their window is wholly
+// after it. The return:w2:<D> counter never expires (growth history); the
+// ret7: marker only needs to outlive the seven-day window, so it expires
+// after eight days. A backfilled month value never parses as a day.
+export const WEEK_TWO_RETURN_MARKER_TTL = 8 * 24 * 3600;
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+export function daysSince(firstDay, day) {
+  if (!DAY_RE.test(firstDay ?? '') || !DAY_RE.test(day ?? '')) return NaN;
+  return Math.round((Date.parse(`${day}T00:00:00Z`) - Date.parse(`${firstDay}T00:00:00Z`)) / 86400000);
+}
+
+export async function markWeekTwoReturn(kv, hashedId, day, bumpFn) {
+  const firstDay = await kv.get(`first:${hashedId}`);
+  const age = daysSince(firstDay, day);
+  if (!(age >= 7 && age <= 13)) return false;
+  const markerKey = `ret7:${firstDay}:${hashedId}`;
+  if ((await kv.get(markerKey)) !== null) return false;
+  await bumpFn(kv, `return:w2:${firstDay}`);
+  await kv.put(markerKey, '1', { expirationTtl: WEEK_TWO_RETURN_MARKER_TTL });
+  return true;
+}
+
+// Thirty-day return, for Blanc for iPhone only (M18 design §7.2; the port
+// revisit's kill criteria): of the installs first seen on day D, how many
+// launch again on any day from D+28 through D+34 (UTC), shaped like week two.
+// Counted once per install on its first launch in that window. The
+// return:m1:<D> counter never expires; the ret30: marker expires after eight
+// days, once the window is over.
+export const MONTH_RETURN_MARKER_TTL = 8 * 24 * 3600;
+
+export async function markMonthReturn(kv, hashedId, day, bumpFn) {
+  const firstDay = await kv.get(`first:${hashedId}`);
+  const age = daysSince(firstDay, day);
+  if (!(age >= 28 && age <= 34)) return false;
+  const markerKey = `ret30:${firstDay}:${hashedId}`;
+  if ((await kv.get(markerKey)) !== null) return false;
+  await bumpFn(kv, `return:m1:${firstDay}`);
+  await kv.put(markerKey, '1', { expirationTtl: MONTH_RETURN_MARKER_TTL });
+  return true;
+}

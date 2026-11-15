@@ -1,0 +1,166 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+const source = fs.readFileSync(path.join(__dirname, '../../src/main/tab-view.js'), 'utf8');
+const policySource = source.match(/  const applyWindowOpenPolicy = \(targetWc\) => \{[\s\S]*?\n  \};/)?.[0];
+// The shared "show a tab this page opened" step (also used by the page
+// context menu's Search for… and View Page Source).
+const showOpenedTabSource = source.match(/  const showOpenedTab = \(newId, role\) => \{[\s\S]*?\n  \};/)?.[0];
+
+function harness({ isPrivate = false, openerIsReference = false } = {}) {
+  assert.ok(policySource, 'window-open policy must be exercised from the shipped source');
+  assert.ok(showOpenedTabSource, 'showOpenedTab must be exercised from the shipped source');
+  let handler;
+  const tabs = new Map();
+  const created = [];
+  const activated = [];
+  const scheduled = [];
+  const adopted = [];
+  const primed = [];
+  const childWc = { isDestroyed: () => false };
+  const owner = { resident: false, activeTabId: 'main', glanceTabId: openerIsReference ? 'opener' : null };
+  const glanced = [];
+  const tab = { id: 'opener', private: isPrivate, groupId: 'group' };
+  const sandbox = {
+    tab, tabs,
+    getOwner: () => owner,
+    boundToTab: (callback) => callback,
+    installExternalNavigationHandlers: () => {},
+    isForbiddenTopLevelUrl: require('../../src/main/top-level-url-policy').isForbiddenTopLevelUrl,
+    isUtilityUrl: require('../../src/main/utility-pages').isUtilityUrl,
+    handOffToOs: () => false,
+    openInternalPage: () => {},
+    primeTabLoadingBackground: (view, source) => primed.push({ view, source }),
+    WebContentsView: class {
+      constructor(options) {
+        if (!options.webContents) throw new TypeError('options.webContents must be a WebContents');
+        adopted.push(options.webContents);
+        this.webContents = options.webContents;
+      }
+    },
+    createTab: (url, options) => {
+      created.push({ url, options });
+      tabs.set('child', { view: options.view ?? { webContents: childWc } });
+      return 'child';
+    },
+    liveContents: (record) => record?.view?.webContents ?? null,
+    setActiveTab: (id) => activated.push(id),
+    foregroundOpenRole: require('../../src/main/glance-focus').foregroundOpenRole,
+    deps: { setGlanceTab: (id) => { glanced.push(id); return Promise.resolve(true); } },
+    setImmediate: (callback) => scheduled.push(callback),
+  };
+  vm.runInNewContext(`${showOpenedTabSource}\n${policySource}\nthis.install = applyWindowOpenPolicy;`, sandbox);
+  sandbox.install({
+    getURL: () => 'https://example.test/source',
+    setWindowOpenHandler: (callback) => { handler = callback; },
+    on: () => {},
+  });
+  return { handler, tab, childWc, created, activated, scheduled, adopted, glanced, primed };
+}
+
+for (const isPrivate of [false, true]) {
+  test(`background click with no supplied WebContents creates a ${isPrivate ? 'private' : 'regular'} tab`, () => {
+    const h = harness({ isPrivate });
+    const response = h.handler({ url: 'https://example.test/target', disposition: 'background-tab' });
+    assert.equal(response.action, 'allow');
+    let returned;
+    assert.doesNotThrow(() => { returned = response.createWindow({ webPreferences: { sandbox: true } }); });
+    assert.equal(returned, h.childWc, 'Electron receives the newly created tab contents');
+    assert.equal(h.created.length, 1);
+    assert.equal(h.created[0].url, 'https://example.test/target');
+    assert.equal(h.created[0].options.private, isPrivate);
+    assert.equal(h.created[0].options.groupId ?? null, null, 'a link child opens ungrouped, like a plain new tab');
+    assert.equal(h.created[0].options.view ?? null, null, 'normal createTab owns construction and navigation');
+    assert.equal(h.created[0].options.openerTabId ?? null, null, 'deferred contents have no adopted opener family');
+    assert.equal(h.adopted.length, 0);
+    assert.equal(h.primed.length, 0, 'createTab primes the view it builds');
+    assert.equal(h.scheduled.length, 0, 'background clicks preserve the active tab');
+    assert.equal(h.activated.length, 0);
+  });
+}
+
+test('an existing window.open child is adopted and activated without losing its opener', () => {
+  const h = harness();
+  const response = h.handler({ url: 'https://example.test/login', disposition: 'foreground-tab' });
+  const existing = { isDestroyed: () => false };
+  assert.equal(response.createWindow({ webContents: existing }), existing);
+  assert.deepEqual(h.adopted, [existing]);
+  assert.equal(h.created[0].options.view.webContents, existing);
+  assert.deepEqual(h.primed.map((p) => [p.view, p.source]), [[h.created[0].options.view, h.tab]],
+    'the adopted view loads on the opener\'s theme, not a white flash');
+  assert.equal(h.created[0].options.openerTabId, h.tab.id);
+  assert.equal(h.created[0].options.openedInBackground, false, 'a foreground child may be a sign-in hand-off');
+  assert.equal(h.created[0].options.groupId ?? null, null, 'an adopted window.open child keeps its opener but not its group');
+  assert.equal(h.scheduled.length, 1);
+  h.scheduled[0]();
+  assert.deepEqual(h.activated, ['child']);
+});
+
+test('a window.open child from a modifier click is adopted as a background child (#1140)', () => {
+  // GitHub and YouTube open Cmd/Ctrl+clicked links from script, so Electron
+  // hands over a built WebContents with window.opener connected, while the
+  // click's modifiers still make the disposition 'background-tab'.
+  const h = harness();
+  const response = h.handler({ url: 'https://example.test/issue', disposition: 'background-tab' });
+  const existing = { isDestroyed: () => false };
+  assert.equal(response.createWindow({ webContents: existing }), existing);
+  assert.equal(h.created[0].options.openerTabId, h.tab.id, 'the opener family still keeps Quiet Tabs away');
+  assert.equal(h.created[0].options.openedInBackground, true, 'but the child never holds a space switch');
+  assert.equal(h.scheduled.length, 0, 'the active tab stays');
+});
+
+test('a foreground click with deferred contents also loads and activates a normal tab', () => {
+  const h = harness();
+  const response = h.handler({ url: 'https://example.test/target', disposition: 'foreground-tab' });
+  assert.equal(response.createWindow({}), h.childWc);
+  assert.equal(h.created[0].options.view ?? null, null);
+  h.scheduled[0]();
+  assert.deepEqual(h.activated, ['child']);
+});
+
+test('a foreground click in the Glance reference opens the new tab into Glance, not as the main page', () => {
+  const h = harness({ openerIsReference: true });
+  const response = h.handler({ url: 'https://example.test/target', disposition: 'foreground-tab' });
+  response.createWindow({});
+  h.scheduled[0]();
+  assert.deepEqual(h.glanced, ['child']);
+  assert.deepEqual(h.activated, [], 'the main page must not change');
+  // A background click from the reference stays a background tab.
+  const background = harness({ openerIsReference: true });
+  background.handler({ url: 'https://example.test/target', disposition: 'background-tab' }).createWindow({});
+  assert.deepEqual(background.scheduled, []);
+  assert.deepEqual(background.glanced, []);
+});
+
+test('every page-opened child is marked and keeps the full referrer policy', () => {
+  const h = harness();
+  const referrer = { url: 'https://example.test/source', policy: 'origin' };
+  const response = h.handler({ url: 'https://example.test/target', disposition: 'background-tab', referrer });
+  response.createWindow({ webPreferences: { nodeIntegration: true } });
+  assert.equal(h.created[0].options.inheritsDocumentPolicy, true);
+  assert.equal(h.created[0].options.httpReferrer, referrer);
+  assert.equal(h.created[0].options.webPreferences, undefined, 'replacement web preferences are never accepted');
+});
+
+test('a no-referrer navigation keeps its empty URL and policy', () => {
+  const h = harness();
+  const referrer = { url: '', policy: 'no-referrer' };
+  const response = h.handler({ url: 'https://example.test/target', disposition: 'background-tab', referrer });
+  response.createWindow({});
+  assert.equal(h.created[0].options.httpReferrer, referrer);
+  assert.equal(h.created[0].options.inheritsDocumentPolicy, true);
+});
+
+test('featureful new-window requests still use Electron popup creation', () => {
+  const h = harness({ isPrivate: true });
+  const response = h.handler({ url: 'https://example.test/login', disposition: 'new-window' });
+  assert.equal(response.action, 'allow');
+  assert.equal(response.createWindow, undefined);
+  assert.equal(response.overrideBrowserWindowOptions.webPreferences.sandbox, true);
+  assert.equal(h.created.length, 0);
+});

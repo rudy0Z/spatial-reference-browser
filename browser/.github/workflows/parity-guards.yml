@@ -1,0 +1,475 @@
+name: Parity guards
+
+# Enforces the cross-platform parity substrate (see spec/shared-substrate.md):
+# the design tokens, settings schema, and copy catalog each have a single source
+# of truth (tokens/, settings-schema/, copy/) that the desktop code must not drift
+# from, and the shared acceptance scenarios (spec/acceptance/) must stay wired to
+# their desktop step definitions. These are read-only checks — no build, no publish.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # macOS legs of the desktop jobs run here, not on every pull request or push:
+  # GitHub's concurrent macOS job limit queued PRs for 30-40 minutes behind them
+  # (October 2026). A manual run can add them to any branch.
+  schedule:
+    - cron: "41 7 * * *"
+  workflow_dispatch:
+
+# A new push to a pull request cancels that PR's older run. Pushes to main,
+# schedules and manual dispatches each get their own group (run_id), so
+# none is ever cancelled or queued behind another.
+concurrency:
+  group: parity-guards-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    # Decides whether this change can affect the desktop app. Pull requests that
+    # touch only website and documentation paths skip the Electron jobs below;
+    # every other change, every push to main and any failure here runs them all.
+    # Gated jobs use `if:` (not workflow `paths`), so a required check that is
+    # skipped still reports, as "skipped", and never leaves the PR blocked.
+    # The unit suite, lint and drift guards in `substrate` always run: unit tests
+    # also guard the website's claims ledgers and read site/ and docs/ files.
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.classify.outputs.app }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2 # The PR merge commit and its base parent.
+      - id: classify
+        name: Classify changed paths
+        run: |
+          app=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && git rev-parse --verify -q HEAD^2 >/dev/null; then
+            # Old and new paths of every rename count, compared with the base.
+            git diff --name-only --no-renames HEAD^1 HEAD > "$RUNNER_TEMP/changed.txt"
+            app=false
+            [ -s "$RUNNER_TEMP/changed.txt" ] || app=true
+            while IFS= read -r f; do
+              case "$f" in
+                site/*|test/site/*|docs/*) ;;
+                # Packaged into app.asar and checked by the compliance gates.
+                THIRD-PARTY-NOTICES.md|ASSET-LICENSE.md) app=true; echo "app: $f" ;;
+                */*) app=true; echo "app: $f" ;;
+                *.md) ;;
+                *) app=true; echo "app: $f" ;;
+              esac
+            done < "$RUNNER_TEMP/changed.txt"
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          if [ "$app" = true ]; then
+            echo "Desktop app jobs run for this change." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Website and documentation only: desktop app jobs are skipped on purpose." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  substrate:
+    runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Website claim guards verify evidence against immutable public tags.
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: tokens / settings / copy / browserAPI / adblock / audit inventory match their sources
+        # Drift guards — the build.mjs checkers use only node builtins,
+        # no dependency install needed for this step.
+        run: |
+          node tokens/build.mjs --check
+          node settings-schema/build.mjs --check
+          node copy/build.mjs --check
+          node browser-api/build.mjs --check
+          node adblock/build.mjs --check
+          node scripts/audit-surface-inventory.mjs --check
+      - name: Enable Chromium user namespaces in this disposable Linux runner
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-enable-linux-sandbox.sh
+      - run: npm ci
+      - name: Sync Worker quota in the local Workers runtime
+        run: |
+          npm ci --prefix cloudflare/sync-worker
+          npm --prefix cloudflare/sync-worker run test:runtime
+      - name: Generated brand assets match their sources
+        # Needs sharp from npm ci. PNGs within one channel level of the
+        # committed file count as current (macOS/Linux rasterizer rounding).
+        run: npm run brand:check
+      - name: Dependency compliance artifacts match the lockfiles
+        run: npm run compliance:check
+      - name: Compatibility evidence and generated matrix match
+        run: npm run compatibility:check
+      - name: Dependency advisories satisfy the security policy
+        run: npm run security:dependencies
+      - name: JavaScript correctness checks
+        run: npm run lint
+      - name: Unit regression tests
+        run: npm run test:unit
+
+  acceptance-wiring:
+    # The shared Gherkin scenarios must resolve to the desktop step definitions.
+    # Dry-run only — no app is launched, so the Electron binary isn't downloaded.
+    runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Enable Chromium user namespaces in this disposable Linux runner
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-enable-linux-sandbox.sh
+      - run: npm ci
+      - name: Acceptance step definitions resolve (dry-run)
+        run: npm run test:acceptance:dry
+
+  oauth-compatibility:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    # A deterministic, two-origin OAuth fixture exercises the real Electron
+    # popup/tab policies, trusted user activation, opener callback, Chrome
+    # identity signals, and FedCM fallback. Cross-platform mapping branches run
+    # in the unit job above; live third-party canaries stay opt-in because their
+    # UI changes independently of Blanc and would make pull requests flaky.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Enable Chromium user namespaces in this disposable Linux runner
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-enable-linux-sandbox.sh
+      - run: npm ci
+      - name: Google OAuth compatibility contract
+        run: xvfb-run -a npm run test:oauth:desktop
+      - name: Favorites folder picker layering and interaction regression
+        run: xvfb-run -a npm run test:favorites-picker:desktop
+      - name: Local-clock dynamic wallpaper regression
+        run: xvfb-run -a npm run test:wallpaper:desktop
+      - name: Custom Start Page wallpaper (F49)
+        run: xvfb-run -a npm run test:custom-wallpaper:desktop
+      - name: Billboard clock Font & color (F54)
+        run: xvfb-run -a npm run test:billboard-clock:desktop
+
+  modified-link-clicks:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    # Electron can defer WebContents creation for Ctrl/Cmd-click and middle-click.
+    # Exercise the native input path on both platforms reported in #468.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Modified link clicks (Linux, headless)
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/ci-enable-linux-sandbox.sh
+          xvfb-run -a npm run test:modified-links:desktop
+      - name: Modified link clicks (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:modified-links:desktop
+      # Windows Electron refuses several URLs unless `--` comes first.
+      - name: Several command-line URLs after -- (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          bash scripts/ci-enable-linux-sandbox.sh
+          xvfb-run -a npm run test:command-line-urls
+      - name: Several command-line URLs after -- (Windows)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        run: npm run test:command-line-urls
+
+  tab-handoff:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    # Separate from deployment/signing: use the real local Workers runtime,
+    # synthetic tab metadata, and an isolated Electron profile. No credentials.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            cloudflare/tab-import-worker/package-lock.json
+            extensions/blanc-tab-import/package-lock.json
+      - name: Enable Chromium user namespaces in this disposable Linux runner
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-enable-linux-sandbox.sh
+      - run: npm ci
+      - run: npm ci --prefix cloudflare/tab-import-worker
+      - run: npm ci --prefix extensions/blanc-tab-import
+      - name: SQLite-backed one-time handoff and desktop decryption
+        run: npm run test:runtime --prefix cloudflare/tab-import-worker
+      - name: Sync v1 limits in the local Workers runtime
+        run: node test/worker/sync-runtime-smoke.mjs
+      - name: Firefox manifest and archive
+        run: |
+          npm run lint:firefox --prefix extensions/blanc-tab-import
+          npm run build:firefox --prefix extensions/blanc-tab-import
+      - name: Both import screens coexist in Electron
+        run: xvfb-run -a npm run test:tab-handoff
+      - name: Closing the last window quits Blanc and keeps its tabs (Linux)
+        run: xvfb-run -a npm run test:window-close-quit
+
+  workspace-regressions:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS only nightly and on manual runs (see `on:` above), on the
+        # self-hosted Mac when vars.MAC_RUNNER_LABELS is set. Every pull request
+        # would queue three more jobs for it. docs/ci-self-hosted-macos-runner.md
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+    runs-on: ${{ (matrix.os == 'macos-latest' && vars.MAC_RUNNER_LABELS != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON(vars.MAC_RUNNER_LABELS) || matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Workspace preservation and opener families (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/ci-enable-linux-sandbox.sh
+          xvfb-run -a npm run test:workspaces:desktop
+      - name: Workspace preservation and opener families (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: npm run test:workspaces:desktop
+      # Linux runs the same smoke in the tab-handoff job.
+      - name: Closing the last window quits Blanc and keeps its tabs (Windows)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        run: npm run test:window-close-quit
+      # macOS keeps the primary for Dock reopen, so this smoke skips there.
+      - name: A closed primary window stays closed (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: |
+          bash scripts/ci-enable-linux-sandbox.sh
+          xvfb-run -a npm run test:window-close-primary
+      - name: A closed primary window stays closed (Windows)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        run: npm run test:window-close-primary
+
+  shared-spaces:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    # Two real clients and hard restarts, obeying the real 10-GET/60-second
+    # window: 16 minutes in one job, so its scenarios are split across three.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Shared Spaces window and consent acceptance
+        run: |
+          bash scripts/ci-apt-mirror.sh
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnome-keyring dbus-x11 libsecret-1-0
+          bash scripts/ci-enable-linux-sandbox.sh
+          dbus-run-session -- bash -c '
+            set -euo pipefail
+            printf "%s\n" "blanc-ci-fixture" | gnome-keyring-daemon --unlock --components=secrets
+            BLANC_TEST_SECURE_STORAGE=1 XDG_CURRENT_DESKTOP=GNOME xvfb-run -a npx cucumber-js -c test/desktop/cucumber.mjs -p runnable --tags @F57 --shard ${{ matrix.shard }}/3
+          '
+
+  favorites-import:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    # F30 Favorites import from other browsers' profiles (F30-1 to F30-5),
+    # through the real Favorites sheet and first-run setup. Each platform
+    # keeps browser profiles in a different place, so all three run.
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS only nightly and on manual runs (see `on:` above), on the
+        # self-hosted Mac when vars.MAC_RUNNER_LABELS is set. Every pull request
+        # would queue three more jobs for it. docs/ci-self-hosted-macos-runner.md
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+    runs-on: ${{ (matrix.os == 'macos-latest' && vars.MAC_RUNNER_LABELS != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON(vars.MAC_RUNNER_LABELS) || matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Favorites import from detected browser profiles (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/ci-enable-linux-sandbox.sh
+          xvfb-run -a npm run test:favorites-import:desktop
+      - name: Favorites import from detected browser profiles (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: npm run test:favorites-import:desktop
+
+  quiet-tabs:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    # Linux and Windows: the nightly job already covers macOS, and the Linux
+    # renderer-discard path only differs there (see renderer-discard.js).
+    # The tab-view drawing smoke runs without Playwright, whose focus emulation
+    # makes a stuck page draw (see tab-view-drawing-smoke.mjs).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Quiet Tabs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/ci-enable-linux-sandbox.sh
+          xvfb-run -a npm run test:quiet-tabs:desktop
+      - name: Quiet Tabs (Windows)
+        if: runner.os != 'Linux'
+        run: npm run test:quiet-tabs:desktop
+      - name: Page zoom (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: xvfb-run -a npm run test:page-zoom:desktop
+      - name: Page zoom (Windows)
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        run: npm run test:page-zoom:desktop
+      - name: Tab views keep drawing (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: xvfb-run -a npm run test:tab-view-drawing:desktop
+      - name: Tab views keep drawing (Windows)
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        run: npm run test:tab-view-drawing:desktop
+      - name: Pinned-home crash recovery (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: xvfb-run -a npm run test:pinned-home-recovery:desktop
+      - name: Pinned-home crash recovery (Windows)
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        run: npm run test:pinned-home-recovery:desktop
+      - name: Acceptance harness healing (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: xvfb-run -a npm run test:acceptance:healing:desktop
+      - name: Acceptance harness healing (Windows)
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        run: npm run test:acceptance:healing:desktop
+
+  browser-shortcuts:
+    needs: changes
+    # Runs unless `changes` proved a website/docs-only PR (also runs if it failed).
+    if: ${{ !cancelled() && needs.changes.outputs.app != 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS only nightly and on manual runs (see `on:` above), and always
+        # GitHub-hosted: the smoke posts real key events, and hosted macOS
+        # images already grant the runner Accessibility. Granting it on the
+        # self-hosted Mac would let every job drive that machine's keyboard and
+        # mouse. docs/ci-self-hosted-macos-runner.md
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest", "windows-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Real X11 keys for most-recent Ctrl+Tab: synthetic events can't prove
+      # the Control release arrives (docs/superpowers/specs/2026-10-24-mru-tab-switcher-design.md §8).
+      - name: Install xdotool (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-apt-mirror.sh && sudo apt-get update -q && sudo apt-get install -y -q xdotool
+      - name: Browser commands and Settings (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/ci-enable-linux-sandbox.sh
+          for attempt in 1 2 3 4 5; do
+            xvfb-run -a npm run test:browser-shortcuts:desktop || exit $?
+          done
+      - name: Browser commands and Settings (Windows, five fresh processes)
+        if: runner.os == 'Windows'
+        run: |
+          foreach ($attempt in 1..5) {
+            npm run test:browser-shortcuts:desktop
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Browser commands and Settings (macOS)
+        if: runner.os == 'macOS'
+        run: npm run test:browser-shortcuts:desktop
+      - name: Real Chrome Web Store documents (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:web-store
+      - name: Real Chrome Web Store documents (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: npm run test:web-store
+      # Chromium's PDF viewer loads each document from its own chrome-extension:
+      # origin; a guard that refuses it leaves PDFs as an empty viewer.
+      - name: PDFs render with each blocker (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: xvfb-run -a npm run test:pdf-viewer:desktop
+      - name: PDFs render with each blocker (Windows/macOS)
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        run: npm run test:pdf-viewer:desktop
+      - name: Reader Mode lifecycle and pane routing (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: xvfb-run -a npm run test:reader:desktop
+      - name: Reader Mode lifecycle and pane routing (Windows/macOS)
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        run: npm run test:reader:desktop
+      - name: Retain private native command failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-command-failure-${{ runner.os }}
+          path: dist/browser-command-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3

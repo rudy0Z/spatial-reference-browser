@@ -1,0 +1,526 @@
+// Pure model for the optional E2EE tab-icon sidecar. Keeping icon bytes out
+// of the `session` store preserves that store's deployed schema: older Blanc
+// clients rebuild every device entry from known fields and would otherwise
+// strip a newly-added favicon field, causing repair-write ping-pong.
+
+const PRUNE_MS = 30 * 24 * 60 * 60 * 1000;
+const HEARTBEAT_MS = 24 * 60 * 60 * 1000;
+const BUDGET_BYTES = 256 * 1024;
+const MAX_ICONS = 500;
+const MAX_URL = 2048;
+// Publish enough source pixels for the largest 16 CSS-pixel favicon slot on a
+// 2x display. Keep accepting the original 16x16 records so mixed-version
+// devices and already-synced caches continue to render during rollout.
+const LEGACY_ICON_SIZE = 16;
+const ICON_SIZE = 32;
+const ICON_SIZES = new Set([LEGACY_ICON_SIZE, ICON_SIZE]);
+// A high-entropy 32x32 RGBA PNG can exceed the old 4 KiB data-URL ceiling.
+// The independent 256 KiB account budget below still bounds aggregate data.
+const MAX_ICON_DATA = 8192;
+const MAX_SOURCE_BYTES = 256 * 1024;
+// Some production sites use app artwork as their only desktop favicon. NFL,
+// for example, declares a compressed 2000x2000 PNG. Keep a decoded-pixel
+// ceiling (rather than trusting the much smaller compressed byte count), but
+// make it large enough for that real-world class of icon: at most 4M pixels,
+// or 16 MiB as RGBA, with an independent long-edge guard.
+const MAX_SOURCE_DIMENSION = 4096;
+const MAX_SOURCE_PIXELS = 2048 * 2048;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_DATA_PREFIX = 'data:image/png;base64,';
+const GENERIC_BINARY_MEDIA_TYPE = 'application/octet-stream';
+
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/** The size a width × height source scales to inside a size × size square,
+ * keeping its aspect ratio. A wide or tall favicon is letterboxed rather than
+ * squashed into the square the icon record requires. */
+function fitWithin(width, height, size = ICON_SIZE) {
+  const scale = size / Math.max(width, height);
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+/** Center a 4-byte-per-pixel bitmap on a transparent size × size square. */
+function centerInSquare(bitmap, width, height, size = ICON_SIZE) {
+  if (!bitmap || bitmap.length !== width * height * 4 || width > size || height > size) return null;
+  const square = Buffer.alloc(size * size * 4);
+  const left = Math.floor((size - width) / 2);
+  const top = Math.floor((size - height) / 2);
+  for (let y = 0; y < height; y += 1) {
+    bitmap.copy(square, ((top + y) * size + left) * 4, y * width * 4, (y + 1) * width * 4);
+  }
+  return square;
+}
+
+function validIconData(data) {
+  if (
+    typeof data !== 'string' ||
+    data.length > MAX_ICON_DATA ||
+    !data.toLowerCase().startsWith(PNG_DATA_PREFIX)
+  ) return null;
+  const encoded = data.slice(PNG_DATA_PREFIX.length);
+  // Buffer.from(base64) is deliberately forgiving. Require a canonical
+  // encoding here so junk following valid base64 cannot hitch a ride into
+  // privileged chrome under an image MIME type.
+  if (!encoded || encoded.length % 4 !== 0 || !/^[a-z0-9+/]+={0,2}$/i.test(encoded)) return null;
+  const bytes = Buffer.from(encoded, 'base64');
+  if (
+    bytes.toString('base64') !== encoded ||
+    bytes.length < 24 ||
+    !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE) ||
+    bytes.subarray(12, 16).toString('ascii') !== 'IHDR' ||
+    bytes.readUInt32BE(16) !== bytes.readUInt32BE(20) ||
+    !ICON_SIZES.has(bytes.readUInt32BE(16))
+  ) return null;
+  return data;
+}
+
+/** Validate the cheap, fixed-size PNG header before handing untrusted source
+ * bytes to Chromium's image decoder. Icons are cosmetic, so accepting PNG
+ * only is preferable to expanding the native decoder attack surface for ICO,
+ * SVG, animated formats, or dimension bombs. */
+function validSourcePngBytes(raw) {
+  if (!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array)) return null;
+  const bytes = Buffer.isBuffer(raw)
+    ? raw
+    : Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+  if (
+    bytes.length < 24 ||
+    bytes.length > MAX_SOURCE_BYTES ||
+    !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE) ||
+    bytes.readUInt32BE(8) !== 13 ||
+    bytes.subarray(12, 16).toString('ascii') !== 'IHDR'
+  ) return null;
+  const width = bytes.readUInt32BE(16);
+  const height = bytes.readUInt32BE(20);
+  if (
+    width < 1 ||
+    height < 1 ||
+    width > MAX_SOURCE_DIMENSION ||
+    height > MAX_SOURCE_DIMENSION ||
+    width * height > MAX_SOURCE_PIXELS
+  ) return null;
+  return bytes;
+}
+
+/** A bounded, structurally valid ICO container. Some otherwise ordinary
+ * sites (App Store Connect is the production case) serve `/favicon.ico` as
+ * `application/octet-stream`. We may sniff that narrow fallback only after
+ * proving it is actually an icon container; arbitrary generic downloads must
+ * never reach Chromium's image decoder merely because their URL ends in .ico. */
+function validSourceIcoBytes(raw) {
+  if (!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array)) return null;
+  const bytes = Buffer.isBuffer(raw)
+    ? raw
+    : Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+  if (
+    bytes.length < 22 ||
+    bytes.length > MAX_SOURCE_BYTES ||
+    bytes.readUInt16LE(0) !== 0 ||
+    bytes.readUInt16LE(2) !== 1
+  ) return null;
+  const count = bytes.readUInt16LE(4);
+  if (count < 1 || count > 256) return null;
+  const directoryEnd = 6 + count * 16;
+  if (directoryEnd > bytes.length) return null;
+  for (let index = 0; index < count; index++) {
+    const entry = 6 + index * 16;
+    const width = bytes[entry] || 256;
+    const height = bytes[entry + 1] || 256;
+    const size = bytes.readUInt32LE(entry + 8);
+    const offset = bytes.readUInt32LE(entry + 12);
+    if (
+      width > MAX_SOURCE_DIMENSION ||
+      height > MAX_SOURCE_DIMENSION ||
+      width * height > MAX_SOURCE_PIXELS ||
+      size < 8 ||
+      offset < directoryEnd ||
+      offset > bytes.length - size
+    ) return null;
+    const frame = bytes.subarray(offset, offset + size);
+    const png = frame.length >= PNG_SIGNATURE.length &&
+      frame.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE);
+    // ICO frames are either PNGs or DIBs. These are the Windows bitmap header
+    // generations accepted by Chromium's ICO decoder.
+    const dib = frame.length >= 4 &&
+      [12, 40, 52, 56, 108, 124].includes(frame.readUInt32LE(0));
+    if (!png && !dib) return null;
+  }
+  return bytes;
+}
+
+function sourcePngFromDataUrl(source) {
+  if (typeof source !== 'string') return null;
+  const comma = source.indexOf(',');
+  if (comma < 0 || source.slice(0, comma).toLowerCase() !== 'data:image/png;base64') return null;
+  const encoded = source.slice(comma + 1);
+  if (
+    !encoded ||
+    encoded.length % 4 !== 0 ||
+    encoded.length > Math.ceil(MAX_SOURCE_BYTES / 3) * 4 ||
+    !/^[a-z0-9+/]+={0,2}$/i.test(encoded)
+  ) return null;
+  const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.toString('base64') !== encoded) return null;
+  return validSourcePngBytes(bytes);
+}
+
+// Non-PNG favicons (ICO, SVG, GIF, …) can't be decoded by nativeImage, so they
+// take the renderer-canvas path (icon-raster.js) instead of the native PNG
+// guard above. The model's job for these is only to confirm an image MIME type
+// and bound the payload; Chromium's own <img> decoder does the parsing, and the
+// canvas output is re-validated as a supported square PNG before it can be
+// stored (32x32 for new captures, plus legacy 16x16 records on receive).
+const IMAGE_MEDIA_TYPE = /^image\/[a-z0-9][a-z0-9.+-]*$/;
+// A base64 image data URL can't exceed this many chars for MAX_SOURCE_BYTES of
+// bytes; percent-encoded inline SVG favicons stay well under it too.
+const MAX_SOURCE_DATA_URL = Math.ceil(MAX_SOURCE_BYTES / 3) * 4 + 64;
+
+function normalizeImageMediaType(contentType) {
+  if (typeof contentType !== 'string') return null;
+  const type = contentType.split(';', 1)[0].trim().toLowerCase();
+  return IMAGE_MEDIA_TYPE.test(type) ? type : null;
+}
+
+const isImageMediaType = (contentType) => normalizeImageMediaType(contentType) !== null;
+
+function normalizedMediaType(contentType) {
+  return typeof contentType === 'string'
+    ? contentType.split(';', 1)[0].trim().toLowerCase()
+    : '';
+}
+
+function isIcoUrl(source) {
+  try {
+    return /\.ico$/i.test(new URL(source).pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a response is worth reading under the existing byte ceiling.
+ * Generic page-designated candidates are read, but callers must still prove
+ * their completed PNG/ICO bytes through faviconResponseMediaType below. */
+function canReadFaviconResponse(contentType, _source) {
+  const type = normalizedMediaType(contentType);
+  return isImageMediaType(type) ||
+    // A page-designated favicon is already a bounded, isolated request. Read
+    // generic responses so the completed bytes can prove a PNG signature (or
+    // a valid ICO container) instead of rejecting honest icons solely because
+    // their CDN supplied a generic label.
+    type === GENERIC_BINARY_MEDIA_TYPE;
+}
+
+/** Resolve the inert media type used for decoding after a bounded read.
+ * Honest image/* labels retain their existing path. Generic responses are
+ * promoted only after a valid PNG signature, or a valid ICO container when
+ * the conventional `.ico` suffix supplies that format hint. */
+function faviconResponseMediaType(contentType, source, bytes) {
+  const type = normalizedMediaType(contentType);
+  if (isImageMediaType(type)) return type;
+  if (
+    type === GENERIC_BINARY_MEDIA_TYPE &&
+    validSourcePngBytes(bytes)
+  ) return 'image/png';
+  if (
+    type === GENERIC_BINARY_MEDIA_TYPE &&
+    isIcoUrl(source) &&
+    validSourceIcoBytes(bytes)
+  ) return 'image/x-icon';
+  return null;
+}
+
+/** The image MIME type of a `data:` URL, or null when it isn't an image. */
+function dataUrlMediaType(source) {
+  if (typeof source !== 'string') return null;
+  const comma = source.indexOf(',');
+  if (comma < 0) return null;
+  const match = /^data:([a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*)(?:;[^,]*)?$/i.exec(source.slice(0, comma));
+  return match && IMAGE_MEDIA_TYPE.test(match[1].toLowerCase()) ? match[1].toLowerCase() : null;
+}
+
+/** Wrap fetched non-PNG image bytes into a base64 data URL for the renderer. */
+function imageSourceToDataUrl(contentType, raw) {
+  const type = normalizeImageMediaType(contentType);
+  if (!type) return null;
+  if (!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array)) return null;
+  const bytes = Buffer.isBuffer(raw)
+    ? raw
+    : Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+  if (bytes.length < 1 || bytes.length > MAX_SOURCE_BYTES) return null;
+  return `data:${type};base64,${bytes.toString('base64')}`;
+}
+
+/** Accept a favicon that is itself an inert, bounded image `data:` URL. The
+ * original encoding is preserved for the renderer's <img> to decode. */
+function boundedImageDataUrl(source) {
+  if (typeof source !== 'string' || source.length > MAX_SOURCE_DATA_URL) return null;
+  return dataUrlMediaType(source) ? source : null;
+}
+
+function isPrivateIpv4(host) {
+  const parts = host.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
+  const [a, b] = parts;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+function isPrivateIpv6(host) {
+  const value = host.toLowerCase();
+  // Unique-local, link-local, loopback/unspecified, and IPv4-mapped literals
+  // are never valid icon origins.
+  if (value === '::' || value === '::1' || value.startsWith('::ffff:')) return true;
+  const first = Number.parseInt(value.split(':', 1)[0], 16);
+  return (
+    (first & 0xfe00) === 0xfc00 || // fc00::/7
+    (first & 0xffc0) === 0xfe80 || // fe80::/10
+    (first & 0xffc0) === 0xfec0 || // deprecated site-local fec0::/10
+    (first & 0xff00) === 0xff00    // multicast ff00::/8
+  );
+}
+
+/** Network favicon capture is cosmetic and must not become a new LAN probe.
+ * URL canonicalization collapses unusual IPv4 spellings before these checks.
+ * DNS rebinding is outside this lightweight guard, so the fetch also remains
+ * cookie/referrer-free and redirect-disabled as defense in depth. */
+function isPublicHttpSource(source) {
+  if (typeof source !== 'string' || source.length > MAX_URL) return false;
+  let parsed;
+  try {
+    parsed = new URL(source);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  let host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return false;
+  if (host.includes(':')) return !isPrivateIpv6(host);
+  if (/^\d+(?:\.\d+){3}$/.test(host)) return !isPrivateIpv4(host);
+  return true;
+}
+
+function sanitizeIcon(raw) {
+  if (!raw || typeof raw.url !== 'string') return null;
+  if (!/^https?:\/\//.test(raw.url) || raw.url.length > MAX_URL) return null;
+  const data = validIconData(raw.data);
+  return data ? { url: raw.url, data } : null;
+}
+
+function sanitizeIcons(rawIcons) {
+  const seen = new Set();
+  const icons = [];
+  for (const raw of Array.isArray(rawIcons) ? rawIcons : []) {
+    const icon = sanitizeIcon(raw);
+    if (!icon || seen.has(icon.url)) continue;
+    seen.add(icon.url);
+    icons.push(icon);
+    if (icons.length >= MAX_ICONS) break;
+  }
+  return icons;
+}
+
+function sanitizeEntry(raw) {
+  if (!raw || !Number.isFinite(raw.updatedAt)) return null;
+  if (raw.retracted) return { retracted: true, updatedAt: raw.updatedAt };
+  return {
+    updatedAt: raw.updatedAt,
+    icons: sanitizeIcons(raw.icons),
+  };
+}
+
+const fingerprint = ({ icons }) => canonical({ icons: sanitizeIcons(icons) });
+
+function winner(local, remote, isOwn) {
+  if (remote.updatedAt !== local.updatedAt) return remote.updatedAt > local.updatedAt ? remote : local;
+  if (isOwn) return local;
+  if (!!remote.retracted !== !!local.retracted) return remote.retracted ? remote : local;
+  return canonical(remote) < canonical(local) ? remote : local;
+}
+
+function mergeDevices(local, remote, { now, ownId }) {
+  const out = {};
+  for (const [id, raw] of Object.entries(local ?? {})) {
+    const entry = sanitizeEntry(raw);
+    if (entry) out[id] = entry;
+  }
+  for (const [id, raw] of Object.entries(remote ?? {})) {
+    const entry = sanitizeEntry(raw);
+    if (!entry) continue;
+    const current = out[id];
+    out[id] = current ? winner(current, entry, id === ownId) : entry;
+  }
+  for (const [id, entry] of Object.entries(out)) {
+    if (now - entry.updatedAt > PRUNE_MS) delete out[id];
+  }
+  return out;
+}
+
+function rebindDevices(stored, accountId) {
+  if (stored.accountId === accountId) return stored;
+  return { accountId, devices: {} };
+}
+
+function buildOwnEntry({ prev, snapshot, now }) {
+  const next = { updatedAt: now, icons: sanitizeIcons(snapshot?.icons) };
+  if (
+    prev && !prev.retracted &&
+    fingerprint(prev) === fingerprint(next) &&
+    now - prev.updatedAt < HEARTBEAT_MS
+  ) {
+    return { ...next, updatedAt: prev.updatedAt };
+  }
+  return next;
+}
+
+function retractedEntry(prev, now) {
+  if (!prev) return null;
+  if (prev.retracted) return prev;
+  return { retracted: true, updatedAt: now };
+}
+
+function ownEntryFor({ syncTabs, prev, snapshot, now }) {
+  return syncTabs && snapshot
+    ? buildOwnEntry({ prev, snapshot, now })
+    : retractedEntry(prev, now);
+}
+
+const heartbeatDue = (entry, now) =>
+  !!entry && !entry.retracted && now - entry.updatedAt >= HEARTBEAT_MS;
+
+const devicesEqual = (a, b) => canonical(a ?? {}) === canonical(b ?? {});
+
+/** Icons are cosmetic and live in their own store, so the budget can discard
+ * icon records without ever removing a tab from the primary session store.
+ * The full local map remains intact; only the upload copy is trimmed. */
+function applyBudget(devices, ownId, { maxBytes = BUDGET_BYTES } = {}) {
+  const out = structuredClone(devices ?? {});
+  const over = () => Buffer.byteLength(canonical(out), 'utf8') > maxBytes;
+  if (!over()) return out;
+
+  const trim = (entry) => {
+    while (entry?.icons?.length && over()) {
+      entry.icons.splice(-Math.max(1, Math.ceil(entry.icons.length / 4)));
+    }
+  };
+  trim(out[ownId]);
+
+  const others = Object.entries(out)
+    .filter(([id, entry]) => id !== ownId && !entry?.retracted)
+    .sort(([, a], [, b]) => a.updatedAt - b.updatedAt);
+  for (const [id, entry] of others) {
+    if (!over()) break;
+    trim(entry);
+    if (!entry.icons.length) delete out[id];
+  }
+  for (const [id, entry] of Object.entries(out)) {
+    if (!over()) break;
+    if (id !== ownId && entry?.retracted) delete out[id];
+  }
+  return out;
+}
+
+function exportDevices({ devices, deviceId, syncTabs, snapshot, now, maxBytes }) {
+  const next = { ...(devices ?? {}) };
+  const own = ownEntryFor({
+    syncTabs,
+    prev: next[deviceId] ?? null,
+    snapshot,
+    now,
+  });
+  if (own) next[deviceId] = own;
+  else delete next[deviceId];
+  const store = mergeDevices(next, {}, { now, ownId: deviceId });
+  const upload = applyBudget(store, deviceId, maxBytes ? { maxBytes } : {});
+  return { store, upload };
+}
+
+function displayDevices(devices, ownId, { now }) {
+  return Object.fromEntries(
+    Object.entries(devices ?? {})
+      .filter(([id, entry]) =>
+        id !== ownId && entry && !entry.retracted &&
+        Array.isArray(entry.icons) && entry.icons.length > 0 &&
+        now - entry.updatedAt <= PRUNE_MS)
+      .map(([id, entry]) => [id, sanitizeIcons(entry.icons)])
+  );
+}
+
+/** Add safe data URLs to the renderer projection only. The synchronized
+ * session object itself remains unchanged and never carries favicon fields. */
+function attachIcons(remoteDevices, iconDevices) {
+  return (remoteDevices ?? []).map((device) => {
+    const icons = Array.isArray(iconDevices?.[device.deviceId])
+      ? iconDevices[device.deviceId]
+      : [];
+    const byUrl = new Map(icons.map((icon) => [icon.url, validIconData(icon.data)]));
+    return {
+      ...device,
+      tabs: (Array.isArray(device.tabs) ? device.tabs : []).map((tab) => ({
+        ...tab,
+        favicon: validIconData(byUrl.get(tab.url)),
+      })),
+    };
+  });
+}
+
+module.exports = {
+  PRUNE_MS,
+  HEARTBEAT_MS,
+  BUDGET_BYTES,
+  MAX_ICONS,
+  MAX_URL,
+  MAX_ICON_DATA,
+  LEGACY_ICON_SIZE,
+  ICON_SIZE,
+  MAX_SOURCE_BYTES,
+  MAX_SOURCE_DIMENSION,
+  MAX_SOURCE_PIXELS,
+  PNG_DATA_PREFIX,
+  isPublicHttpSource,
+  canonical,
+  fitWithin,
+  centerInSquare,
+  validIconData,
+  validSourcePngBytes,
+  validSourceIcoBytes,
+  sourcePngFromDataUrl,
+  isImageMediaType,
+  canReadFaviconResponse,
+  faviconResponseMediaType,
+  dataUrlMediaType,
+  imageSourceToDataUrl,
+  boundedImageDataUrl,
+  sanitizeIcon,
+  sanitizeEntry,
+  fingerprint,
+  mergeDevices,
+  rebindDevices,
+  buildOwnEntry,
+  retractedEntry,
+  ownEntryFor,
+  heartbeatDue,
+  devicesEqual,
+  applyBudget,
+  exportDevices,
+  displayDevices,
+  attachIcons,
+};

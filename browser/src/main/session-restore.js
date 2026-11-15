@@ -1,0 +1,108 @@
+// Pure restore-time filter (design §6 of 2026-07-22-utility-sheet-design):
+// session.json holds parallel arrays (urls / groupIds / pinned / meta and an
+// optional localFiles grant column) plus
+// activeIndex, so dropping entries must be zipped or the metadata silently
+// misaligns onto the wrong tabs.
+
+const { DOCUMENT_POLICY_VERSION, restoredMarker } = require('./document-policy');
+
+/**
+ * @param {{urls?: string[], groupIds?: (string|null)[], pinned?: boolean[],
+ *          meta?: {title: string, favicon: string|null}[], localFiles?: boolean[], activeIndex?: number}} saved
+ * @param {(url: string, index: number, localFile: boolean) => boolean} shouldDrop
+ */
+// Files written before the meta column (≤1.1.1), and rollbacks that dropped
+// it, carry no saved title — and restored tabs are born quiet, so nothing
+// repaints the label until first wake. A real site's host ("blanc.day",
+// www-stripped like the panel's own url labels) keeps rows distinguishable;
+// non-web urls (blanc://newtab) stay blank and render as "New Tab". Favicons
+// are never fabricated here.
+function hostTitle(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+    return u.host.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function filterRestoredSession({ urls = [], groupIds = [], pinned = [], meta = [], localFiles, splitIds, tabIds, documentPolicy, inheritsDocumentPolicy, spatialNodes, activeIndex = 0 } = {}, shouldDrop) {
+  const hasTabIds=Array.isArray(tabIds)&&tabIds.length===urls.length;
+  const hasLocalFiles = Array.isArray(localFiles) && localFiles.length === urls.length;
+  // Split View (F53): zipped like the others, so a dropped tab takes its id along.
+  const hasSplitIds = Array.isArray(splitIds) && splitIds.length === urls.length;
+  // Spatial shell (session v3): node records zipped onto urls the same way.
+  const hasSpatialNodes = Array.isArray(spatialNodes) && spatialNodes.length === urls.length;
+  // Page-opened tabs' marks (document-policy.js), resolved per tab before the
+  // zip so a malformed value can't shift onto a neighbor. Legacy stays legacy.
+  const stamped = documentPolicy !== undefined;
+  const policyRecord = { documentPolicy, inheritsDocumentPolicy };
+  const survivors = [];
+  for (const [i, url] of urls.entries()) {
+    const localFile = hasLocalFiles && localFiles[i] === true;
+    if (shouldDrop(url, i, localFile)) continue;
+    // Quiet Tabs (spec §10.1). A missing or blank saved title falls back to
+    // the host, never to a label belonging to a different tab.
+    const saved = meta[i] ?? { title: '', favicon: null };
+    survivors.push({
+      url,
+      groupId: groupIds[i] ?? null,
+      pinned: !!pinned[i],
+      localFile,
+      splitId: hasSplitIds ? splitIds[i] ?? null : null,
+      marked: restoredMarker(policyRecord, i),
+      meta: saved.title ? saved : { ...saved, title: hostTitle(url) },
+      originalIndex: i,
+      sharedTabId:hasTabIds?tabIds[i]:null,
+      spatialNode: hasSpatialNodes ? spatialNodes[i] ?? null : null,
+    });
+  }
+  const clamped = Math.min(Math.max(0, activeIndex), Math.max(0, urls.length - 1));
+  // The survivor at the original index, else the next surviving neighbor
+  // (first after, falling back to last before), else 0.
+  let next = survivors.findIndex((s) => s.originalIndex >= clamped);
+  if (next === -1) next = survivors.length - 1;
+  if (next === -1) next = 0;
+  return {
+    urls: survivors.map((s) => s.url),
+    groupIds: survivors.map((s) => s.groupId),
+    pinned: survivors.map((s) => s.pinned),
+    meta: survivors.map((s) => s.meta),
+    ...(hasLocalFiles ? { localFiles: survivors.map((s) => s.localFile) } : {}),
+    ...(hasSplitIds ? { splitIds: survivors.map((s) => s.splitId) } : {}),
+    ...(hasSpatialNodes ? { spatialNodes: survivors.map((s) => s.spatialNode) } : {}),
+    ...(hasTabIds ? {tabIds:survivors.map(s=>s.sharedTabId)} : {}),
+    ...(stamped ? {
+      documentPolicy: DOCUMENT_POLICY_VERSION,
+      inheritsDocumentPolicy: survivors.map((s) => s.marked),
+    } : {}),
+    activeIndex: next,
+  };
+}
+
+/** The tab to activate after a restore. createTab returns null for a url it
+ * refuses (utility pages — filtered above, but the guard is structural), so
+ * the saved index can land on a hole. Walk forward, then back, exactly like
+ * the survivor rule above. Null means nothing usable was created. */
+function restoreTargetId(restoredIds, activeIndex) {
+  const ids = Array.isArray(restoredIds) ? restoredIds : [];
+  if (!ids.length) return null;
+  const start = Math.min(
+    Math.max(0, Number.isInteger(activeIndex) ? activeIndex : 0),
+    ids.length - 1
+  );
+  for (let i = start; i < ids.length; i += 1) if (ids[i]) return ids[i];
+  for (let i = start - 1; i >= 0; i -= 1) if (ids[i]) return ids[i];
+  return null;
+}
+
+/** A restored tab's Tab Archive clock (F52): the saved value when it is a
+ * real past time, else now, so an update or a clock that moved backwards never
+ * makes a tab look long idle. */
+function restoredLastViewedAt(meta, now) {
+  const saved = meta?.lastViewedAt;
+  return Number.isFinite(saved) && saved > 0 && saved <= now ? saved : now;
+}
+
+module.exports = { filterRestoredSession, restoreTargetId, restoredLastViewedAt };

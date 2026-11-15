@@ -1,0 +1,642 @@
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { MAX_SOURCE_DIMENSION } = require('../../src/main/tabicons-model');
+
+const LEGACY_PNG_DATA = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGElEQVR42mNgGAWjYBSMglEwCkbBqAABBgAE/wABeV0FzgAAAABJRU5ErkJggg==';
+const pngBytes = Buffer.from(LEGACY_PNG_DATA.split(',')[1], 'base64');
+pngBytes.writeUInt32BE(32, 16);
+pngBytes.writeUInt32BE(32, 20);
+const PNG_DATA = `data:image/png;base64,${pngBytes.toString('base64')}`;
+const PNG_BYTES = Buffer.from(PNG_DATA.split(',')[1], 'base64');
+const ICO_BYTES = (() => {
+  const dib = Buffer.alloc(40);
+  dib.writeUInt32LE(40, 0);
+  dib.writeInt32LE(16, 4);
+  dib.writeInt32LE(32, 8);
+  dib.writeUInt16LE(1, 12);
+  dib.writeUInt16LE(32, 14);
+  const bytes = Buffer.alloc(22 + dib.length);
+  bytes.writeUInt16LE(1, 2);
+  bytes.writeUInt16LE(1, 4);
+  bytes[6] = 16;
+  bytes[7] = 16;
+  bytes.writeUInt16LE(1, 10);
+  bytes.writeUInt16LE(32, 12);
+  bytes.writeUInt32LE(dib.length, 14);
+  bytes.writeUInt32LE(22, 18);
+  dib.copy(bytes, 22);
+  return bytes;
+})();
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-tabicons-'));
+const requests = [];
+let decodeCount = 0;
+let lastResizeOptions = null;
+
+const image = {
+  isEmpty: () => false,
+  getSize: () => ({ width: 32, height: 32 }),
+  resize: (options) => {
+    lastResizeOptions = options;
+    return image;
+  },
+  toPNG: () => PNG_BYTES,
+};
+let defaultSessionFetch = async () => { throw new Error('defaultSession.fetch not stubbed'); };
+const electronId = require.resolve('electron');
+require.cache[electronId] = {
+  id: electronId,
+  filename: electronId,
+  loaded: true,
+  exports: {
+    app: { getPath: () => tmp, on: () => {} },
+    session: { defaultSession: { fetch: (...args) => defaultSessionFetch(...args) } },
+    nativeImage: {
+      createFromBuffer: () => {
+        decodeCount += 1;
+        return image;
+      },
+      createFromDataURL: () => image,
+    },
+  },
+};
+
+const tabicons = require('../../src/main/tabicons');
+const ctx = {
+  accountId: 'account-a',
+  deviceId: 'device-a',
+  syncTabs: true,
+};
+
+function response(contentType, bytes = PNG_BYTES) {
+  return {
+    ok: true,
+    headers: {
+      get: (name) => name === 'content-type' ? contentType : null,
+    },
+    arrayBuffer: async () => Uint8Array.from(bytes).buffer,
+  };
+}
+
+test('capture rasterizes on the source device without cookies or a referrer', async () => {
+  const session = {
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return response('image/png');
+    },
+  };
+  const tab = {
+    url: 'https://page.example/',
+    favicon: 'https://cdn.example/icon.png',
+    private: false,
+    view: { webContents: { session } },
+  };
+  tabicons.setSnapshotProvider(() => ({ tabList: [tab] }));
+
+  assert.equal(await tabicons.captureTab(tab, ctx), true);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.credentials, 'omit');
+  assert.equal(requests[0].options.referrerPolicy, 'no-referrer');
+  assert.equal(requests[0].options.redirect, 'error');
+  assert.deepEqual(lastResizeOptions, { width: 32, height: 32, quality: 'best' });
+
+  const payload = tabicons.exportForSync(ctx);
+  assert.deepEqual(payload.devices['device-a'].icons, [{
+    url: 'https://page.example/',
+    data: PNG_DATA,
+  }]);
+});
+
+test('a sanitized live fallback enters the synced sidecar without another network fetch', async () => {
+  let fetched = false;
+  const tab = {
+    url: 'https://fallback-page.example/',
+    favicon: PNG_DATA,
+    private: false,
+    view: {
+      webContents: {
+        session: { fetch: async () => { fetched = true; throw new Error('unexpected fetch'); } },
+      },
+    },
+  };
+  tabicons.setSnapshotProvider(() => ({ tabList: [tab] }));
+
+  assert.equal(await tabicons.captureTab(tab, ctx), true);
+  assert.equal(fetched, false, 'main already supplied inert PNG pixels');
+  assert.deepEqual(
+    tabicons.exportForSync(ctx).devices['device-a'].icons.find(({ url }) => url === tab.url),
+    { url: tab.url, data: PNG_DATA }
+  );
+});
+
+test('capture rejects non-image responses before decoding or serializing them', async () => {
+  const before = decodeCount;
+  const tab = {
+    url: 'https://other.example/',
+    favicon: 'https://other.example/not-an-image',
+    private: false,
+    view: {
+      webContents: {
+        session: { fetch: async () => response('text/html; charset=utf-8') },
+      },
+    },
+  };
+
+  assert.equal(await tabicons.captureTab(tab, ctx), false);
+  assert.equal(decodeCount, before);
+  const payload = tabicons.exportForSync(ctx);
+  assert.equal(payload.devices['device-a'].icons.some((icon) => icon.url === tab.url), false);
+});
+
+test('PNG sources are format- and dimension-guarded before nativeImage decode', async () => {
+  const before = decodeCount;
+  const huge = Buffer.from(PNG_BYTES);
+  huge.writeUInt32BE(MAX_SOURCE_DIMENSION + 1, 16);
+  const cases = [
+    {
+      // An image/png label over non-PNG bytes must not smuggle another format
+      // past the guard into the decoder.
+      favicon: 'https://unsafe.example/spoofed.png',
+      fetch: async () => response('image/png', Buffer.from('<svg/>')),
+    },
+    {
+      // A PNG whose IHDR claims oversized dimensions is rejected pre-decode.
+      favicon: `data:image/png;base64,${huge.toString('base64')}`,
+      fetch: null,
+    },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const tab = {
+      url: `https://unsafe-page-${index}.example/`,
+      favicon: item.favicon,
+      private: false,
+      view: item.fetch ? { webContents: { session: { fetch: item.fetch } } } : null,
+    };
+    tabicons.setSnapshotProvider(() => ({ tabList: [tab] }));
+    assert.equal(await tabicons.captureTab(tab, ctx), false, item.favicon);
+  }
+  assert.equal(decodeCount, before);
+});
+
+test('non-PNG favicons rasterize through the renderer seam and store the result', async () => {
+  const seen = [];
+  tabicons.setRasterizer(async (dataUrl) => {
+    seen.push(dataUrl);
+    return PNG_DATA;
+  });
+  try {
+    const httpSvg = {
+      url: 'https://vector-page.example/',
+      favicon: 'https://vector-page.example/icon.svg',
+      private: false,
+      view: {
+        webContents: {
+          session: {
+            fetch: async () => response('image/svg+xml', Buffer.from('<svg viewBox="0 0 16 16"/>')),
+          },
+        },
+      },
+    };
+    const inlineSvg = {
+      url: 'https://inline-page.example/',
+      favicon: 'data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgMTYgMTYiLz4=',
+      private: false,
+      view: null,
+    };
+    tabicons.setSnapshotProvider(() => ({ tabList: [httpSvg, inlineSvg] }));
+
+    assert.equal(await tabicons.captureTab(httpSvg, ctx), true);
+    assert.equal(await tabicons.captureTab(inlineSvg, ctx), true);
+
+    assert.equal(seen.length, 2);
+    assert.ok(
+      seen[0].startsWith('data:image/svg+xml;base64,'),
+      'fetched non-PNG bytes are wrapped as an image data URL for the renderer'
+    );
+    assert.equal(seen[1], inlineSvg.favicon, 'an inline image data URL passes through unchanged');
+
+    const icons = tabicons.exportForSync(ctx).devices['device-a'].icons;
+    assert.ok(icons.some((i) => i.url === httpSvg.url && i.data === PNG_DATA));
+    assert.ok(icons.some((i) => i.url === inlineSvg.url && i.data === PNG_DATA));
+  } finally {
+    tabicons.setRasterizer(null);
+  }
+});
+
+test('a generic-MIME ICO fallback rasterizes into the synced tab sidecar', async () => {
+  const seen = [];
+  tabicons.setRasterizer(async (dataUrl) => {
+    seen.push(dataUrl);
+    return PNG_DATA;
+  });
+  try {
+    const tab = {
+      url: 'https://appstoreconnect.apple.com/',
+      favicon: 'https://appstoreconnect.apple.com/favicon.ico',
+      private: false,
+      view: {
+        webContents: {
+          session: {
+            fetch: async () => response('application/octet-stream', ICO_BYTES),
+          },
+        },
+      },
+    };
+    tabicons.setSnapshotProvider(() => ({ tabList: [tab] }));
+
+    assert.equal(await tabicons.captureTab(tab, ctx), true);
+    assert.equal(seen.length, 1);
+    assert.ok(seen[0].startsWith('data:image/x-icon;base64,'));
+    assert.deepEqual(
+      tabicons.exportForSync(ctx).devices['device-a'].icons.find(({ url }) => url === tab.url),
+      { url: tab.url, data: PNG_DATA },
+    );
+  } finally {
+    tabicons.setRasterizer(null);
+  }
+});
+
+test('a rasterizer result that is not a bounded supported-size PNG is discarded', async () => {
+  tabicons.setRasterizer(async () => 'data:image/svg+xml,<svg/>'); // not a PNG data URL
+  try {
+    const tab = {
+      url: 'https://bad-raster.example/',
+      favicon: 'https://bad-raster.example/icon.svg',
+      private: false,
+      view: {
+        webContents: {
+          session: { fetch: async () => response('image/svg+xml', Buffer.from('<svg/>')) },
+        },
+      },
+    };
+    tabicons.setSnapshotProvider(() => ({ tabList: [tab] }));
+    assert.equal(await tabicons.captureTab(tab, ctx), false);
+    assert.equal(
+      tabicons.exportForSync(ctx).devices['device-a'].icons.some((i) => i.url === tab.url),
+      false
+    );
+  } finally {
+    tabicons.setRasterizer(null);
+  }
+});
+
+test('capture never fetches obvious localhost, LAN, or link-local sources', async () => {
+  let fetched = false;
+  const session = {
+    fetch: async () => {
+      fetched = true;
+      return response('image/png');
+    },
+  };
+  for (const [index, favicon] of [
+    'http://localhost/icon.png',
+    'http://printer.local/icon.png',
+    'http://127.0.0.1/icon.png',
+    'http://169.254.169.254/icon.png',
+    'http://192.168.1.1/icon.png',
+    'http://[::1]/icon.png',
+    'http://[fd00::1]/icon.png',
+  ].entries()) {
+    const tab = {
+      url: `https://public-${index}.example/`,
+      favicon,
+      private: false,
+      view: { webContents: { session } },
+    };
+    assert.equal(await tabicons.captureTab(tab, ctx), false, favicon);
+  }
+  assert.equal(fetched, false);
+});
+
+test('live captures share a globally bounded scheduler and queue', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let active = 0;
+  let maxActive = 0;
+  let started = 0;
+  const session = {
+    fetch: async () => {
+      started += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await gate;
+      active -= 1;
+      return response('image/png');
+    },
+  };
+  const tabs = Array.from({ length: 72 }, (_, index) => ({
+    url: `https://queue-page-${index}.example/`,
+    favicon: `https://queue-icons.example/${index}.png`,
+    private: false,
+    view: { webContents: { session } },
+  }));
+  tabicons.setSnapshotProvider(() => ({ tabList: tabs }));
+
+  const captures = tabs.map((tab) => tabicons.captureTab(tab, ctx));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started, 4, 'only the global concurrency cap starts');
+  assert.equal(maxActive, 4);
+  release();
+  const results = await Promise.all(captures);
+  assert.equal(maxActive, 4);
+  assert.equal(results.filter(Boolean).length, 64, 'work beyond the hard pending cap is dropped');
+});
+
+test('cancelling a capture generation aborts active work and never starts queued requests', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const started = [];
+  const signals = [];
+  const session = {
+    fetch: async (url, options) => {
+      started.push(url);
+      signals.push(options.signal);
+      await gate;
+      return response('image/png');
+    },
+  };
+  const tabs = Array.from({ length: 8 }, (_, index) => ({
+    url: `https://cancel-page-${index}.example/`,
+    favicon: `https://cancel-icons.example/${index}.png`,
+    private: false,
+    view: { webContents: { session } },
+  }));
+  tabicons.setSnapshotProvider(() => ({ tabList: tabs }));
+  let current = true;
+
+  const captures = tabs.map((tab) =>
+    tabicons.captureTab(tab, ctx, { isCurrent: () => current })
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started.length, 4);
+
+  current = false;
+  tabicons.cancelCaptures();
+  assert.ok(signals.every((signal) => signal.aborted), 'active fetch signals are aborted');
+  release();
+
+  assert.deepEqual(await Promise.all(captures), Array(8).fill(false));
+  assert.equal(started.length, 4, 'queued work was resolved without issuing a request');
+});
+
+test('more than 64 favicon changes retain the final source instead of filling the queue with stale work', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const started = [];
+  const blockerSession = {
+    fetch: async (url) => {
+      started.push(url);
+      await gate;
+      return response('image/png');
+    },
+  };
+  const finalSession = {
+    fetch: async (url) => {
+      started.push(url);
+      return response('image/png');
+    },
+  };
+  const blockers = Array.from({ length: 4 }, (_, index) => ({
+    url: `https://latest-blocker-${index}.example/`,
+    favicon: `https://latest-blocker-icons.example/${index}.png`,
+    private: false,
+    view: { webContents: { session: blockerSession } },
+  }));
+  const changing = {
+    url: 'https://latest-changing.example/',
+    favicon: '',
+    private: false,
+    view: { webContents: { session: finalSession } },
+  };
+  tabicons.setSnapshotProvider(() => ({ tabList: [...blockers, changing] }));
+
+  const blockerCaptures = blockers.map((tab) => tabicons.captureTab(tab, ctx));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started.length, 4);
+
+  const changingCaptures = [];
+  for (let index = 0; index < 70; index += 1) {
+    changing.favicon = `https://latest-changing-icons.example/${index}.png`;
+    changingCaptures.push(tabicons.captureTab(changing, ctx));
+  }
+  const finalSource = changing.favicon;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started.length, 4, 'changing sources remain queued behind the active cap');
+
+  release();
+  await Promise.all(blockerCaptures);
+  const changingResults = await Promise.all(changingCaptures);
+
+  assert.ok(started.includes(finalSource), 'the final source was eventually fetched');
+  assert.equal(
+    started.filter((url) => url.startsWith('https://latest-changing-icons.example/')).length,
+    1,
+    'superseded queued sources never started'
+  );
+  assert.equal(changingResults.at(-1), true);
+  assert.ok(
+    tabicons.exportForSync(ctx).devices['device-a'].icons.some(({ url }) => url === changing.url),
+    'the final source produced the stored icon'
+  );
+});
+
+test('replacing an active source at the exact pending cap preserves the replacement slot', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const started = [];
+  const session = {
+    fetch: async (url) => {
+      started.push(url);
+      await gate;
+      return response('image/png');
+    },
+  };
+  const activeChanging = {
+    url: 'https://cap-replacement.example/',
+    favicon: 'https://cap-replacement-icons.example/old.png',
+    private: false,
+    view: { webContents: { session } },
+  };
+  const otherTabs = Array.from({ length: 63 }, (_, index) => ({
+    url: `https://cap-load-${index}.example/`,
+    favicon: `https://cap-load-icons.example/${index}.png`,
+    private: false,
+    view: { webContents: { session } },
+  }));
+  const tabs = [activeChanging, ...otherTabs];
+  tabicons.setSnapshotProvider(() => ({ tabList: tabs }));
+
+  const captures = tabs.map((tab) => tabicons.captureTab(tab, ctx));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started.length, 4, 'four jobs are active and sixty are queued');
+
+  activeChanging.favicon = 'https://cap-replacement-icons.example/current.png';
+  const replacement = tabicons.captureTab(activeChanging, ctx);
+  release();
+
+  await Promise.all(captures);
+  assert.equal(await replacement, true);
+  assert.ok(
+    started.includes(activeChanging.favicon),
+    'the replacement starts after its superseded active request is aborted'
+  );
+  assert.ok(
+    tabicons.exportForSync(ctx).devices['device-a'].icons.some(({ url }) => url === activeChanging.url),
+    'the replacement is retained in the synchronized icon set'
+  );
+});
+
+test('same-tab pushState churn replaces one pending consumer instead of retaining every URL', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const started = [];
+  const session = {
+    fetch: async (url) => {
+      started.push(url);
+      await gate;
+      return response('image/png');
+    },
+  };
+  const changing = {
+    id: 'pushstate-tab',
+    url: 'https://pushstate.example/0',
+    favicon: 'https://pushstate.example/icon.png',
+    private: false,
+    view: { webContents: { session } },
+  };
+  const probe = {
+    id: 'pushstate-probe',
+    url: 'https://pushstate-probe.example/',
+    favicon: 'https://pushstate-probe.example/icon.png',
+    private: false,
+    view: { webContents: { session } },
+  };
+  tabicons.setSnapshotProvider(() => ({ tabList: [changing, probe] }));
+
+  let predicateChecks = 0;
+  const captures = [];
+  for (let index = 0; index < 200; index += 1) {
+    changing.url = `https://pushstate.example/${index}`;
+    captures.push(tabicons.captureTab(changing, ctx, {
+      isCurrent: () => {
+        predicateChecks += 1;
+        return true;
+      },
+    }));
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started.length, 1, 'the shared source is fetched once');
+
+  predicateChecks = 0;
+  const probeCapture = tabicons.captureTab(probe, ctx);
+  assert.equal(
+    predicateChecks,
+    1,
+    'capacity accounting evaluates only the latest predicate for the changing tab'
+  );
+
+  release();
+  const results = await Promise.all(captures);
+  await probeCapture;
+  assert.equal(results.filter(Boolean).length, 1, 'only the final navigated URL stores the icon');
+});
+
+test('a superseded live favicon fetch cannot overwrite the newer source', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const tab = {
+    url: 'https://changing-icon.example/',
+    favicon: 'https://changing-icon.example/old.png',
+    private: false,
+    view: {
+      webContents: {
+        session: {
+          fetch: async () => {
+            await gate;
+            return response('image/png');
+          },
+        },
+      },
+    },
+  };
+  tabicons.setSnapshotProvider(() => ({ tabList: [tab] }));
+
+  const pending = tabicons.captureTab(tab, ctx);
+  await new Promise((resolve) => setImmediate(resolve));
+  tab.favicon = 'https://changing-icon.example/new.png';
+  release();
+
+  assert.equal(await pending, false);
+  const payload = tabicons.exportForSync(ctx);
+  assert.equal(
+    payload.devices['device-a'].icons.some(({ url }) => url === tab.url),
+    false
+  );
+});
+
+test('local icon cache purges closed tabs and re-captures them if they become live again', async () => {
+  const session = { fetch: async () => response('image/png') };
+  const first = {
+    url: 'https://purge-first.example/',
+    favicon: 'https://purge-icons.example/first.png',
+    private: false,
+    view: { webContents: { session } },
+  };
+  const second = {
+    url: 'https://purge-second.example/',
+    favicon: 'https://purge-icons.example/second.png',
+    private: false,
+    view: { webContents: { session } },
+  };
+  let tabs = [first];
+  tabicons.setSnapshotProvider(() => ({ tabList: tabs }));
+  assert.equal(await tabicons.captureTab(first, ctx), true);
+  tabs = [second];
+  assert.equal(await tabicons.captureTab(second, ctx), true);
+  tabs = [first, second];
+  assert.equal(
+    await tabicons.captureTab(first, ctx),
+    true,
+    'the first entry was purged rather than retained after its tab closed'
+  );
+});
+
+test('local icon working set has a hard MAX_ICONS bound', async () => {
+  const tabs = Array.from({ length: 501 }, (_, index) => ({
+    url: `https://bounded-${index}.example/`,
+    favicon: PNG_DATA,
+    private: false,
+    view: null,
+  }));
+  tabicons.setSnapshotProvider(() => ({ tabList: tabs }));
+  await Promise.all(tabs.map((tab) => tabicons.captureTab(tab, ctx)));
+
+  const icons = tabicons.exportForSync(ctx).devices['device-a'].icons;
+  assert.equal(icons.length, 500);
+  assert.equal(icons.some(({ url }) => url === tabs[0].url), false, 'oldest working entry is evicted');
+  assert.equal(icons.some(({ url }) => url === tabs.at(-1).url), true);
+});
+
+test('a quiet tab has no view, so capture falls back to the default session', async () => {
+  let fetched = null;
+  defaultSessionFetch = async (url, options) => {
+    fetched = { url, options };
+    return response('image/png');
+  };
+  const tab = {
+    id: 'quiet-1',
+    url: 'https://quiet-page.example/',
+    favicon: 'https://quiet-page.example/icon.png',
+    private: false,
+    view: null,
+  };
+  tabicons.setSnapshotProvider(() => ({ tabList: [tab] }));
+
+  assert.equal(await tabicons.captureTab(tab, ctx), true);
+  assert.equal(fetched.url, tab.favicon);
+  assert.equal(fetched.options.credentials, 'omit', 'still a cosmetic, cookie-less fetch');
+  const icons = tabicons.exportForSync(ctx).devices['device-a'].icons;
+  assert.ok(icons.some((i) => i.url === tab.url && i.data === PNG_DATA));
+});

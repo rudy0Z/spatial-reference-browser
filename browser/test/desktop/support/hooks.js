@@ -1,0 +1,597 @@
+const path = require('node:path');
+const os = require('node:os');
+const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
+const { _electron } = require('playwright');
+const { BeforeAll, AfterAll, Before, After, AfterStep, setDefaultTimeout } = require('@cucumber/cucumber');
+const fixtures = require('./fixtures-server');
+const ctx = require('./context');
+const { callTestHook } = require('./test-hook-call');
+const {
+  isTransportError, firstLine, shouldHealAfterReset, exitCodeOf, probeApp, routeUncaught, createHealingLog,
+} = require('./app-health');
+const { browserDataRoot } = require('../../../src/main/browser-data-import');
+const { createChromiumSession } = require('../../support/chromium-session-fixture');
+
+// Launching Electron + first evaluate is slow; give scenarios generous headroom.
+setDefaultTimeout(60_000);
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
+let userDataDir;
+let fixturesHandle;
+let secureFixturesHandle;
+let untrustedFixturesHandle;
+let localFixturesHandle;
+let localTrustedSpkiHash;
+let secureSpkiHash = null;
+let browserHomeDir;
+let savedClipboard = null;
+let uncaughtLogPath;
+let relaunchEnv = {};
+const peerApps = new Map();
+// Temporary profiles made by ctx.relaunch(..., { freshProfile: true }). An
+// unpackaged Blanc keeps its data beside each one in "<dir>-Dev", so both go.
+const tempProfileDirs = new Set();
+function removeUnusedTempProfiles({ all = false } = {}) {
+  for (const directory of tempProfileDirs) {
+    if (!all && directory === ctx.profileDir) continue;
+    try {
+      for (const target of [directory, `${directory}-Dev`]) {
+        fs.rmSync(target, { recursive: true, force: true, maxRetries: 5 });
+      }
+      tempProfileDirs.delete(directory);
+    } catch (error) {
+      // Best effort: a directory Windows still holds is tried again at the
+      // next relaunch and in AfterAll, and never stops the app coming back.
+      process.stderr.write(`acceptance: could not remove ${directory} yet: ${firstLine(error.message)}\n`);
+    }
+  }
+}
+
+function mainProcessExceptionsSinceLaunch(electronApp) {
+  if (!uncaughtLogPath || !fs.existsSync(uncaughtLogPath)) return '';
+  const contents = fs.readFileSync(uncaughtLogPath, 'utf8');
+  return contents.slice(electronApp.__blancUncaughtOffset ?? 0).trim();
+}
+
+/**
+ * Close an app and return the main-process exception text it logged since its
+ * launch. The text is also queued on ctx.pendingMainProcessException, which
+ * the last After hook turns into the scenario's failure: throwing here instead
+ * left callers such as ctx.relaunch holding a closed app.
+ */
+async function closeApp(electronApp) {
+  if (!electronApp) return '';
+  const text = mainProcessExceptionsSinceLaunch(electronApp);
+  if (text) ctx.pendingMainProcessException += `${text}\n`;
+  try {
+    await electronApp.close();
+  } catch (error) {
+    // A fatal main-process exception may close Playwright's target before the
+    // explicit close completes; a process that is already gone is closed.
+    if (exitCodeOf(electronApp) === null) throw error;
+  }
+  return text;
+}
+
+async function launchApp(extraEnv = {}, { recoveryChoice = null, profileDir = userDataDir } = {}) {
+  // Cursor/VS Code agent shells inherit ELECTRON_RUN_AS_NODE=1 so their own
+  // Electron host can spawn Node helpers. That makes the app binary reject
+  // Playwright's --remote-debugging-port as a "bad option" and exit before
+  // main.js runs — strip it so acceptance launches a real Electron process.
+  const { ELECTRON_RUN_AS_NODE: _ignored, ...cleanEnv } = process.env;
+  void _ignored;
+
+  const electronApp = await _electron.launch({ chromiumSandbox: true,
+    // insecure.test maps to loopback at the resolver so the F12-7 scenario can
+    // load a genuinely non-loopback-HOSTNAMED page offline: the connection
+    // model classifies by hostname, and every fixtures-server URL is
+    // 127.0.0.1 (i.e. 'local', never 'http').
+    args: [
+      REPO_ROOT,
+      `--user-data-dir=${profileDir}`,
+      // Both names map to loopback at the resolver, so scheme-classified
+      // pages load offline: the connection model reads HOSTNAMES, and every
+      // plain fixtures-server URL is 127.0.0.1 (i.e. 'local', never 'http').
+      '--host-resolver-rules=MAP insecure.test 127.0.0.1, MAP secure.test 127.0.0.1, MAP badcert.test 127.0.0.1, MAP nas.home.arpa 127.0.0.1, MAP lab.home.arpa 127.0.0.1',
+      // Trust EXACTLY the throwaway per-run fixture cert, by SPKI hash —
+      // Chromium's scoped testing flag, not a blanket ignore. Every other
+      // certificate error keeps its normal handling.
+      `--ignore-certificate-errors-spki-list=${secureSpkiHash},${localTrustedSpkiHash}`,
+    ],
+    env: {
+      ...cleanEnv,
+      BLANC_TEST: '1',
+      BLANC_TEST_BROWSER_HOME: browserHomeDir,
+      BLANC_TEST_UNCAUGHT_LOG: uncaughtLogPath,
+      ...extraEnv,
+    },
+  });
+  if (process.env.BLANC_TEST_APP_OUTPUT === '1') {
+    for (const stream of ['stdout', 'stderr']) {
+      electronApp.process()[stream]?.on('data', (chunk) => process.stderr.write(`[app ${stream}] ${chunk}`));
+    }
+  }
+  electronApp.__blancUncaughtOffset = fs.existsSync(uncaughtLogPath)
+    ? fs.statSync(uncaughtLogPath).size
+    : 0;
+
+  // Wait for whenReady to have installed the test hook and completed the
+  // blocker-gated workspace restore. Returning while persistence is still
+  // suspended lets the first scenario mutate an in-memory workspace that
+  // cannot yet reach session.json.
+  // After a crash, startup waits for the session-recovery choice (the crash
+  // ledger) when the crashed session held something to restore; make it as
+  // a person would. A session of one blank start page asks nothing. Wait for
+  // startup to have decided which: before that, startupReady() can read true
+  // (persistence isn't suspended yet) while a prompt is still coming.
+  if (recoveryChoice) {
+    const asked = await electronApp.evaluate(
+      () => new Promise((resolve) => {
+        const t = setInterval(() => {
+          const recovery = globalThis.__blancCall ? globalThis.__blanc?.sessionRecoveryState?.() : null;
+          if (recovery?.decided === true) {
+            clearInterval(t);
+            resolve(recovery.required === true);
+          }
+        }, 50);
+      })
+    );
+    if (asked) {
+      const chosen = await callTestHook(electronApp, 'chooseSessionRecovery', [recoveryChoice]);
+      if (!chosen?.ok) throw new Error(`session recovery choice failed: ${JSON.stringify(chosen)}`);
+    }
+  }
+  await electronApp.evaluate(
+    () => new Promise((resolve) => {
+      const t = setInterval(() => {
+        if (globalThis.__blancCall && globalThis.__blanc?.startupReady?.()) {
+          clearInterval(t);
+          resolve();
+        }
+      }, 50);
+    })
+  );
+  return electronApp;
+}
+
+BeforeAll({ timeout: 120_000 }, async () => {
+  fixturesHandle = await fixtures.start();
+  ctx.fixturesBase = fixturesHandle.base;
+
+  // Mint a throwaway self-signed cert for secure.test and pin its SPKI at
+  // launch, so F12-8 can assert a real https-committed page fully offline.
+  const certDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-fixture-cert-'));
+  const keyPath = path.join(certDir, 'key.pem');
+  const certPath = path.join(certDir, 'cert.pem');
+  execFileSync('openssl', [
+    'req', '-x509', '-newkey', 'rsa:2048', '-keyout', keyPath, '-out', certPath,
+    '-days', '2', '-nodes', '-subj', '/CN=secure.test',
+    '-addext', 'subjectAltName=DNS:secure.test',
+  ], { stdio: 'pipe' });
+  const spkiDer = execFileSync('sh', ['-c',
+    `openssl x509 -in '${certPath}' -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64`,
+  ]);
+  secureSpkiHash = spkiDer.toString().trim();
+  secureFixturesHandle = await fixtures.startSecure({
+    key: fs.readFileSync(keyPath),
+    cert: fs.readFileSync(certPath),
+  });
+  ctx.secureFixturesBase = `https://secure.test:${secureFixturesHandle.port}`;
+
+  // A second key is intentionally absent from the SPKI allowlist above. It
+  // exercises Chromium's real certificate rejection and Blanc's interstitial
+  // without any production-only fixture seam.
+  const badCertDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-untrusted-cert-'));
+  const badKeyPath = path.join(badCertDir, 'key.pem');
+  const badCertPath = path.join(badCertDir, 'cert.pem');
+  execFileSync('openssl', [
+    'req', '-x509', '-newkey', 'rsa:2048', '-keyout', badKeyPath, '-out', badCertPath,
+    '-days', '2', '-nodes', '-subj', '/CN=badcert.test',
+    '-addext', 'subjectAltName=DNS:badcert.test',
+  ], { stdio: 'pipe' });
+  untrustedFixturesHandle = await fixtures.startSecure({
+    key: fs.readFileSync(badKeyPath),
+    cert: fs.readFileSync(badCertPath),
+  });
+  ctx.untrustedFixturesBase = `https://badcert.test:${untrustedFixturesHandle.port}`;
+
+  // Local-use names (F39-2..7). A and B are two untrusted keys, so their
+  // fingerprints differ; the trusted pair's SPKI is added to the allowlist
+  // so F39-7 can make a genuinely trusted load on the same host.
+  const localCertDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-local-cert-'));
+  const mintLocal = (name) => {
+    const key = path.join(localCertDir, `${name}-key.pem`);
+    const cert = path.join(localCertDir, `${name}-cert.pem`);
+    execFileSync('openssl', [
+      'req', '-x509', '-newkey', 'rsa:2048', '-keyout', key, '-out', cert,
+      '-days', '2', '-nodes', '-subj', '/CN=nas.home.arpa',
+      '-addext', 'subjectAltName=DNS:nas.home.arpa,DNS:lab.home.arpa',
+    ], { stdio: 'pipe' });
+    return { key: fs.readFileSync(key), cert: fs.readFileSync(cert), certPath: cert };
+  };
+  const localA = mintLocal('a');
+  const localB = mintLocal('b');
+  const localTrusted = mintLocal('trusted');
+  localTrustedSpkiHash = execFileSync('sh', ['-c',
+    `openssl x509 -in '${localTrusted.certPath}' -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64`,
+  ]).toString().trim();
+  const pair = ({ key, cert }) => ({ key, cert });
+  localFixturesHandle = await fixtures.startSecure(pair(localA));
+  ctx.localFixturesPort = localFixturesHandle.port;
+  ctx.localFixturesBase = `https://nas.home.arpa:${localFixturesHandle.port}`;
+  ctx.localFixtures = {
+    handle: localFixturesHandle,
+    certA: pair(localA),
+    certB: pair(localB),
+    certTrusted: pair(localTrusted),
+  };
+
+  // Isolated, throwaway profile so no prior session/history/settings leaks in.
+  userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-acceptance-'));
+  uncaughtLogPath = path.join(userDataDir, 'main-process-uncaught.log');
+  browserHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-browser-home-'));
+  ctx.browserHomeDir = browserHomeDir;
+  const chromeRoot = browserDataRoot('chrome', {
+    platform: process.platform,
+    homeDir: browserHomeDir,
+    env: { ...process.env, LOCALAPPDATA: browserHomeDir },
+  });
+  const profileDir = path.join(chromeRoot, 'Default');
+  fs.mkdirSync(profileDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(chromeRoot, 'Local State'),
+    JSON.stringify({
+      profile: {
+        info_cache: {
+          Default: { name: 'Acceptance profile' },
+          'Profile 1': { name: 'Tab migration fixture' },
+          'Profile 2': { name: 'Merge fixture' },
+          'Profile 3': { name: 'Stress 500' },
+          'Profile 4': { name: 'Quit safety fixture' },
+        },
+      },
+    })
+  );
+  fs.writeFileSync(path.join(profileDir, 'Bookmarks'), JSON.stringify({
+    roots: {
+      bookmark_bar: {
+        type: 'folder',
+        name: 'Bookmarks bar',
+        children: [
+          {
+            type: 'url',
+            name: 'Migration one',
+            url: 'https://migration-one.example/',
+            date_added: '13370000000000000',
+          },
+          {
+            type: 'folder',
+            name: 'Reading',
+            children: [
+              {
+                type: 'url',
+                name: 'Migration two',
+                url: 'https://migration-two.example/',
+                date_added: '13371000000000000',
+              },
+              { type: 'url', name: 'Browser internals', url: 'chrome://settings/' },
+            ],
+          },
+        ],
+      },
+      other: {
+        type: 'folder',
+        name: 'Other bookmarks',
+        children: [
+          { type: 'url', name: 'Migration three', url: 'https://migration-three.example/' },
+        ],
+      },
+    },
+  }));
+  const tabImportProfileDir = path.join(chromeRoot, 'Profile 1');
+  fs.mkdirSync(tabImportProfileDir, { recursive: true });
+  const tabImportFixture = JSON.parse(fs.readFileSync(
+    path.join(REPO_ROOT, 'test', 'fixtures', 'tab-import', 'chromium-acceptance.json'),
+    'utf8',
+  ));
+  tabImportFixture.roots.bookmark_bar.children.push({
+    type: 'folder',
+    name: 'stress 500',
+    children: Array.from({ length: 500 }, (_, index) => ({
+      type: 'url',
+      name: `Stress candidate ${String(index + 1).padStart(3, '0')}`,
+      url: `https://stress-${String(index + 1).padStart(3, '0')}.example/page`,
+      date_added: String(13380000000000000 + index),
+    })),
+  });
+  fs.writeFileSync(
+    path.join(tabImportProfileDir, 'Bookmarks'),
+    JSON.stringify(tabImportFixture),
+  );
+
+  const writeSession = (directory, windows, activeWindowId) => {
+    const sessionsDir = path.join(chromeRoot, directory, 'Sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, 'Session_100'),
+      createChromiumSession({ windows, activeWindowId }),
+    );
+  };
+  writeSession('Profile 1', [
+    {
+      id: 10,
+      tabs: [
+        { id: 101, url: 'https://hotels.example/stay', title: 'Hotels', groupName: 'travel' },
+        { id: 102, url: 'https://flights.example/search', title: 'Flights', groupName: 'travel' },
+        { id: 103, url: 'https://direct-in-reset.example/', title: 'Direct in session' },
+        { id: 104, url: 'chrome://settings/', title: 'Browser settings' },
+      ],
+    },
+    {
+      id: 20,
+      tabs: [
+        { id: 201, url: 'https://atlas-docs.example/guide', title: 'Atlas docs', groupName: 'work', pinned: true },
+        { id: 202, url: 'https://atlas-issues.example/board', title: 'Atlas issues', groupName: 'work' },
+        { id: 203, url: 'https://atlas-docs.example/guide', title: 'Atlas docs duplicate', groupName: 'work' },
+      ],
+    },
+  ], 20);
+  writeSession('Profile 2', [{
+    id: 30,
+    tabs: [
+      { id: 301, url: 'https://project-brief.example/', title: 'Project brief', groupName: 'project' },
+      { id: 302, url: 'https://project-board.example/', title: 'Project board', groupName: 'project' },
+    ],
+  }], 30);
+  writeSession('Profile 3', [{
+    id: 40,
+    tabs: Array.from({ length: 500 }, (_, index) => ({
+      id: 4000 + index,
+      url: `https://stress-${String(index + 1).padStart(3, '0')}.example/page`,
+      title: `Stress candidate ${String(index + 1).padStart(3, '0')}`,
+    })),
+  }], 40);
+  const quitSafetyDir = path.join(chromeRoot, 'Profile 4', 'Sessions');
+  fs.mkdirSync(quitSafetyDir, { recursive: true });
+  const recoverableSession = createChromiumSession({
+    windows: [{
+      id: 50,
+      tabs: [
+        { id: 5001, url: 'https://saved-one.example/', title: 'Saved one' },
+        { id: 5002, url: 'https://saved-two.example/', title: 'Saved two' },
+      ],
+    }],
+    activeWindowId: 50,
+  });
+  fs.writeFileSync(path.join(quitSafetyDir, 'Session_100'), recoverableSession);
+  // The newest file models a browser that has not completed its final save.
+  // Removing only the terminal marker leaves an older snapshot as preflight
+  // evidence while making the exact newest snapshot ineligible for import.
+  fs.writeFileSync(
+    path.join(quitSafetyDir, 'Session_200'),
+    recoverableSession.subarray(0, recoverableSession.length - 3),
+  );
+
+  ctx.healing = createHealingLog();
+  ctx.profileDir = userDataDir;
+  ctx.app = await launchApp();
+  // F28-1 exercises a genuine process relaunch against this same profile,
+  // rather than a renderer reload or an in-memory persistence proxy.
+  // { freshProfile: true } relaunches on a new temporary profile instead, as a
+  // new device would start (Shared Spaces: the sync request budget persists in
+  // the profile, so reusing one made each scenario wait out the last one's).
+  // Any relaunch removes temporary profiles no longer in use.
+  ctx.relaunch = async (extraEnv = {}, { freshProfile = false } = {}) => {
+    if (ctx.app) await closeApp(ctx.app);
+    relaunchEnv = extraEnv;
+    ctx.profileDir = freshProfile
+      ? fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-shared-a-'))
+      : userDataDir;
+    if (freshProfile) tempProfileDirs.add(ctx.profileDir);
+    removeUnusedTempProfiles();
+    ctx.app = await launchApp(extraEnv, { profileDir: ctx.profileDir });
+  };
+  ctx.launchPeerApp = async (extraEnv = {}) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'blanc-shared-peer-'));
+    try { const peer = await launchApp(extraEnv, { profileDir: directory }); peerApps.set(peer,directory); return peer; }
+    catch(error) { fs.rmSync(directory,{recursive:true,force:true});throw error; }
+  };
+  ctx.closePeerApp = async peer => {
+    const directory=peerApps.get(peer);if(!directory)return;
+    await closeApp(peer);peerApps.delete(peer);fs.rmSync(directory,{recursive:true,force:true});
+  };
+  // A crash, not a quit: the process is killed, so nothing gets a chance to
+  // flush on the way out, and the next launch sees only what was on disk.
+  // The whole tree goes: on Windows, kill() reaches only the browser process,
+  // and its orphaned GPU and renderer processes keep the stdio pipes (and so
+  // this runner) open until the job times out (pinned-home-recovery-smoke
+  // kills the same way).
+  ctx.crashAndRelaunch = async () => {
+    const child = ctx.app?.process();
+    if (child && child.exitCode === null) {
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      if (process.platform === 'win32') {
+        try { execFileSync('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' }); } catch { child.kill('SIGKILL'); }
+      } else {
+        child.kill('SIGKILL');
+      }
+      await exited;
+    }
+    ctx.app = await launchApp(relaunchEnv, { recoveryChoice: 'restore', profileDir: ctx.profileDir });
+  };
+  // An ordinary quit, not a crash: before-quit and every shutdown teardown
+  // run, then the app launches again on the same profile and environment.
+  // whileQuit, when given, reads what reached disk while nothing is running.
+  ctx.quitAndRelaunch = async (whileQuit = null) => {
+    if (ctx.app) await closeApp(ctx.app);
+    try { if (whileQuit) await whileQuit(ctx.profileDir); }
+    finally { ctx.app = await launchApp(relaunchEnv, { profileDir: ctx.profileDir }); }
+  };
+
+  // The F19 scenarios write the REAL system clipboard — save the developer's
+  // clipboard now and restore it in AfterAll so a local run doesn't clobber it.
+  savedClipboard = await callTestHook(ctx.app, 'readClipboardText').catch(() => null);
+});
+
+// Cucumber runs After hooks in reverse definition order, and support files load
+// before step files, so this hook (the first After defined) runs after every
+// tagged After, including those that relaunch the app. A main-process
+// exception fails the scenario during which it was logged, once.
+// A suspicion lives on the app it was raised against: an app a tagged After
+// replaces takes its suspicion with it, so the fresh one is not relaunched too.
+function markSuspect(reason, app = ctx.app) {
+  if (app && !app.__blancSuspect) app.__blancSuspect = reason;
+}
+
+After(function (scenario) {
+  const current = ctx.app ? mainProcessExceptionsSinceLaunch(ctx.app) : '';
+  const text = ctx.pendingMainProcessException + current;
+  ctx.pendingMainProcessException = '';
+  if (current) {
+    ctx.app.__blancUncaughtOffset = fs.statSync(uncaughtLogPath).size;
+    markSuspect('main-process exception');
+  } else if (ctx.app === ctx.scenarioApp && isTransportError(scenario.result?.message)) {
+    // A tagged After that failed on the app's handle (AfterStep sees steps
+    // only), as long as that is still the app the scenario ran on.
+    markSuspect(firstLine(scenario.result.message));
+  }
+  if (text) throw new Error(`Electron main-process exception:\n${text}`);
+});
+
+// A step that failed because the app's handle broke (a crashed renderer
+// leaves its page answering every call with "Target crashed") marks the app
+// for a relaunch before the next scenario.
+AfterStep(function ({ result }) {
+  if (result.status === 'FAILED' && isTransportError(result.message)) {
+    markSuspect(firstLine(result.message));
+  }
+});
+
+// After a renderer crash, Chromium answers requests Playwright already gave up
+// on, and Playwright's message handler throws "Target crashed" for each as an
+// uncaught exception: a stream of them while the old app dies. Cucumber fails
+// whatever hook or step is running when one arrives, so one crash used to fail
+// every following scenario. A capture callback receives uncaught exceptions
+// instead of the listeners: these mark the app for a relaunch and go no
+// further; everything else reaches Cucumber, or ends the run as Node would.
+process.setUncaughtExceptionCaptureCallback((error) => {
+  const route = routeUncaught(error, { listeners: process.listenerCount('uncaughtException') });
+  if (route === 'suspect') {
+    markSuspect(firstLine(error.message));
+  } else if (route === 'forward') {
+    process.emit('uncaughtException', error, 'uncaughtException');
+  } else {
+    process.stderr.write(`${error?.stack ?? error}\n`);
+    process.exit(1);
+  }
+});
+
+// Cucumber can abandon a hook that failed through an uncaught exception while
+// its code is still running, so a heal may still be in flight when the next
+// Before starts. Only one runs at a time, and Before waits for it.
+let healInFlight = null;
+function healApp(scenario, reason) {
+  healInFlight ??= (async () => {
+    process.stderr.write(`acceptance: relaunching Blanc before "${scenario}" (${reason})\n`);
+    // Anything the broken app logged after the After hook read the log would
+    // otherwise be lost; it goes into the healing summary instead.
+    const exception = await closeApp(ctx.app).catch(() => '');
+    ctx.pendingMainProcessException = '';
+    if (exception) process.stderr.write(`acceptance: that app also logged: ${firstLine(exception)}\n`);
+    ctx.app = await launchApp(relaunchEnv, { profileDir: ctx.profileDir });
+    ctx.healing.record({ scenario, reason, exception });
+  })().finally(() => { healInFlight = null; });
+  return healInFlight;
+}
+
+Before(async function (scenario) {
+  if (healInFlight) await healInFlight.catch(() => {});
+  ctx.tabByName = {};
+  ctx.activeExpectedUrl = null;
+  ctx.lastNewTabId = null;
+  ctx.enteredInput = null;
+  ctx.addressMenuItems = null;
+  ctx.addressMenuFieldText = null;
+  ctx.groupMembers = null;
+  ctx.groupPinnedTabId = null;
+  ctx.standalonePinnedTabId = null;
+  const name = scenario.pickle.name;
+  // At most one relaunch per scenario, in this order: a suspicion left by the
+  // previous scenario; a reset that fails on the app's handle; a probe of what
+  // is left after the reset. The probe runs after the reset on purpose: the
+  // product discards renderers of its own accord (Quiet Tabs, Glance), and
+  // Playwright reports such a page as crashed for good, so probing the tabs a
+  // scenario left behind relaunched a healthy app. Reset closes them first.
+  ctx.scenarioApp = null;
+  const suspect = ctx.app?.__blancSuspect ?? null;
+  let healed = Boolean(suspect);
+  if (healed) await healApp(name, suspect);
+  try {
+    await callTestHook(ctx.app, 'reset');
+  } catch (error) {
+    if (!shouldHealAfterReset({ alreadyHealed: healed, error })) throw error;
+    healed = true;
+    await healApp(name, `reset: ${firstLine(error.message)}`);
+    await callTestHook(ctx.app, 'reset');
+  }
+  if (!healed) {
+    const { reason } = await probeApp(ctx.app);
+    if (reason) {
+      await healApp(name, reason);
+      await callTestHook(ctx.app, 'reset');
+    }
+  }
+  ctx.scenarioApp = ctx.app;
+});
+
+// Scenarios tagged @test-platform-linux run in an app that acts as on Linux
+// (main and the chrome renderers alike; BLANC_TEST_PLATFORM is honoured only
+// in the acceptance test mode), then the ordinary app comes back.
+Before({ tags: '@test-platform-linux' }, async function () {
+  await ctx.relaunch({ BLANC_TEST_PLATFORM: 'linux' });
+  await callTestHook(ctx.app, 'reset');
+});
+
+After({ tags: '@test-platform-linux' }, async function () {
+  await ctx.relaunch();
+});
+
+// F39 local-certificate scenarios share one fixture server and one exception
+// store: start each from certificate A and no remembered choices.
+Before({ tags: '@F39-2 or @F39-3 or @F39-4 or @F39-5 or @F39-6 or @F39-7 or @F39-9' }, async function () {
+  ctx.localFixtures.handle.setCertificate(ctx.localFixtures.certA);
+  await callTestHook(ctx.app, 'resetCertificateExceptionsForTest');
+});
+
+AfterAll(async () => {
+  for(const peer of [...peerApps.keys()])await ctx.closePeerApp(peer);
+  let closeFailure = null;
+  if (ctx.app && savedClipboard !== null) {
+    await callTestHook(ctx.app, 'setClipboardText', [savedClipboard])
+      .catch(() => {});
+  }
+  // A relaunch still in flight would leave an app running after the run.
+  if (healInFlight) await healInFlight.catch(() => {});
+  for (const line of ctx.healing?.summaryLines() ?? []) process.stderr.write(`${line}\n`);
+  if (ctx.app) {
+    try {
+      const text = await closeApp(ctx.app);
+      if (text) closeFailure = new Error(`Electron main-process exception:\n${text}`);
+    } catch (error) {
+      closeFailure = error;
+    }
+  }
+  ctx.app = null;
+  ctx.relaunch = null;
+  ctx.crashAndRelaunch = null;
+  ctx.quitAndRelaunch = null;
+  removeUnusedTempProfiles({ all: true });
+  if (fixturesHandle) await fixturesHandle.close();
+  if (secureFixturesHandle) await secureFixturesHandle.close();
+  if (untrustedFixturesHandle) await untrustedFixturesHandle.close();
+  if (localFixturesHandle) await localFixturesHandle.close();
+  if (userDataDir) fs.rmSync(userDataDir, { recursive: true, force: true });
+  if (browserHomeDir) fs.rmSync(browserHomeDir, { recursive: true, force: true });
+  if (closeFailure) throw closeFailure;
+});

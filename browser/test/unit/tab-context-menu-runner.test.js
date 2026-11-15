@@ -1,0 +1,108 @@
+'use strict';
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const { runTabContextMenuItem } = require('../../src/main/tab-context-menu');
+
+function spyActions() {
+  const calls = [];
+  const rec = (name) => (...args) => calls.push([name, ...args]);
+  const names = ['copy', 'reload', 'duplicate', 'togglePin', 'toggleMute', 'toggleFavorite',
+    'setGroup', 'beginNewGroup', 'beginNewSpaceForTab', 'glance', 'quiet', 'newTab', 'newPrivateTab',
+    'closeOthers', 'moveToNewWindow', 'reopenClosed', 'close', 'rename', 'resetTitle', 'closeGlance',
+    'returnPinnedHome', 'setPinnedHome', 'toggleStartPagePin', 'moveToSpace', 'sendToDevice'];
+  const actions = {};
+  for (const n of names) actions[n] = rec(n);
+  return { actions, calls };
+}
+const tab = { id: 7, url: 'https://a.test/p?utm_source=x' };
+
+test('copy-link copies the tab url; copy-clean-link copies the descriptor value', () => {
+  const { actions, calls } = spyActions();
+  runTabContextMenuItem('copy-link', { tab, actions });
+  // The model stashes the cleaned URL on the descriptor when it decides to
+  // show the item; the runner copies exactly that — no recompute.
+  runTabContextMenuItem('copy-clean-link', { tab, cleanedUrl: 'https://a.test/p', actions });
+  assert.deepEqual(calls[0], ['copy', 'https://a.test/p?utm_source=x']);
+  assert.deepEqual(calls[1], ['copy', 'https://a.test/p']);
+  // Defensive: no descriptor value → nothing copied (never a wrong value).
+  const s = spyActions();
+  runTabContextMenuItem('copy-clean-link', { tab, actions: s.actions });
+  assert.deepEqual(s.calls, []);
+});
+
+test('simple items dispatch to their action with the tab id', () => {
+  const cases = [
+    ['reload', 'reload'], ['duplicate', 'duplicate'], ['toggle-pin', 'togglePin'],
+    ['return-pinned-home', 'returnPinnedHome'], ['set-pinned-home', 'setPinnedHome'],
+    ['toggle-mute', 'toggleMute'], ['toggle-favorite', 'toggleFavorite'],
+    ['toggle-start-pin', 'toggleStartPagePin'],
+    ['glance', 'glance'], ['quiet', 'quiet'], ['close-others', 'closeOthers'],
+    ['move-new-window', 'moveToNewWindow'], ['close', 'close'],
+  ];
+  for (const [id, fn] of cases) {
+    const { actions, calls } = spyActions();
+    runTabContextMenuItem(id, { tab, actions });
+    assert.deepEqual(calls, [[fn, 7]], `${id} → ${fn}(7)`);
+  }
+});
+
+test('new-tab / new-private-tab / reopen take no id', () => {
+  for (const [id, fn] of [['new-tab', 'newTab'], ['new-private-tab', 'newPrivateTab'], ['reopen-closed', 'reopenClosed']]) {
+    const { actions, calls } = spyActions();
+    runTabContextMenuItem(id, { tab, actions });
+    assert.deepEqual(calls, [[fn]]);
+  }
+});
+
+test('group items: move uses raw groupId, none clears, new begins the handoff', () => {
+  let s = spyActions();
+  runTabContextMenuItem('group-move', { tab, groupId: 42, actions: s.actions });
+  assert.deepEqual(s.calls, [['setGroup', 7, 42]]);
+  s = spyActions();
+  runTabContextMenuItem('group-none', { tab, actions: s.actions });
+  assert.deepEqual(s.calls, [['setGroup', 7, null]]);
+  s = spyActions();
+  runTabContextMenuItem('group-new', { tab, actions: s.actions });
+  assert.deepEqual(s.calls, [['beginNewGroup', 7]]);
+});
+
+test('rename begins the handoff; reset-title clears the name', () => {
+  for (const [id, fn] of [['rename', 'rename'], ['reset-title', 'resetTitle']]) {
+    const { actions, calls } = spyActions();
+    runTabContextMenuItem(id, { tab, actions });
+    assert.deepEqual(calls, [[fn, 7]]);
+  }
+});
+
+test('close-glance closes the pane, not the tab', () => {
+  const { actions, calls } = spyActions();
+  runTabContextMenuItem('close-glance', { tab, actions });
+  assert.deepEqual(calls, [['closeGlance']]);
+});
+
+test('send-to-device sends the tab to the item\'s device', () => {
+  const { actions, calls } = spyActions();
+  runTabContextMenuItem('send-to-device', { tab, deviceId: 'phone', actions });
+  assert.deepEqual(calls, [['sendToDevice', 7, 'phone']]);
+});
+
+test('space-move moves the tab to the chosen space', () => {
+  const { actions, calls } = spyActions();
+  runTabContextMenuItem('space-move', { tab, workspaceId: 'w2', actions });
+  assert.deepEqual(calls, [['moveToSpace', 7, 'w2']]);
+});
+
+test('space-new opens the editor for the context tab', () => {
+  const { actions, calls } = spyActions();
+  runTabContextMenuItem('space-new', { tab: { id: 7 }, actions });
+  assert.deepEqual(calls, [['beginNewSpaceForTab', 7]]);
+});
+
+test('batch actions carry the menu selection and destination to the batch runner', () => {
+  const calls = [], selectedTabIds = ['a', 'b'];
+  const actions = { batch: (...args) => calls.push(args) };
+  for (const id of ['batch-space-move', 'batch-space-new', 'batch-new-window', 'batch-group-move', 'batch-group-none', 'batch-group-new', 'batch-pin', 'batch-mute', 'batch-reload', 'batch-quiet', 'batch-copy', 'batch-close']) {
+    runTabContextMenuItem(id, { tab, actions, selectedTabIds, groupId: 'g', workspaceId: 's' });
+    assert.deepEqual(calls.at(-1), [id, { groupId: 'g', workspaceId: 's' }, selectedTabIds]);
+  }
+});
