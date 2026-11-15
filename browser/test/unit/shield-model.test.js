@@ -19,28 +19,28 @@ test('chip is hidden without a blockable host', () => {
 
 test('chip is quiet at zero blocked while protected', () => {
   const s = shieldChipState({ url: HTTP, blockedCount: 0, excepted: false, adblockEnabled: true });
-  assert.deepEqual(s, { mode: 'quiet', count: 0, title: 'Blanc Blocker — protected, nothing blocked yet — click for site controls' });
+  assert.deepEqual(s, { mode: 'quiet', count: 0, title: 'Spatial Blocker — protected, nothing blocked yet — click for site controls' });
 });
 
 test('chip counts while protected, singular at 1', () => {
   const many = shieldChipState({ url: HTTP, blockedCount: 12, excepted: false, adblockEnabled: true });
   assert.equal(many.mode, 'count');
   assert.equal(many.count, 12);
-  assert.equal(many.title, 'Blanc Blocker — 12 ads & trackers blocked here — click for site controls');
+  assert.equal(many.title, 'Spatial Blocker — 12 ads & trackers blocked here — click for site controls');
   const one = shieldChipState({ url: HTTP, blockedCount: 1, excepted: false, adblockEnabled: true });
-  assert.equal(one.title, 'Blanc Blocker — 1 ad or tracker blocked here — click for site controls');
+  assert.equal(one.title, 'Spatial Blocker — 1 ad or tracker blocked here — click for site controls');
 });
 
 test('chip is off when the site is excepted — site tooltip wins over global', () => {
   for (const adblockEnabled of [true, false]) {
     const s = shieldChipState({ url: HTTP, blockedCount: 0, excepted: true, adblockEnabled });
-    assert.deepEqual(s, { mode: 'off', count: 0, title: 'Blanc Blocker off for this site — click for site controls' });
+    assert.deepEqual(s, { mode: 'off', count: 0, title: 'Spatial Blocker off for this site — click for site controls' });
   }
 });
 
 test('chip is off with the global tooltip when blocking is off everywhere', () => {
   const s = shieldChipState({ url: HTTP, blockedCount: 0, excepted: false, adblockEnabled: false });
-  assert.deepEqual(s, { mode: 'off', count: 0, title: 'Blanc Blocker is off everywhere — click for details' });
+  assert.deepEqual(s, { mode: 'off', count: 0, title: 'Spatial Blocker is off everywhere — click for details' });
 });
 
 test('popover is null without a blockable host', () => {
@@ -68,7 +68,7 @@ test('popover global-off variant when not excepted and blocking is off', () => {
   assert.deepEqual(v, { variant: 'global-off', host: 'theverge.com', on: false, countLine: 'Ad blocking is off everywhere', connection: null });
 });
 
-test('failed Blanc filtering shows recovery instead of a site switch or stale successful count', () => {
+test('failed Spatial filtering shows recovery instead of a site switch or stale successful count', () => {
   for (const readiness of ['failed', 'unsupported']) {
     for (const excepted of [true, false]) {
       const model = shieldPopoverModel({
@@ -91,7 +91,7 @@ test('failed Blanc filtering shows recovery instead of a site switch or stale su
   }
 });
 
-test('uBO chip and popover count blocked requests without applying Blanc site exceptions', () => {
+test('uBO chip and popover count blocked requests without applying Spatial site exceptions', () => {
   for (const [blockedCount, noun] of [[0, 'requests'], [1, 'request'], [12, 'requests']]) {
     const input = { url: HTTP, blockedCount, adblockEnabled: true, provider: 'ublock-origin', connection: 'https' };
     const chip = shieldChipState({ ...input, excepted: true });
@@ -127,8 +127,8 @@ test('uBO still withholds site controls on internal pages', () => {
 
 test('provider selection remains separate from the active blocker until restart in either direction', () => {
   for (const [active, selected, activeLabel, selectedLabel] of [
-    ['blanc', 'ublock-origin', 'Blanc Blocker', 'uBlock Origin'],
-    ['ublock-origin', 'blanc', 'uBlock Origin', 'Blanc Blocker'],
+    ['blanc', 'ublock-origin', 'Spatial Blocker', 'uBlock Origin'],
+    ['ublock-origin', 'blanc', 'uBlock Origin', 'Spatial Blocker'],
   ]) {
     const model = shieldProviderModel({ active, selected, restartPending: true, phase: 'ready', enabled: true, supported: true });
     assert.equal(model.active, active);
@@ -137,7 +137,7 @@ test('provider selection remains separate from the active blocker until restart 
     assert.equal(model.ublockAvailable, true);
     assert.equal(model.canOpenUblock, active === 'ublock-origin');
     assert.match(model.detail, new RegExp(`${selectedLabel} selected`));
-    assert.match(model.detail, /Restart Blanc to apply/);
+    assert.match(model.detail, /Restart Spatial to apply/);
     assert.match(model.detail, new RegExp(`${activeLabel} is still active`));
   }
 });
@@ -155,25 +155,25 @@ test('pending restart preserves the running provider failure, disable, or startu
       const model = shieldProviderModel({ active, selected, restartPending: true, supported: true, phase, enabled });
       assert.equal(model.active, active);
       assert.equal(model.selected, selected);
-      assert.match(model.detail, /selected.*Restart Blanc to apply/);
+      assert.match(model.detail, /selected.*Restart Spatial to apply/);
       assert.match(model.detail, expected);
       assert.doesNotMatch(model.detail, /is (still )?active|protected/i);
     }
   }
 });
 
-test('unsupported uBO stays unavailable while the Blanc selection remains usable', () => {
+test('unsupported uBO stays unavailable while the Spatial selection remains usable', () => {
   const model = shieldProviderModel({ active: 'blanc', selected: 'blanc', phase: 'ready', enabled: true, supported: false });
   assert.equal(model.disabled, false);
   assert.equal(model.ublockAvailable, false);
   assert.equal(model.canOpenUblock, false);
   assert.match(model.availability, /uBlock Origin is unavailable/);
   assert.equal(model.detail, 'Active');
-  assert.match(model.scope, /Private tabs use Blanc Blocker/);
+  assert.match(model.scope, /Private tabs use Spatial Blocker/);
   assert.match(model.scope, /Each blocker keeps its own site settings/);
 });
 
-test('private shield stays with Blanc and cannot open or select the ordinary uBO provider', () => {
+test('private shield stays with Spatial and cannot open or select the ordinary uBO provider', () => {
   for (const phase of ['ready', 'failed', 'unsupported']) {
     const model = shieldProviderModel({
       active: 'ublock-origin', selected: 'ublock-origin', supported: true,
@@ -185,7 +185,7 @@ test('private shield stays with Blanc and cannot open or select the ordinary uBO
     assert.equal(model.ublockAvailable, false);
     assert.equal(model.canOpenUblock, false);
     assert.match(model.detail, /can’t load uBO in temporary private sessions/);
-    assert.match(model.detail, /Blanc Blocker protects this tab/);
+    assert.match(model.detail, /Spatial Blocker protects this tab/);
     assert.equal(model.availability, '');
     assert.equal(model.scope, '');
   }
@@ -339,7 +339,7 @@ for (const fallback of ['manifest-v2-retired', 'ublock-unavailable']) test(`MV2 
   const model = shieldProviderModel(state);
   assert.equal(model.active, 'blanc'); assert.equal(model.selected, 'ublock-origin');
   assert.equal(model.choice, 'blanc'); assert.equal(model.restartPending, false);
-  assert.match(model.detail, /Blanc Blocker is protecting/);
+  assert.match(model.detail, /Spatial Blocker is protecting/);
   assert.match(model.detail, /uBO settings are saved/);
   assert.match(model.detail, fallback === 'manifest-v2-retired' ? /engine can’t run/ : /isn’t available in this build/);
   assert.equal(model.canOpenUblock, false); assert.equal(model.ublockAvailable, false);

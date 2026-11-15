@@ -210,7 +210,7 @@
   const adblockEnabled = document.getElementById('adblockEnabled');
   if (supports('blockingStatus') && typeof window.bowserPages.settings.blockingStatus === 'function') {
     const selector = document.getElementById('adblockProvider');
-    const label = id => id === 'ublock-origin' ? 'uBlock Origin' : 'Blanc Blocker';
+    const label = id => id === 'ublock-origin' ? 'uBlock Origin' : 'Spatial Blocker';
     const renderBlocking = (state) => {
       if (!state) return;
       document.getElementById('blockingProviderSetting').hidden = state.exposed === false;

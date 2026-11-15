@@ -130,7 +130,7 @@ function createStudioPlugins({
   }
 
   function attachView(tabId, wc) {
-    if (!wc || typeof tabId !== 'number') return;
+    if (!wc || tabId == null) return; // tab ids are UUID strings in this fork
     let view = views.get(tabId);
     if (view && view.wc === wc) return;
     if (view) view.wc = wc;
@@ -431,7 +431,7 @@ function createStudioPlugins({
         // Arm the ACTIVE view even if it has not joined the attached set yet
         // (same on-demand posture as the §B.9 zapper's armZapper).
         const target = getActiveView();
-        if (target?.wc && !target.wc.isDestroyed?.() && typeof target.tabId === 'number') {
+        if (target?.wc && !target.wc.isDestroyed?.() && target.tabId != null) {
           attachView(target.tabId, target.wc);
         }
         for (const view of views.values()) reinjectView(view);

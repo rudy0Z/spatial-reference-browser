@@ -305,7 +305,7 @@ test('a public ECS build enables uBO only through its own reviewed runtime recor
   assert.equal(ok.supported, true); assert.equal(ok.active, 'ublock-origin'); assert.equal(ok.fallback, null);
   assert.equal(ok.internalCandidate, false);
 
-  // Each unreviewed case falls back to Blanc Blocker at startup.
+  // Each unreviewed case falls back to Spatial Blocker at startup.
   for (const [label, input] of [
     ['no ECS record', { metadata: release, matrix: { ...matrix, ecsRuntime: undefined } }],
     ['different ECS pin', { metadata: { ...release, blancEcsRuntime: '44.9.4+wvcus' }, matrix }],

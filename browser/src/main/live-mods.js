@@ -183,7 +183,7 @@ function createLiveMods({ chromeHandle, chromeOn, store, getActiveView, iterView
    * loaded. Dead views are pruned lazily on every pass.
    */
   function attachView(tabId, wc) {
-    if (!wc || typeof tabId !== 'number') return;
+    if (!wc || tabId == null) return; // tab ids are UUID strings in this fork
     let view = views.get(tabId);
     if (view && view.wc === wc) return; // already wired
     if (view) view.wc = wc; // tab's webContents was recreated after wake

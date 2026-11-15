@@ -5,12 +5,12 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const { englishT } = require('../support/english-t');
-test('Settings exposes Retry and Continue for Blanc startup failure without exposing uBO', () => {
+test('Settings exposes Retry and Continue for Spatial startup failure without exposing uBO', () => {
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/pages/settings.js'), 'utf8');
   const render = source.match(/const renderBlocking = \(state\) => \{[\s\S]*?\n    \};/)[0];
   const elements = new Map();
   const element = id => { if (!elements.has(id)) elements.set(id, { hidden: false, textContent: '', querySelector: () => ({}) }); return elements.get(id); };
-  const context = { document: { getElementById: element }, selector: element('adblockProvider'), label: id => id === 'blanc' ? 'Blanc Blocker' : 'uBlock Origin', t: englishT };
+  const context = { document: { getElementById: element }, selector: element('adblockProvider'), label: id => id === 'blanc' ? 'Spatial Blocker' : 'uBlock Origin', t: englishT };
   vm.runInNewContext(render + '\nthis.render = renderBlocking;', context);
   context.render({ active: 'blanc', selected: 'blanc', exposed: false, supported: false, phase: 'failed', enabled: true, error: 'blanc-initialization-failed' });
   assert.equal(element('ublockTools').hidden, true);
@@ -29,12 +29,12 @@ for (const fallback of ['manifest-v2-retired', 'ublock-unavailable']) test(`Sett
   const render = source.match(/const renderBlocking = \(state\) => \{[\s\S]*?\n    \};/)[0];
   const elements = new Map();
   const element = id => { if (!elements.has(id)) elements.set(id, { hidden: false, textContent: '', querySelector: () => ({}) }); return elements.get(id); };
-  const context = { document: { getElementById: element }, selector: element('adblockProvider'), label: id => id === 'blanc' ? 'Blanc Blocker' : 'uBlock Origin', t: englishT };
+  const context = { document: { getElementById: element }, selector: element('adblockProvider'), label: id => id === 'blanc' ? 'Spatial Blocker' : 'uBlock Origin', t: englishT };
   vm.runInNewContext(render + '\nthis.render = renderBlocking;', context);
   const state = { active: 'blanc', selected: 'ublock-origin', fallback, exposed: true, supported: false, phase: 'ready', enabled: true, restartPending: false };
   context.render(state);
   assert.equal(context.selector.value, 'blanc');
-  assert.match(element('blockingProviderStatus').textContent, /Blanc Blocker is active/);
+  assert.match(element('blockingProviderStatus').textContent, /Spatial Blocker is active/);
   assert.match(element('blockingProviderStatus').textContent, /Your uBO settings are saved/);
   assert.match(element('blockingProviderStatus').textContent, fallback === 'manifest-v2-retired' ? /engine can’t run/ : /isn’t available in this build/);
   assert.equal(element('ublockTools').hidden, true);
@@ -43,9 +43,9 @@ for (const fallback of ['manifest-v2-retired', 'ublock-unavailable']) test(`Sett
   assert.match(element('blockingProviderStatus').textContent, /Blocking is off/);
   assert(!element('blockingProviderStatus').textContent.includes('is active'));
   context.render({ ...state, phase: 'failed', error: 'blanc-initialization-failed' });
-  assert.match(element('blockingProviderStatus').textContent, /Blanc Blocker could not continue/);
+  assert.match(element('blockingProviderStatus').textContent, /Spatial Blocker could not continue/);
   assert.equal(element('blockingRecovery').hidden, false);
-  assert.equal(element('ublockRetry').textContent, 'Retry Blanc Blocker');
+  assert.equal(element('ublockRetry').textContent, 'Retry Spatial Blocker');
 });
 
 test('Settings shows a restarting uBO without recovery buttons', () => {
@@ -53,7 +53,7 @@ test('Settings shows a restarting uBO without recovery buttons', () => {
   const render = source.match(/const renderBlocking = \(state\) => \{[\s\S]*?\n    \};/)[0];
   const elements = new Map();
   const element = id => { if (!elements.has(id)) elements.set(id, { hidden: false, textContent: '', querySelector: () => ({}) }); return elements.get(id); };
-  const context = { document: { getElementById: element }, selector: element('adblockProvider'), label: id => id === 'blanc' ? 'Blanc Blocker' : 'uBlock Origin', t: englishT };
+  const context = { document: { getElementById: element }, selector: element('adblockProvider'), label: id => id === 'blanc' ? 'Spatial Blocker' : 'uBlock Origin', t: englishT };
   vm.runInNewContext(render + '\nthis.render = renderBlocking;', context);
   context.render({ active: 'ublock-origin', selected: 'ublock-origin', exposed: true, supported: true, phase: 'recovering', enabled: true, error: 'ubo-decision-timeout' });
   assert.equal(element('blockingProviderStatus').textContent, 'uBlock Origin is restarting. New requests are paused.');

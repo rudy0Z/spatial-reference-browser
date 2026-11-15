@@ -1,0 +1,14 @@
+shield.restartNeeded = "Restart Spatial to use your selected blocker."
+shield.restartNote = "Changes take effect after restarting Spatial."
+shield.restart = "Restart Spatial"
+shield.provider.off = "Blocking is off."
+shield.provider.active = "Active"
+shield.provider.privateProtects = "Spatial Blocker protects this private tab."
+shield.provider.privateNoUbo = "Spatial’s browser engine can’t load uBO in temporary private sessions. Spatial Blocker protects this tab."
+shield.chip.quiet = "Spatial Blocker — protected, nothing blocked yet — click for site controls"
+shield.scope.private = undefined
+shield.currentBlocker = "Current blocker"
+--- value-side blanc ---
+update.stalled.detail :: "The update download stopped making progress. You can retry with “{command}”, or reinstall from blanc.day."
+update.failed.detail :: "{error}\n\nYou can retry with “{command}”, or reinstall from blanc.day."
+ios.welcome.measureUsageHelp :: "Each time you open Spatial, it sends one anonymous count: a random ID for this install, the app version and t

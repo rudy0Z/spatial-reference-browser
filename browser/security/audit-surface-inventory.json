@@ -27,79 +27,79 @@
   "boundaries": [
     {
       "file": "cloudflare/bang-icons-worker/src/find-icon.js",
-      "sha256": "8fbc367189a14d2986e289c85ef824c34683404c0a85b99768c8ebe853f57f84",
+      "sha256": "18960bae4b06d8c4cbc5c4e1247cbc97156bb21c96d409e48ae42db2030b958a",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/bang-icons-worker/src/hosts.js",
-      "sha256": "e967c91a5ad6509daaeda43d562371746317a51683efcdfe0956c02481da2a82",
+      "sha256": "7f6090f72f4b59f0c42f7b85800d8f86a772e6097978587aa76c5ae419aaea6e",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/bang-icons-worker/src/index.js",
-      "sha256": "4b237d1b8a898f1f8f6e9e3ee19329cfe1685c9e4230cd188acf290036f56d96",
+      "sha256": "96b5f3242de20552040420348873ae58c50f65de91a294578c4e0ccf46e36415",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/bang-icons-worker/src/rules.js",
-      "sha256": "967b79763cea6ab2ac1be57abcf0f8b98905bb48b214bdcc3929f0d1f5765d35",
+      "sha256": "6687b2eb8d40e43e5fa4eaac402e8589b1d0338d8fc5df7fc914bdeffff75d11",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/newsletter-worker/src/index.js",
-      "sha256": "13d5b0b95a688b96822dc74b6e2591a5e90a287f169447af677b718f1ef3d0c5",
+      "sha256": "5452ca26cc98ad971acf4530ae1e8796f1e003ff95855f49c1cc7bded78e3229",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/newsletter-worker/src/resend-sync.js",
-      "sha256": "338e55f741af0674e5b1ad55968ae0b884bbed97268de76c58fed24f46197c9f",
+      "sha256": "2bb186a735760647859699e305802cf66b5d2c5ec17eb461002988c248ff4606",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/ping-worker/src/dl.js",
-      "sha256": "dbbe49d56e4fedbc02229535d6f4847722b64c2d39eb6e3c43c17b89702f2505",
+      "sha256": "41a01bc296e88a4cd915b774c335ee6e822ead17c7f6ad74b62e21698aec0e55",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/ping-worker/src/first-seen.js",
-      "sha256": "aa1ce64a1dd562a7ba6fd53038ee95621f7031037218c275082c2c22544f0ced",
+      "sha256": "b936ff35a02ad1d7c9363434326d28c14974cd89219f1b36ce2df5d49f80d285",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/ping-worker/src/index.js",
-      "sha256": "7232de6e86e9d20f85ad98f41244dc41ecec13df1db404fdfa4781ac84bf3a47",
+      "sha256": "cf33edfd32f6ed6ca4ab5a7c06094246621ccb5bcb6a7e798cdb289a1658003d",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/sync-worker/src/index.js",
-      "sha256": "4fcd6fe77d0dddd211cdf1edc25fcb1eec712548b1dcb29c7ce55a6cd420514e",
+      "sha256": "d50df0a9d0b455cc81c54056501ad96b3e6131a808e5801f082d237becc40ee0",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/tab-import-worker/src/index.js",
-      "sha256": "720673c4c5b9106ef7bcaf07b0d2f154432d1cb0c27854df6f393f02c9cbb7f8",
+      "sha256": "f26db9999f4d8a73ef658a9ed8ae090518e1d4d2ef8ce46f538d9e57051acc7f",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "cloudflare/tab-import-worker/src/model.js",
-      "sha256": "3f98f7f14e22497546232843d0d6ab873bee7c17df8507bacc77a55c9fef355a",
+      "sha256": "f74c8cf325b3b18e8ffc33cff9a4cb52162db88e919418cf06bf2fcd0233f87c",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/badge-api-preload.js",
-      "sha256": "e7b067be4a461b0c4d8d65208409e4107b44bc331dba2b90fbc64b23928f75fb",
+      "sha256": "505f6998758e95e176abf987b37911b798e89032dfaff8c7857f6efbae074588",
       "literalChannels": [],
       "role": "preload"
     },
@@ -159,13 +159,13 @@
     },
     {
       "file": "src/main/chrome-compat-preload.js",
-      "sha256": "4d2b1d014f948bbb75bb32a634523d239e6cb2ae573b2fc8ca52ef676358c925",
+      "sha256": "2b666de7859590ddf2de5b5fd93eab42e37c5428f497c8bbea30bada34bbc8e7",
       "literalChannels": [],
       "role": "preload"
     },
     {
       "file": "src/main/chrome-protocol.js",
-      "sha256": "9aeba19661990918a41570653752f2ddb3d6eaf13a555bb54ed12c32ae1dd277",
+      "sha256": "10b1dbbd7f65b502fa7773f631019abd3698ca7098a1064aad4cb77584987305",
       "literalChannels": [
         "blanc-chrome"
       ],
@@ -173,13 +173,13 @@
     },
     {
       "file": "src/main/closed-tabs.js",
-      "sha256": "5c35b4c21cca7c07a6affa1fbc9ac25d52dae8f1a2a53bb0dc78af493e2cdc70",
+      "sha256": "b3e46a0b29900c40a2e0b7abf10c1c7ffa7890dfa748bf7b14a429889562d8a9",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/credential-fill-controller.js",
-      "sha256": "3fab86f88647bb6be4a04fd725f71095a25f6b43510b4997a9a9126f82092999",
+      "sha256": "0d08d5176ed585cf1d5f44204b905e05c3b952e2664a8d253d67b65bb196034c",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
@@ -206,7 +206,7 @@
     },
     {
       "file": "src/main/downloads.js",
-      "sha256": "cc2f638f21d50a0d1b00037949f125657ae62960376b53b3b993746bf1dfa074",
+      "sha256": "3a2a41121df30d9b9b4848ecd24a71031d088d5d74bbff12e0f63772ee2394f3",
       "literalChannels": [
         "updated",
         "will-download"
@@ -215,7 +215,7 @@
     },
     {
       "file": "src/main/external-protocols.js",
-      "sha256": "e3de37e86a4c74cb9ff1acafe8946ef040672d606ba734367f1aa2697152d4cb",
+      "sha256": "51c06f4fd4ea9aacab09dfd31a6e566ec4691de007e452f28b269d8439f59e86",
       "literalChannels": [
         "will-frame-navigate",
         "will-redirect"
@@ -224,7 +224,7 @@
     },
     {
       "file": "src/main/fill-status-preload.js",
-      "sha256": "07a9c915ca170ae3acdc5f274cef7acdd088c2c67a241b7aae9b7b63630d4d35",
+      "sha256": "5de217949a8cb16ad2cb10d8a10bc2f893a5c4d2a91369d10f41aaaabe77114f",
       "literalChannels": [
         "fill:hide",
         "fill:reply",
@@ -234,13 +234,13 @@
     },
     {
       "file": "src/main/ipc-trust.js",
-      "sha256": "c54e4be9eb3a47f57e8c88bd56d5c34d747d9d89fb911dcfec7624ec35119928",
+      "sha256": "d967853e21a7b5f67c5c74de0c5003f6b310d60664ef22ff66523e4e5d230316",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/link-route-preload.js",
-      "sha256": "e282fa7e7049edf6bf00834cb92a50273a5cfd4e5708ba0f00c59ec52bbe36a4",
+      "sha256": "849f5b3ea8bf4bf73cb2e86305050c9c76c6a138eaa7558d876b043f536bab21",
       "literalChannels": [
         "link-route:activated"
       ],
@@ -248,19 +248,19 @@
     },
     {
       "file": "src/main/linux-sandbox-launch.js",
-      "sha256": "36a99069340d4391567e020e686b918978878a2e6b14bb1ab4b43f7c495dc3ea",
+      "sha256": "de0f39c72c7d7d35ac0f7cb831941ce4a84a68f0e83dbdd6b32b72a8aa1f15ab",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/local-profiles.js",
-      "sha256": "d8baba8cbfb484cbc5a696c430af5ad512d37200eb2b9a8823fef0f164cbc41b",
+      "sha256": "b51ef6fd4f0a5976ff9b31e8f7b231bff0259d5b117781abc6de41de84689751",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/main.js",
-      "sha256": "b0a0ac58deb5dfc650888df4ab72c34c54cc580864fa8ba09a2c8f559c3c30e0",
+      "sha256": "fddc1fc410b2c48454d972b5c193274841711171866f52d0354d56209107b377",
       "literalChannels": [
         "activate",
         "bang-icons:changed",
@@ -420,6 +420,7 @@
         "resize",
         "resume",
         "second-instance",
+        "spatial:link:activated",
         "tabs:activate-from-rail",
         "tabs:back",
         "tabs:clear-closed",
@@ -476,7 +477,7 @@
     },
     {
       "file": "src/main/onepassword-app.js",
-      "sha256": "f0fb209a71887df5aa55b9c2970ab77074c83acd400a350a43432536d9caae0d",
+      "sha256": "c784e5ef6f24b378ce998f74fe964eac3df193c118a781f9792d31830436fe90",
       "literalChannels": [
         "error"
       ],
@@ -484,7 +485,7 @@
     },
     {
       "file": "src/main/onepassword-broker.js",
-      "sha256": "d5dad26e3a0c155b7f92773d5c84942a20e442dda5e7ee70d545f0c103c27a53",
+      "sha256": "8b39b0d662ec3e04c2887386815f0599947c973c3ec3bb889865e78884a0a6bf",
       "literalChannels": [
         "message"
       ],
@@ -492,7 +493,7 @@
     },
     {
       "file": "src/main/onepassword-client.js",
-      "sha256": "43d247cbe624fc957d1dfe96c6bf32333fb0a417f4cfe3e9104647c38b167dfa",
+      "sha256": "abff97f9fc37fc829cd76fad4b615ff97fe11fdf832ed436de3301ce508e8583",
       "literalChannels": [
         "message"
       ],
@@ -500,25 +501,25 @@
     },
     {
       "file": "src/main/page-tint-controller.js",
-      "sha256": "31983bda9cb3e462f6ca88bef09e9ab02cf9962d0f294c0b4f573e49a4a20ef7",
+      "sha256": "fb904edf72ab18cf977dfc7a18ede6a9a2acd7199cb80c87f5363768d875cba2",
       "literalChannels": [],
       "role": "bounded per-window sampling lifecycle"
     },
     {
       "file": "src/main/page-tint-policy.js",
-      "sha256": "482979bdc155e8f7782c130fe07dc8b108628e9f193331219df9b8bb701eb487",
+      "sha256": "c2aca80d04b0cb6963f0680e273505b8887757d6c2886305c9c7fcacdc344ac5",
       "literalChannels": [],
       "role": "foreground/main-frame eligibility policy"
     },
     {
       "file": "src/main/pages-ipc-trust.js",
-      "sha256": "9b31ed197018b0e5539fcb72db432efa95998f5350a3c9189b48b1f0a736632c",
+      "sha256": "ca3895e145a92de4a0af7f2037513e0e633e913cd8658407722ce3ca005e4f3e",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/pages.js",
-      "sha256": "0b3e4a1d96ff351d4b432ef607e862f6ef49a144fd582ee524743f874ad10a16",
+      "sha256": "b0163da8d1fec4c1f3393fdb82587ddf0213282fd70c0342e972450212b01479",
       "literalChannels": [
         "blanc",
         "pages:app-version",
@@ -669,7 +670,7 @@
     },
     {
       "file": "src/main/preload.js",
-      "sha256": "61b13ec4e7d6da6e7fe5e5ac4642bf9904bf7e490f437d46a909b0ce86f64882",
+      "sha256": "240e858c8d2c9dfe0ac15ec5b517eb5bdc6cab266c30a8a4535dfa93bd4e84a1",
       "literalChannels": [
         "bang-icons:changed",
         "bangs:changed",
@@ -832,13 +833,13 @@
     },
     {
       "file": "src/main/profile-deletions.js",
-      "sha256": "f7152966418905972da6295e3bec9da5cdedd0adb41a6ca7b85bf2a248dd66fe",
+      "sha256": "bf502a5414c8af5b096fc7bfc55f086a1d18c610c0bd1e1532cd31455d7a0e2f",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/profile-sessions.js",
-      "sha256": "b46db2edbea6509ed4ddafecb8d4e348b00273c425a54b04f259d26d5b4a0099",
+      "sha256": "a39c0eb558842b35ed7a16fc349b6a61b6032b6179cddda8d5245520f89add83",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
@@ -951,25 +952,25 @@
     },
     {
       "file": "src/main/scoped-session-preload.js",
-      "sha256": "880c90775ee36d8cc60ae46e166d0f7afe3e24d9821646dfa47f63590b7fba60",
+      "sha256": "763afa46929ce145acf44c4712db526c7762a141cccfce23fb420d667c5a032c",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/sync-crypto.js",
-      "sha256": "e1575b178424eb86b97ed6c3ebf78e8e7d7f2f015855f379a691a755d8bbddbd",
+      "sha256": "c5f1782e5c126630e83617d685fa3fa92c6495f0ca14788c936b6d351e61bcfe",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/sync-key-storage.js",
-      "sha256": "9e4f99c2eabe2ed60f4597f5f220ca386d54519e76cdb808571e01fa12c6d27f",
+      "sha256": "16fbeb2c6ec8411a43361eb88ea15d7426c909ebc164a0c62870f8e55fe3d29b",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/sync.js",
-      "sha256": "0a7c5974677f186c08ab657512173eb20beaf3f5571e1373ceb5aa3cb701271f",
+      "sha256": "0345619bddf0c63002a224f7eb62fdd335b8744e726cd3a9e6908ba2f92d7373",
       "literalChannels": [
         "before-quit"
       ],
@@ -977,13 +978,13 @@
     },
     {
       "file": "src/main/tab-import-protocol.js",
-      "sha256": "29c20bf58fa911068cf8e91299bd22a234e907375c263c8fad131416a6a1ae4b",
+      "sha256": "5be26e2a7991ee9d90d375eb6bdd8ddef5a49d37225d62940d0f0d68e25e5254",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/tab-preload.js",
-      "sha256": "77c36a7b0ef913b38a90983ec9534f594ff7beba05c40440a7d68ef4a738f38d",
+      "sha256": "99a075abdff49e9336bc81071d75bc76477ff45520696c784a7407f23bc5d7d1",
       "literalChannels": [
         "page-tint:changed",
         "pages:app-version",
@@ -1137,13 +1138,13 @@
     },
     {
       "file": "src/main/tab-sleep.js",
-      "sha256": "94d4f31a737de495b2c0a717c00169e75567bef88dd417c9df614929d6b7c6fb",
+      "sha256": "50c35b124c3f72380e546f2366adbe32e9aa89ca34b905ddbf7ba182812ac6b6",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/tab-view.js",
-      "sha256": "b7cc5a39a06fc614d19ccb0dcb0ee0a57130b6ba24e37d2524547e16bd3446db",
+      "sha256": "5ec1a29829102eecd94237d10da2ed830814270d2ac10c95a01f15cd24d81bed",
       "literalChannels": [
         "audio-state-changed",
         "before-input-event",
@@ -1192,7 +1193,7 @@
     },
     {
       "file": "src/main/update-restart.js",
-      "sha256": "caf58874c80d945134aea4b41829b04e3b2f86dcc4327ea18dae60cb82e4b454",
+      "sha256": "d34e0a81cd581f8f38a8cf8ca60d68ea7d6552fa273a7f6df7c062f3d5dfe079",
       "literalChannels": [
         "error"
       ],
@@ -1200,13 +1201,13 @@
     },
     {
       "file": "src/main/updater-signature.js",
-      "sha256": "c391b3ba4b28e16fca90fce171bf74d74fb0b7a871d33810508a3138ffe1a8c6",
+      "sha256": "b867a8145952cd1eed37cfdd0bbf7f034b369e7595dd9dfc56ffee9910566b4e",
       "literalChannels": [],
       "role": "privileged implementation or service"
     },
     {
       "file": "src/main/updater.js",
-      "sha256": "4512ff51ed0be90ddff2ae13e1912e41fc57d197a873ed7735bc7aa275e2341e",
+      "sha256": "3fde9c04aeed8ffdbe827dce100bc02b483ede98927e8312e8cd848680f6f56d",
       "literalChannels": [
         "browser-window-focus",
         "checking-for-update",
@@ -1220,7 +1221,7 @@
     },
     {
       "file": "src/main/webauthn.js",
-      "sha256": "24d2465c172b05495344bde155b6a224e419f7957d985a838aaaeef3e3fa3a44",
+      "sha256": "b43aceaec0693db7714e46a0f590c115470a07b7f558904d4e4c6cc537de8daf",
       "literalChannels": [
         "select-webauthn-account"
       ],
@@ -1228,7 +1229,7 @@
     },
     {
       "file": "src/main/webrtc-audio-buffer-preload.js",
-      "sha256": "cedcabada378224580f879eacdf741a80ab054d6a38ad4cd6918c2e957811d94",
+      "sha256": "da45b0816c9f1a153d8cc81791d025dcf25d6f9f039acd81f0a1bc2de5ff76d6",
       "literalChannels": [
         "webrtc:audio-buffer:get",
         "webrtc:audio-buffer:update"
@@ -1237,7 +1238,7 @@
     },
     {
       "file": "src/main/windows-update-trust.js",
-      "sha256": "f303b078e1d7a4d1f30fbe219b403c1afec5a089045092e547a653cbb74311b5",
+      "sha256": "79e151890f736a1fa7c4057173b9961803e230e16123726c7a2c333e93e79a7f",
       "literalChannels": [],
       "role": "privileged implementation or service"
     }

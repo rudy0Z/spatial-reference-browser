@@ -92,7 +92,7 @@ async function exportReport(parent, t) {
     const date = new Date().toISOString().slice(0, 10);
     const picked = await dialog.showSaveDialog(parent ?? undefined, {
       title: t('diagnostics.export.title'),
-      defaultPath: path.join(app.getPath('downloads'), `Blanc-Diagnostics-${date}.json`),
+      defaultPath: path.join(app.getPath('downloads'), `Spatial-Diagnostics-${date}.json`),
       filters: [{ name: 'JSON', extensions: ['json'] }],
     });
     if (picked.canceled || !picked.filePath) return { ok: false, cancelled: true };

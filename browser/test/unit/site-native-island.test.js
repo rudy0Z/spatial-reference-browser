@@ -70,11 +70,11 @@ test('the shield popover replica renders the native overlay in the states the ap
   const overlay = read('src/renderer/overlay.html'), overlayScript = read('src/renderer/overlay.js');
   const text = html => html.replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ');
   const art = state => nativeShieldPopoverArt({styles:source.styles, overlay, mark:'/mark.png', host:'nytimes.com', count:24, ...state});
-  // A regular tab with Blanc Blocker ready and active, default settings.
+  // A regular tab with Spatial Blocker ready and active, default settings.
   const controls = shieldProviderModel({active:'blanc', selected:'blanc', phase:'ready', enabled:true, supported:true, exposed:true}, false, t);
   const site = shieldPopoverModel({url:'https://www.nytimes.com/', blockedCount:24, adblockEnabled:true, connection:'https', t});
   const summary = art({step:'summary'});
-  for (const expected of [site.host, controls.detail, site.countLine, ...controls.scope.split('\n'), 'Uses HTTPS', 'Applies while Blanc is dark.']) {
+  for (const expected of [site.host, controls.detail, site.countLine, ...controls.scope.split('\n'), 'Uses HTTPS', 'Applies while Spatial is dark.']) {
     assert.ok(text(summary.html).includes(expected), `summary shows: ${expected}`);
   }
   // The replica's state text mirrors what overlay.js renders from the
@@ -87,8 +87,8 @@ test('the shield popover replica renders the native overlay in the states the ap
   assert.match(summary.html, /<div id="shieldPopChooser" hidden>/);
   for (const [key, literal] of [
     ['shield.chooseBlocker', 'Choose a blocker'], ['shield.scopeRegular', 'For regular tabs on this device.'],
-    ['shield.restartNeeded', 'Restart Blanc to use your selected blocker.'], ['shield.restartNote', 'Changes take effect after restarting Blanc.'],
-    ['shield.restart', 'Restart Blanc'],
+    ['shield.restartNeeded', 'Restart Spatial to use your selected blocker.'], ['shield.restartNote', 'Changes take effect after restarting Spatial.'],
+    ['shield.restart', 'Restart Spatial'],
   ]) {
     assert.ok(overlayScript.includes(`blancI18n.t('${key}')`), `overlay.js still renders ${key}`);
     assert.equal(english(key), literal, `${key} is still "${literal}"`);
@@ -96,9 +96,9 @@ test('the shield popover replica renders the native overlay in the states the ap
   const chooser = art({step:'chooser'}), switching = art({step:'chooser', draft:'ublock-origin'});
   assert.match(chooser.html, /value="blanc" checked/);
   assert.match(chooser.html, new RegExp(`data-provider="blanc">${controls.activeLabel}<`));
-  assert.ok(chooser.html.includes('>Done</button>') && chooser.html.includes('Changes take effect after restarting Blanc.'));
+  assert.ok(chooser.html.includes('>Done</button>') && chooser.html.includes('Changes take effect after restarting Spatial.'));
   assert.match(switching.html, /value="ublock-origin" checked/);
-  assert.ok(switching.html.includes('>Restart Blanc</button>') && switching.html.includes('Restart Blanc to use your selected blocker.'));
+  assert.ok(switching.html.includes('>Restart Spatial</button>') && switching.html.includes('Restart Spatial to use your selected blocker.'));
   for (const state of [chooser, switching]) assert.match(state.html, /<div id="shieldPopSummary" hidden>/);
   assert.ok(summary.css.includes('#shieldPop {') && summary.css.includes('#shieldPopProvider label {'), 'native popover rules travel with it');
   assert.doesNotMatch(summary.html + chooser.html, /<script|browserAPI|data-i18n/);
@@ -403,7 +403,7 @@ test('the resting-Island figures draw a native window in the tab states the app 
   assert.match(open.strip, /id="islandPill" class="no-drag shield-open"/);
   assert.match(open.strip, /id="pillShield" class="shield" aria-expanded="true"/);
   assert.match(open.popover, /^<div class="native-shield-view"><div id="shieldPopPointer"/);
-  for (const expected of ['Site protection', 'netflix.com', 'Blanc Blocker', '3 ads & trackers blocked on this page', 'Uses HTTPS']) {
+  for (const expected of ['Site protection', 'netflix.com', 'Spatial Blocker', '3 ads & trackers blocked on this page', 'Uses HTTPS']) {
     assert.ok(text(open.popover).includes(expected), expected);
   }
   assert.ok(open.css.includes('#islandPill.shield-open {'));
@@ -452,7 +452,7 @@ test('every resting-Island figure on the site is the native window, not a hand-d
   for (const file of walk('site/src').filter(file => file.endsWith('.astro'))) {
     const markup = read(file);
     assert.doesNotMatch(markup, /<div class="pill">|class="site-controls-popover"|class="demo-rail"/, `${file} draws an Island the app doesn't`);
-    // Blanc is desktop only: no figure swaps in a phone layout of the page.
+    // Spatial is desktop only: no figure swaps in a phone layout of the page.
     assert.doesNotMatch(markup, /shots\/mobile\//, `${file} shows a phone layout`);
   }
 });
