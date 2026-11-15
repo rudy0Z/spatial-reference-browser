@@ -1927,6 +1927,54 @@ ipcMain.on(LINK_ROUTE_ACTIVATED_CHANNEL, (event, url) => {
   linkActivations.set(event.sender.id, { url, at: Date.now() });
 });
 
+// Spatial link-branch provenance (Phase 3, step 3). spatial-link-preload.js
+// — registered on the browsing sessions next to link-route-preload.js —
+// reports, from a tab's own top-level page only, a trusted activation of a
+// link the person asked to branch (Cmd/Ctrl+Click, middle-click, or a link
+// carrying target="_blank"). The window-open handler's branch record
+// consults this through onSpatialBranch so a graph node is spawned only for
+// branches the USER requested; a script's window.open stays an ordinary tab
+// (the system pays, the user confirms). Channel is NOT chrome-gated: it
+// comes from ordinary tab pages, so it validates the same way link-route's
+// does — top-level frames only, http(s) targets, bounded map.
+const SPATIAL_LINK_ACTIVATED_CHANNEL = 'spatial:link:activated';
+const SPATIAL_BRANCH_ACTIVATION_MS = 1000;
+const spatialLinkActivations = new Map();
+ipcMain.on(SPATIAL_LINK_ACTIVATED_CHANNEL, (event, info) => {
+  // Only a tab's own top-level page; spatial-link-preload.js runs nowhere else.
+  if (!event.senderFrame || event.senderFrame.parent) return;
+  if (!info || typeof info !== 'object' || typeof info.url !== 'string') return;
+  if (info.url.length > 8192 || !/^https?:\/\//i.test(info.url)) return;
+  const tab = tabs.get(tabIdByWebContentsId.get(event.sender.id));
+  if (!tab) return;
+  if (spatialLinkActivations.size > 64) {
+    const cutoff = Date.now() - 60_000;
+    for (const [wcId, record] of spatialLinkActivations) {
+      if (record.at < cutoff) spatialLinkActivations.delete(wcId);
+    }
+  }
+  spatialLinkActivations.set(event.sender.id, {
+    url: info.url,
+    modified: info.modified === true,
+    targetBlank: info.targetBlank === true,
+    middle: info.middle === true,
+    at: Date.now(),
+  });
+});
+
+/** The recorded user activation a branch is judged against, or null. */
+function spatialBranchActivationFor(parentTabId, branchUrl) {
+  const parentTab = tabs.get(parentTabId);
+  const parentWc = parentTab ? liveContents(parentTab) : null;
+  const activation = parentWc ? spatialLinkActivations.get(parentWc.id) : null;
+  if (!activation) return null;
+  if (Date.now() - activation.at > SPATIAL_BRANCH_ACTIVATION_MS) return null;
+  // Exact target match when both sides know the URL; the recorded one wins
+  // when a redirect changed the address between the click and the open.
+  if (typeof branchUrl === 'string' && branchUrl && activation.url !== branchUrl) return null;
+  return activation;
+}
+
 function routeInAppLink(tab, sourceWc, url, disposition, { fromMenu = false, postBody = null } = {}) {
   if (settings.getSettings().linkRoutesInApp !== true || !tab || tab.private || tab.inheritsDocumentPolicy) return false;
   if (disposition !== 'foreground-tab' && disposition !== 'background-tab') return false;
@@ -9474,6 +9522,28 @@ initTabView({
   onMainFrameCommit,
   noteWakeSuppressed,
   notePopupChild,
+  // Link branching (master spec Phase 3, step 3): a page-opened child the
+  // person asked for (spatial-link-preload activation, 1 s window) becomes a
+  // child node with a parentUuid edge on the spatial graph. POSTs, auth
+  // popups and <3s chains are refused/collapsed by branch-policy.js inside
+  // the runtime; only spatial-chrome windows participate.
+  onSpatialBranch: (parentTabId, childTabId, info = {}) => {
+    const runtime = windowRuntimes.runtimeForTab(parentTabId);
+    if (!runtime?.spatialChrome) return;
+    const userRequested = spatialBranchActivationFor(parentTabId, info?.url) != null;
+    try {
+      spatialRuntime.handleSpatialBranch(runtime, parentTabId, childTabId, {
+        ...info,
+        userRequested,
+      });
+    } catch { /* a failed branch record never breaks the tab open itself */ }
+  },
+  // Audio-state-changed relay: the warm pool's 2.5 s audio debounce.
+  onSpatialAudioActivity: (tabId) => {
+    const runtime = windowRuntimes.runtimeForTab(tabId);
+    if (!runtime?.spatialChrome) return;
+    spatialRuntime.noteSpatialAudioActivity(runtime, tabId);
+  },
 });
 
 function createTab(url = newTabUrl(), { private: isPrivate = false, groupId = null, view = null, pinned = false, muted = false, restoreHistory = null, openerTabId = null, openedInBackground = false, asleep = false, title = null, favicon = null, customTitle = null, pinnedHomeUrl = null, lastViewedAt = null, adoptView = null, allowLocalFile = false, inheritsDocumentPolicy = false, httpReferrer = null, managedExtension = false } = {}) {
@@ -11757,6 +11827,9 @@ function registerIpcHandlers() {
     liveContents,
     presentationView,
     setTabViewVisible,
+    // The window runtime that owns a tab (branch records and remove-op tab
+    // closes resolve per window, never through the focused fallback).
+    runtimeForTab: (tabId) => windowRuntimes.runtimeForTab(tabId) ?? null,
     loadUrlInTab: (tabId, url) => {
       const tab = tabs.get(tabId);
       const contents = tab ? liveContents(tab) : null;
@@ -15236,6 +15309,14 @@ app.whenReady().then(bindWindowRuntime(primaryRuntime, async () => {
       browsingSession.registerPreloadScript({
         type: 'frame',
         filePath: path.join(__dirname, 'link-route-preload.js'),
+      });
+      // Spatial link-branch provenance (Phase 3, step 3): same surface,
+      // narrower contract — reports Cmd/Ctrl+Click / middle-click /
+      // target="_blank" activations so the window-open handler spawns a
+      // graph node only for branches the person asked for.
+      browsingSession.registerPreloadScript({
+        type: 'frame',
+        filePath: path.join(__dirname, 'spatial/spatial-link-preload.js'),
       });
       // Capture instrumentation relay (spec §4). Per the §4.1 spike, session
       // preloads only reach MAIN frames on our configuration — subframe grants

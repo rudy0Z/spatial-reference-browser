@@ -309,6 +309,10 @@ function wireTabView(tab, view, { owner, adopted }) {
     if (tab.sleeping || tab.view?.webContents !== wc) return;
     tab.audible = wc.isCurrentlyAudible();
     scheduleBroadcastTabs();
+    // Spatial warm pool: every audio transition renews the tab's 2.5 s
+    // eviction immunity (hibernation-state.js) so a brief media pause never
+    // hands an active video/audio tab to the evictor.
+    deps.onSpatialAudioActivity?.(tab.id);
   }));
   // pageState carries no media currentTime, so waking a media tab lands at
   // 0:00. Once this document plays media it must not be quieted; only a new

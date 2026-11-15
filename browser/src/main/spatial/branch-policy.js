@@ -88,7 +88,10 @@ function looksLikeAuthOrPaymentUrl(url) {
  * children may carry the opener's sandbox flags; a deferred creation is
  * Blanc's own fresh view and always safe (document-policy.js).
  */
-function classifyChildBranch({ url, postBody = null, disposition = '', chromiumBuilt = false } = {}) {
+function classifyChildBranch(info = {}) {
+  // Null-safe: a junk branch record refuses instead of crashing the caller.
+  const { url, postBody = null, disposition = '', chromiumBuilt = false } =
+    info && typeof info === 'object' ? info : {};
   if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return 'refuse';
   // A POST resubmission can neither be forked (the body would be lost) nor
   // collapsed: refuse the branch and keep the popup path.
@@ -101,13 +104,25 @@ function classifyChildBranch({ url, postBody = null, disposition = '', chromiumB
 }
 
 /**
+ * Approximate registrable domain: the last two labels of a hostname
+ * ("accounts.google.com" and "myaccount.google.com" share "google.com").
+ * A full public-suffix list is not warranted here — the worst case is a
+ * chain that records an extra hop, never a lost branch.
+ */
+function registrableDomain(hostname) {
+  const labels = String(hostname ?? '').toLowerCase().replace(/\.$/, '').split('.').filter(Boolean);
+  if (labels.length <= 1) return labels.join('.');
+  return labels.slice(-2).join('.');
+}
+
+/**
  * Whether a further spawn inside REDIRECT_COLLAPSE_MS belongs to the same
  * chain as `prev` and must patch that node instead of adding a sibling:
  * same parent branch, and the new URL continues the previous one (same
- * registrable origin, or the previous URL was itself auth/payment shaped —
- * providers hop across their own subdomains).
+ * registrable domain — providers hop across their own subdomains and
+ * service hosts, e.g. accounts.google.com → myaccount.google.com).
  */
-function shouldCollapseBranch(prev, { url, at }, { chainMs = REDIRECT_COLLAPSE_MS } = {}) {
+function shouldCollapseBranch(prev, { url, at } = {}, { chainMs = REDIRECT_COLLAPSE_MS } = {}) {
   if (!prev || typeof prev.url !== 'string' || typeof url !== 'string') return false;
   if (prev.viaAuth !== true) return false;
   const createdAt = Number.isFinite(prev.createdAt) ? prev.createdAt : 0;
@@ -117,12 +132,8 @@ function shouldCollapseBranch(prev, { url, at }, { chainMs = REDIRECT_COLLAPSE_M
     const a = new URL(prev.url);
     const b = new URL(url);
     if (a.protocol !== b.protocol) return false;
-    // Auth providers legitimately hop between their own hosts
-    // (accounts.google.com → myaccount.google.com); collapse by suffix.
-    const hostA = `.${a.hostname.replace(/\.$/, '')}`;
-    const hostB = `.${b.hostname.replace(/\.$/, '')}`;
     if (a.hostname === b.hostname) return true;
-    return hostA.endsWith(hostB) || hostB.endsWith(hostA);
+    return registrableDomain(a.hostname) === registrableDomain(b.hostname);
   } catch {
     return false;
   }

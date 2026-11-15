@@ -58,7 +58,7 @@ type SpatialAPI = {
   storeThumb: (uuid: string, dataUrl: string) => void
   win: { minimize: () => void; maximize: () => void; close: () => void }
   onGraphUpdated: (cb: (graph: SpatialGraphPayload) => void) => () => void
-  onZorderBackdrop: (cb: (payload: { dataUrl: string | null }) => void) => () => void
+  onZorderBackdrop: (cb: (payload: { dataUrl: string | null; released?: boolean }) => void) => () => void
   onModeChanged: (cb: (payload: { mode: 'reading' | 'canvas' }) => void) => () => void
   onActiveChanged: (cb: (payload: { uuid: string }) => void) => () => void
   onThumbCapture: (
@@ -373,7 +373,17 @@ export function initSpatialBridge(): {
     backdropEl.style.height = `calc(100vh - ${layoutOverride.topBarHeight}px)`
     return backdropEl
   }
-  unsubs.push(spatialApi.onZorderBackdrop(({ dataUrl }) => {
+  unsubs.push(spatialApi.onZorderBackdrop(({ dataUrl, released }) => {
+    if (released === true) {
+      // Guard off: the live native view is visible again — the backdrop must
+      // go away entirely or it would keep covering the viewport with void.
+      const el = backdropEl
+      if (el) {
+        el.removeAttribute('src')
+        el.style.display = 'none'
+      }
+      return
+    }
     const el = ensureBackdropEl()
     if (dataUrl) {
       el.src = dataUrl

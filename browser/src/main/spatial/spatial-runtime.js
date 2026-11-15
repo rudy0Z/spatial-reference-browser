@@ -16,6 +16,7 @@
 // from main.js (thin hooks — this file never reaches into main's closures).
 
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 
 const { JsonStore } = require('../store');
 const { CHROME_SPATIAL_URL } = require('../chrome-protocol');
@@ -26,14 +27,31 @@ const {
   sessionNodesForTabIds,
   pickEvictionCandidate,
   MAX_LIVE_VIEWS,
+  UUID_PATTERN,
   shouldCaptureNode,
 } = require('./node-model');
 const { modeAViewBounds, sanitizeChromeLayout, isCanvasMode } = require('./canvas-layout');
+const {
+  classifyChildBranch,
+  shouldCollapseBranch,
+  childBranchPosition,
+} = require('./branch-policy');
+const {
+  collectHibernationScript,
+  normalizeHibernationState,
+  restoreHibernationScript,
+  nextAudioImmunity,
+} = require('./hibernation-state');
 const { createGraphIpc } = require('./graph-ipc');
 
 // uuid → live tab id. Tab ids are process-local; entries for dead tabs are
 // pruned lazily and never persist (the session column carries uuids only).
 const tabIdByUuid = new Map();
+
+// uuid → { scrollX, scrollY, mediaTime, excerpt, at } captured right before
+// the warm pool discarded the renderer. Runtime-scoped: after a full restart
+// Blanc's own navigationHistory pageState carries the scroll back instead.
+const hibernationByUuid = new Map();
 
 // Flip SPATIAL_CHROME=0 to fall back to the strip chrome (rollback path).
 const spatialChromeEnabled = () => process.env.SPATIAL_CHROME !== '0';
@@ -89,6 +107,8 @@ const persistGraph = () => {
 
 function liveEntries(runtime) {
   const live = liveMap(runtime);
+  const immune = audioImmunityMap(runtime);
+  const now = Date.now();
   const entries = [];
   for (const [uuid, entry] of live) {
     const tab = deps.tabs.get(entry.tabId);
@@ -98,10 +118,47 @@ function liveEntries(runtime) {
       tabId: entry.tabId,
       lastUsedAt: entry.lastUsedAt ?? 0,
       isActive: runtime.spatialActiveUuid === uuid,
-      isAudible: tab.isAudible === true,
+      // tab.audible is Blanc's own field; the 2.5 s debounce window (below)
+      // covers the brief-pause case the spec calls out.
+      isAudible: tab.audible === true || (immune.get(uuid) ?? 0) > now,
     });
   }
   return entries;
+}
+
+/** Per-window audio-immunity deadlines (uuid → until-ms), 2.5 s debounce. */
+function audioImmunityMap(runtime) {
+  if (!runtime.spatialAudioImmune) runtime.spatialAudioImmune = new Map();
+  return runtime.spatialAudioImmune;
+}
+
+/** The uuid a tab id is bound to, or null (small maps — a scan is fine). */
+function uuidForTabId(tabId) {
+  if (tabId == null) return null;
+  for (const [uuid, bound] of tabIdByUuid) {
+    if (bound === tabId) return uuid;
+  }
+  return null;
+}
+
+/**
+ * Audio-state-changed relay (tab-view.js): every transition renews the tab's
+ * 2.5 s eviction immunity so a brief media pause never hands an active
+ * video/audio tab to the evictor (spec Phase 3 step 2).
+ */
+function noteSpatialAudioActivity(runtime, tabId) {
+  if (!runtime || !runtime.spatialChrome) return;
+  const uuid = uuidForTabId(tabId);
+  if (!uuid) return;
+  const immune = audioImmunityMap(runtime);
+  immune.set(uuid, nextAudioImmunity(Date.now()));
+  // Bound the map: one entry per live node at most, but a stale uuid whose
+  // tab died lingers — prune entries with no live binding while we are here.
+  if (immune.size > liveMap(runtime).size + 16) {
+    for (const key of immune.keys()) {
+      if (!liveMap(runtime).has(key)) immune.delete(key);
+    }
+  }
 }
 
 /** Touch the LRU clock for a node's live view. */
@@ -112,17 +169,68 @@ function touchLive(runtime, uuid) {
 }
 
 /**
+ * True 0 MB hibernation, half one: BEFORE the renderer is discarded, ask the
+ * page for { scrollX, scrollY, mediaTime, excerpt } (hibernation-state.js).
+ * A private node keeps no excerpt (the noCapture class); a broken renderer
+ * answer simply leaves no record and wake falls back to Blanc's own
+ * navigationHistory pageState restore.
+ */
+async function collectHibernation(runtime, uuid, entry) {
+  const node = model.nodes.get(uuid);
+  const tab = deps.tabs.get(entry?.tabId);
+  const wc = tab ? deps.liveContents(tab) : null;
+  if (!node || !wc) return;
+  try {
+    const raw = await wc.executeJavaScript(collectHibernationScript(), true);
+    const state = normalizeHibernationState(raw, { private: node.private === true });
+    if (state) hibernationByUuid.set(uuid, state);
+  } catch { /* renderer gone mid-collect — pageState covers wake */ }
+}
+
+/**
+ * True 0 MB hibernation, half two: the woken view shows its cached WebP
+ * cover instantly (the shell paints node.thumb while the view loads) and the
+ * recorded scroll/media position is restored on the finished load. One-shot:
+ * the record is dropped whether or not the restore succeeded.
+ */
+async function restoreHibernation(tabId, uuid) {
+  const state = hibernationByUuid.get(uuid);
+  if (!state) return;
+  hibernationByUuid.delete(uuid);
+  const tab = deps.tabs.get(tabId);
+  const wc = tab ? deps.liveContents(tab) : null;
+  if (!tab || !wc) return;
+  const epochAtWake = tab.navEpoch;
+  try {
+    // wakeTab's promise resolves after its first load, but the retained-view
+    // path can still be reloading — give did-finish-load a bounded chance.
+    if (wc.isLoading()) {
+      await new Promise((resolve) => {
+        const done = () => { wc.removeListener('did-finish-load', done); resolve(); };
+        wc.once('did-finish-load', done);
+        setTimeout(done, 4000).unref?.();
+      });
+    }
+    if (tab.navEpoch !== epochAtWake) return; // navigated mid-restore
+    await wc.executeJavaScript(restoreHibernationScript(state), true);
+  } catch { /* a failed restore is cosmetic; the page is already usable */ }
+}
+
+/**
  * Enforce the ≤ 6 live-view pool by quieting the LRU candidate through
  * Blanc's own sleepTab (renderer discarded, ~148 MB reclaimed, snapshot kept
  * for wake). The active node and pinned/audible/private nodes are immune.
+ * Async: the hibernation record is collected from the page before the
+ * renderer dies. Callers fire-and-forget; this never rejects.
  */
-function enforceLivePool(runtime) {
+async function enforceLivePool(runtime) {
   const evictUuid = pickEvictionCandidate(liveEntries(runtime), model, { maxLive: MAX_LIVE_VIEWS });
   if (!evictUuid) return;
   const live = liveMap(runtime);
   const entry = live.get(evictUuid);
   live.delete(evictUuid);
   if (entry) {
+    await collectHibernation(runtime, evictUuid, entry);
     try { deps.sleepTab(entry.tabId); } catch { /* tab may be mid-teardown */ }
   }
 }
@@ -169,10 +277,17 @@ function ensureLiveView(runtime, node) {
   if (existing && deps.tabs.has(existing.tabId)) {
     const tab = deps.tabs.get(existing.tabId);
     if (tab && tab.asleep) {
-      try { deps.wakeTab(existing.tabId); } catch { /* fall through to bounds */ }
+      try {
+        // Wake, then restore the hibernation record (scroll/media) once the
+        // load has finished. The cached WebP cover is already on the node —
+        // the shell paints it while this view loads.
+        void Promise.resolve(deps.wakeTab(existing.tabId))
+          .then((woke) => { if (woke) return restoreHibernation(existing.tabId, node.uuid); })
+          .catch(() => { /* bounds below still apply */ });
+      } catch { /* fall through to bounds */ }
     }
     touchLive(runtime, node.uuid);
-    enforceLivePool(runtime);
+    void enforceLivePool(runtime).catch(() => {});
     return existing.tabId;
   }
   let tabId = null;
@@ -185,7 +300,7 @@ function ensureLiveView(runtime, node) {
   live.set(node.uuid, { tabId, lastUsedAt: Date.now() });
   tabIdByUuid.set(node.uuid, tabId);
   wireGraphNodeSync(tabId, node.uuid);
-  enforceLivePool(runtime);
+  void enforceLivePool(runtime).catch(() => {});
   return tabId;
 }
 
@@ -281,7 +396,10 @@ async function engageZOrderGuard(runtime) {
 function releaseZOrderGuard(runtime) {
   if (!runtime || runtime.spatialGuard !== true) return;
   runtime.spatialGuard = false;
-  sendToSpatial(runtime, 'spatial:zorder:backdrop', { dataUrl: null });
+  // `released: true` disambiguates "guard off" from "guard on, capture
+  // failed" — both carry dataUrl:null, but only the first may hide the
+  // backdrop element (the fail-safe void must stay up while the guard holds).
+  sendToSpatial(runtime, 'spatial:zorder:backdrop', { dataUrl: null, released: true });
   resizeNodes(runtime);
 }
 
@@ -380,6 +498,7 @@ function closeNode(runtime, uuid) {
     try { deps.closeTab(entry.tabId); } catch { /* already closing */ }
     tabIdByUuid.delete(uuid);
   }
+  hibernationByUuid.delete(uuid);
   if (runtime.spatialActiveUuid === uuid) {
     runtime.spatialActiveUuid = null;
   }
@@ -387,6 +506,28 @@ function closeNode(runtime, uuid) {
   broadcastGraph();
   resizeNodes(runtime);
   return { ok: result.ok };
+}
+
+/**
+ * The shell's canvas delete arrives as a `remove` op through graph:mutate —
+ * the graph is the tab list for the spatial window, so each removed node's
+ * tab closes too (closeNode semantics, resolved through the owning runtime).
+ */
+function closeTabsForRemovedOps(ops) {
+  for (const op of (Array.isArray(ops) ? ops : [])) {
+    if (!op || op.type !== 'remove' || !(typeof op.uuid === 'string' && UUID_PATTERN.test(op.uuid))) continue;
+    const tabId = tabIdByUuid.get(op.uuid);
+    if (tabId != null) {
+      const owner = deps.runtimeForTab?.(tabId) ?? null;
+      if (owner) {
+        const live = liveMap(owner);
+        live.delete(op.uuid);
+      }
+      try { deps.closeTab(tabId); } catch { /* already closing */ }
+      tabIdByUuid.delete(op.uuid);
+    }
+    hibernationByUuid.delete(op.uuid);
+  }
 }
 
 /** Navigate the active node's tab (wake-then-navigate for quiet tabs). */
@@ -410,6 +551,103 @@ function navigateActive(runtime, rawUrl) {
     try { deps.loadUrlInTab(tabId, url); return { ok: true }; } catch { /* ignore */ }
   }
   return { ok: false, error: 'no-tab' };
+}
+
+/* ------------------------------------------------------------------ */
+/* Link branching (spec Phase 3 step 3)                                */
+/* ------------------------------------------------------------------ */
+
+// Spawned child nodes carry the Mode B card footprint (640×400) — the size
+// every RichCard renders, and the capture size their thumbnails use.
+const BRANCH_NODE_SIZE = Object.freeze({ w: 640, h: 400 });
+
+/**
+ * A page-opened child tab (tab-view.js setWindowOpenHandler → deps
+ * .onSpatialBranch) becomes a child NODE on the graph with a parentUuid
+ * edge — but only when the person actually asked for the branch: main gates
+ * on the spatial-link-preload activation (Cmd/Ctrl+Click, middle-click,
+ * target="_blank"), so a script's window.open stays an ordinary tab ("the
+ * system pays, the user confirms"). Classification and chain collapse are
+ * branch-policy.js's pure decisions:
+ *   fork     — fresh main-process tab → child node beside its parent;
+ *   via-auth — OAuth/SSO/payment branch → ONE viaAuth node per parent,
+ *              hops inside REDIRECT_COLLAPSE_MS patch that node's url;
+ *   refuse   — a POST body or a non-navigable target → no node at all.
+ */
+function handleSpatialBranch(runtime, parentTabId, childTabId, info = {}) {
+  if (!runtime || !runtime.spatialChrome) return { ok: false, reason: 'no-spatial' };
+  const parentUuid = uuidForTabId(parentTabId);
+  const parent = parentUuid ? model.nodes.get(parentUuid) : null;
+  if (!parent) return { ok: false, reason: 'no-parent' };
+  if (info.userRequested !== true) return { ok: true, action: 'skipped-unrequested' };
+  const at = Date.now();
+  const classified = classifyChildBranch({
+    url: info.url,
+    postBody: info.postBody ?? null,
+    disposition: typeof info.disposition === 'string' ? info.disposition : '',
+    chromiumBuilt: info.chromiumBuilt === true,
+  });
+  if (classified === 'refuse') return { ok: true, action: 'refused' };
+  if (classified === 'via-auth') {
+    // Collapse into the parent's ONE viaAuth node while the chain window is
+    // open (auth providers hop across their own subdomains).
+    for (const childUuid of parent.edges) {
+      const child = model.nodes.get(childUuid);
+      if (child && child.viaAuth && shouldCollapseBranch(child, { url: info.url, at })) {
+        model.applyOp({ type: 'patch', uuid: child.uuid, patch: { url: info.url } });
+        persistGraph();
+        broadcastGraph();
+        return { ok: true, action: 'collapsed', uuid: child.uuid };
+      }
+    }
+  }
+  const position = childBranchPosition(parent, parent.edges.length);
+  const node = normalizeNode({
+    uuid: randomUUID(),
+    url: info.url,
+    title: '',
+    x: position.x,
+    y: position.y,
+    w: BRANCH_NODE_SIZE.w,
+    h: BRANCH_NODE_SIZE.h,
+    parentUuid: parent.uuid,
+    edges: [],
+    mode: 'reading',
+    pinned: false,
+    // The child inherits the opener's privacy — createTab was called with
+    // `private: tab.private` in tab-view.js, so the graph matches the tab.
+    private: parent.private === true,
+    branchKind: classified === 'via-auth' ? 'auth' : 'link',
+    viaAuth: classified === 'via-auth',
+    createdAt: at,
+    lastActiveAt: at,
+  });
+  if (!node) return { ok: false, reason: 'node' };
+  const added = model.applyOp({ type: 'add', node: { ...node, edges: [] } });
+  if (!added.ok) return { ok: false, reason: added.reason };
+  // Bind the already-created child tab to its node and register it in this
+  // window's live pool — the pool may immediately quiet the LRU in reply.
+  if (childTabId != null) {
+    tabIdByUuid.set(node.uuid, childTabId);
+    liveMap(runtime).set(node.uuid, { tabId: childTabId, lastUsedAt: at });
+    wireGraphNodeSync(childTabId, node.uuid);
+    void enforceLivePool(runtime).catch(() => {});
+  }
+  persistGraph();
+  broadcastGraph();
+  // A foreground branch is where the person is reading now — Blanc's
+  // showOpenedTab already displayed it; keep the shell's active marker in
+  // lockstep. A background (Cmd+Click) branch stays where it was.
+  if (info.disposition !== 'background-tab') {
+    runtime.spatialActiveUuid = node.uuid;
+    sendToSpatial(runtime, 'spatial:active:changed', { uuid: node.uuid });
+    resizeNodes(runtime);
+  }
+  return {
+    ok: true,
+    action: classified === 'via-auth' ? 'spawned-auth' : 'spawned',
+    uuid: node.uuid,
+  };
 }
 
 /** Renderer acked a transcoded 640×400 WebP data URL for one node. */
@@ -493,6 +731,7 @@ function registerGraphIpc() {
         const runtime = deps.rt();
         const result = model.applyOps(ops);
         if (result.ok) {
+          closeTabsForRemovedOps(ops);
           persistGraph();
           broadcastGraph();
           if (runtime) resizeNodes(runtime);
@@ -584,6 +823,8 @@ module.exports = {
   exitCanvasMode,
   openNode,
   closeNode,
+  handleSpatialBranch,
+  noteSpatialAudioActivity,
   adoptRestoredWindow,
   windowSpatialNodes,
   serializeGraph,

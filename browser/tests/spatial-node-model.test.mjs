@@ -198,8 +198,16 @@ test('session column round-trips through parseSessionNodes', () => {
   const tabIdByUuid = new Map([[uuid(1), 11], [uuid(2), 12]])
   const column = sessionNodesForTabIds(model, [11, 12, 13], tabIdByUuid)
   assert.equal(column.length, 3)
-  assert.deepEqual(column[0], { uuid: uuid(1), x: 0, y: 0, w: 260, h: 199, parentUuid: null, edges: [uuid(2)] })
-  assert.deepEqual(column[1], { uuid: uuid(2), x: 0, y: 0, w: 260, h: 199, parentUuid: uuid(1), edges: [] })
+  // The session-v3 record carries the link-branching provenance fields
+  // (branchKind/viaAuth/subPages/createdAt) beside the v1 geometry.
+  assert.deepEqual(column[0], {
+    uuid: uuid(1), x: 0, y: 0, w: 260, h: 199, parentUuid: null, edges: [uuid(2)],
+    branchKind: null, viaAuth: false, subPages: [], createdAt: 0,
+  })
+  assert.deepEqual(column[1], {
+    uuid: uuid(2), x: 0, y: 0, w: 260, h: 199, parentUuid: uuid(1), edges: [],
+    branchKind: null, viaAuth: false, subPages: [], createdAt: 0,
+  })
   assert.equal(column[2], null) // tab 13 maps to no spatial node
   // No spatial records at all → null, so the window keeps the v2 shape.
   assert.equal(sessionNodesForTabIds(model, [99], tabIdByUuid), null)

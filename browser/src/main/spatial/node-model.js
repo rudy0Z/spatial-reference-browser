@@ -205,7 +205,10 @@ function pickEvictionCandidate(live, model, { maxLive = MAX_LIVE_VIEWS } = {}) {
       if (!entry || !entry.uuid || entry.tabId == null || entry.isActive) return false;
       const node = model.nodes.get(entry.uuid);
       if (!node) return false;
-      return !node.pinned && !node.private && !node.isAudible;
+      // Audibility is a TAB property (tab.audible), surfaced on the ENTRY by
+      // the runtime — a graph node has no isAudible field, so reading it off
+      // the node always saw undefined and an audible tab was evictable.
+      return !node.pinned && !node.private && entry.isAudible !== true;
     })
     .sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
   if (!candidates.length) return null;
