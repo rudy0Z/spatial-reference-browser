@@ -84,6 +84,11 @@ function loadCreateTabView({ dark = false } = {}) {
     TAB_WEB_PREFERENCES: { preload: '/tab-preload.js', sandbox: true },
     getNormalBrowsingSession: (profileId) => ({ partition: `normal:${profileId}` }),
     getPrivateBrowsingSession: (profileId) => ({ partition: `private:${profileId}` }),
+    // §B.8.4 — the partition seam: createTabView consults the REAL pure
+    // policy module and a recording fromPartition (session objects are
+    // identity-compared in these asserts, so a plain marker object works).
+    resolveTabPartition: require('../../src/main/spatial/session-partitions').resolveTabPartition,
+    session: { fromPartition: (name) => ({ partition: name }) },
     mayBuildFreshView: require('../../src/main/document-policy').mayBuildFreshView,
   };
   vm.runInNewContext(`${createTabViewSource}\n${primeSource}\nthis.__fn = createTabView;`, sandbox);
@@ -118,6 +123,28 @@ test('createTabView puts a private tab on the private session', () => {
   createTabView({ private: true });
   assert.equal(calls[0].webPreferences.preload, '/tab-preload.js', 'base prefs still spread in');
   assert.deepEqual(calls[0].webPreferences.session, { partition: 'private:default' });
+});
+
+// §B.8.4 — the optional partition field routes the session.
+test('createTabView spawns a sandbox tab in the isolated temp:sandbox session', () => {
+  const { createTabView, calls } = loadCreateTabView();
+  const view = createTabView({ partition: 'sandbox' });
+  assert.ok(view, 'must return a view');
+  assert.deepEqual(calls[0].webPreferences.session, { partition: 'temp:sandbox' }, 'memory-only fromPartition the spec names');
+  // A persisted region partition resolves the same lane, marked persistent
+  // by the name itself.
+  createTabView({ partition: 'persist:region-ab12' });
+  assert.deepEqual(calls[1].webPreferences.session, { partition: 'persist:region-ab12' });
+  // An ordinary/default tab keeps the profile session path untouched.
+  createTabView({ partition: 'default' });
+  assert.deepEqual(calls[2].webPreferences.session, { partition: 'normal:default' });
+  // Privacy outranks the sandbox label: a private tab never shares the
+  // sandbox session, whose storage could co-mingle across its members.
+  createTabView({ partition: 'sandbox', private: true });
+  assert.deepEqual(calls[3].webPreferences.session, { partition: 'private:default' });
+  // A hostile partition value drops to null → the profile session path.
+  createTabView({ partition: 'persist:chrome' });
+  assert.deepEqual(calls[4].webPreferences.session, { partition: 'normal:default' });
 });
 
 test('createTabView tolerates being called before the tab record exists', () => {

@@ -202,8 +202,10 @@ export type GraphActions = {
   navigateActiveNode(url: string, title?: string, searchQuery?: string): void
   /** §5.1 Cmd/Ctrl+Click — spawns a live child satellite near its parent with a directional spawn edge. */
   spawnChildNode(parentUuid: NodeUuid, seed: { url: string; title: string; searchQuery?: string }): NodeUuid
-  /** §3 /new — fresh live tab near the active node, then activates it. */
-  createNewTab(init?: { title?: string; url?: string }): NodeUuid
+  /** §3 /new — fresh live tab near the active node, then activates it.
+   *  §B.8.4 — `partition: 'sandbox'` marks the node for the isolated
+   *  temp:sandbox session when the desktop build wakes its live view. */
+  createNewTab(init?: { title?: string; url?: string; partition?: 'default' | 'sandbox' }): NodeUuid
   /** §4.2 — wake a hibernated node to LIVE (pool enforcement applies). */
   wakeNode(uuid: NodeUuid): void
   /** Manual hibernate; returns false when blocked (node is recording — §5.3). */
@@ -1005,6 +1007,9 @@ export const useGraphStore = create<GraphStore>()(
             ramMb: ramMbFor(uuid),
             isAudible: false,
             isPinned: false,
+            // §B.8.4 — the /sandbox seam: only the sandbox label is ever
+            // user-selectable; main re-normalizes on the graph seam anyway.
+            partition: init?.partition === 'sandbox' ? 'sandbox' : undefined,
             isLoading: false,
             noCapture: false,
             ephemeral: false,

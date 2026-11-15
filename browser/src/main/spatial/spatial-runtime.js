@@ -43,6 +43,8 @@ const {
   nextAudioImmunity,
 } = require('./hibernation-state');
 const { createGraphIpc } = require('./graph-ipc');
+const { createShellBridge } = require('./shell-bridge');
+const { isSandboxPartition } = require('./session-partitions');
 
 // uuid → live tab id. Tab ids are process-local; entries for dead tabs are
 // pruned lazily and never persist (the session column carries uuids only).
@@ -61,6 +63,9 @@ const spatialPreloadPath = () => path.join(__dirname, 'spatial-preload.js');
 let deps = null;
 let model = null;
 let store = null;
+// §B.8 plumbing bridge (shortcuts / external handoff / downloads / find /
+// permission prompts). Created once in initSpatial; null until then.
+let shellBridge = null;
 
 /* ------------------------------------------------------------------ */
 /* State (per runtime, on runtime.* so window teardown needs no map)    */
@@ -239,7 +244,16 @@ async function enforceLivePool(runtime) {
 // page when it becomes a live view (the spatial host cannot serve
 // https://new-tab.spatial/local — it is an identity, not an address).
 const NEW_TAB_NODE_URL = 'https://new-tab.spatial/local';
-const urlForTab = (node) => (node.url === NEW_TAB_NODE_URL ? 'blanc://newtab' : node.url);
+// Same shape for the §B.8.4 sandbox node (/sandbox): an identity, not an
+// address. Its live view is an about:blank document INSIDE the isolated
+// 'temp:sandbox' session (see createTabView), where the user navigates or
+// drops a localhost URL — logged-out client testing with no persisted state.
+const SANDBOX_NODE_URL = 'https://sandbox.spatial/local';
+const urlForTab = (node) => {
+  if (node.url === NEW_TAB_NODE_URL) return 'blanc://newtab';
+  if (node.url === SANDBOX_NODE_URL && isSandboxPartition(node.partition)) return 'about:blank';
+  return node.url;
+};
 
 /**
  * Keep the graph node in lockstep with its tab's committed location and
@@ -292,7 +306,14 @@ function ensureLiveView(runtime, node) {
   }
   let tabId = null;
   try {
-    tabId = deps.createTab(urlForTab(node), { title: node.title || null });
+    // §B.8.4 — a sandbox node's live tab is born in the isolated, in-memory
+    // 'temp:sandbox' session (tab-view.js createTabView resolves the actual
+    // session.fromPartition). 'default'/null passes nothing: the profile
+    // session path applies.
+    tabId = deps.createTab(urlForTab(node), {
+      title: node.title || null,
+      partition: node.partition ?? undefined,
+    });
   } catch {
     return null;
   }
@@ -693,6 +714,7 @@ function adoptRestoredWindow(runtime, saved, restoredIds) {
       Object.assign(existing, {
         x: record.x, y: record.y, w: record.w, h: record.h,
         parentUuid: record.parentUuid, edges: record.edges,
+        partition: record.partition ?? existing.partition ?? null,
       });
     } else {
       const node = normalizeNode({
@@ -702,12 +724,15 @@ function adoptRestoredWindow(runtime, saved, restoredIds) {
         x: record.x, y: record.y, w: record.w, h: record.h,
         parentUuid: record.parentUuid,
         edges: record.edges,
+        partition: record.partition,
       });
       if (node) model.nodes.set(node.uuid, node);
     }
     if (tabId != null) tabIdByUuid.set(record.uuid, tabId);
     // Restored tabs are born asleep (lazy restore): they wake on openNode.
     if (tabId != null) liveMap(runtime).set(record.uuid, { tabId, lastUsedAt: 0 });
+    // §B.8.4 — the session partition label rides the spatialNodes column;
+    // a restored sandbox node still wakes inside 'temp:sandbox'.
   });
   // Re-parent edges whose parents were dropped from the saved column.
   for (const node of model.nodes.values()) {
@@ -808,13 +833,39 @@ function initSpatial(injected) {
   for (const node of model.nodes.values()) node.lastActiveAt = node.lastActiveAt ?? 0;
   ensureFirstRunSeed();
   registerGraphIpc();
+  // §B.8 plumbing bridge: shell shortcuts, external-app handoff toasts,
+  // download progress, the matte find bar and permission prompts — all on
+  // the same trust-gated registrars the graph seam uses.
+  shellBridge = createShellBridge({
+    chromeHandle: deps.chromeHandle,
+    chromeOn: deps.chromeOn,
+    allRuntimes: deps.allRuntimes,
+    openExternal: deps.shell?.openExternal ?? (async () => {}),
+    effects: deps.shell?.effects ?? {},
+  });
+  shellBridge.register();
+}
+
+/** The §B.8 bridge, or null before initSpatial ran (pure test harnesses). */
+function spatialShellBridge() {
+  return shellBridge;
+}
+
+/** Push a sanitized downloads snapshot to every spatial shell (§B.8.5).
+ *  Fire-and-forget: called from main's broadcastDownloadsActivity, which is
+ *  already throttled by downloads.js's own 250 ms coalescer. */
+function broadcastSpatialDownloads() {
+  try { shellBridge?.broadcastDownloads(); } catch { /* a dying window is not fatal */ }
 }
 
 module.exports = {
   CHROME_SPATIAL_URL,
+  SANDBOX_NODE_URL,
   spatialChromeEnabled,
   spatialPreloadPath,
   initSpatial,
+  spatialShellBridge,
+  broadcastSpatialDownloads,
   resizeNodes,
   onOverlayChanged,
   engageZOrderGuard,

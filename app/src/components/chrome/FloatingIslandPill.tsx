@@ -503,7 +503,7 @@ function runSlashCommand(
     toggleCanvas: () => void
     quickNoteOnActive: () => unknown
     parkSessionToArchive: () => number
-    createNewTab: (init?: { title?: string; url?: string }) => string
+    createNewTab: (init?: { title?: string; url?: string; partition?: 'default' | 'sandbox' }) => string
     createClusterFromActive: () => unknown
   },
 ) {
@@ -526,9 +526,11 @@ function runSlashCommand(
       actions.createClusterFromActive()
       break
     case 'sandbox':
-      // §B.8.4 seam — the desktop build spawns into the isolated
-      // 'temp:sandbox' session partition; the shell spawns an honest tab.
-      actions.createNewTab({ title: 'Sandbox', url: 'https://sandbox.spatial/local' })
+      // §B.8.4 seam — the node carries partition:'sandbox'; the desktop
+      // build wakes its live view inside the isolated 'temp:sandbox'
+      // session (memory-only, logged-out). The prototype spawns an honest
+      // local tab.
+      actions.createNewTab({ title: 'Sandbox', url: 'https://sandbox.spatial/local', partition: 'sandbox' })
       actions.setPaletteOpen(false)
       break
     case 'mods':

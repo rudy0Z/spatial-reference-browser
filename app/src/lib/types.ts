@@ -128,6 +128,14 @@ export type SpatialTabNodeRecord = {
   ephemeral: boolean
   /** §7.2 — navigation chains <3s or oauth/payment domains collapsed into ONE node. */
   viaAuth: boolean
+  /**
+   * §B.8.4 — optional session partition for the node's live view:
+   * `'sandbox'` spawns its tab in the isolated in-memory `temp:sandbox`
+   * session (logged-out client testing). Absent/`'default'` = the ordinary
+   * profile session. Main's session-partitions.js owns the policy; the
+   * shell only records what the user asked for.
+   */
+  partition?: 'default' | 'sandbox'
   /** §7.1 — subtle search-query pill tag on hub destination nodes. */
   searchQuery: string | null
   /** §7.3 — in-domain pushState trail rendered as an expandable filmstrip. */

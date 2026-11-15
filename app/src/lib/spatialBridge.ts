@@ -35,6 +35,8 @@ export type SpatialNodeRecord = {
   mode: 'reading' | 'canvas'
   pinned: boolean
   private: boolean
+  /** §B.8.4 — optional session partition ('sandbox' → temp:sandbox). */
+  partition?: 'default' | 'sandbox' | string | null
   thumb: string | null
   lastActiveAt: number
 }
@@ -64,6 +66,49 @@ type SpatialAPI = {
   onThumbCapture: (
     cb: (payload: { uuid: string; png: Uint8Array; width: number; height: number }) => void,
   ) => () => void
+  // §B.8 plumbing — arbitrated shell shortcuts, external handoff toasts,
+  // download progress/⌘J surface, matte find bar, permission prompts.
+  onShellShortcut: (cb: (payload: { action: string; tabId: number | null }) => void) => () => void
+  onExternalConfirm: (
+    cb: (payload: { requestId: string; url: string; origin: string | null }) => void,
+  ) => () => void
+  externalRespond: (requestId: string, allow: boolean) => Promise<{ ok: boolean; opened?: boolean }>
+  onDownloadsUpdated: (
+    cb: (payload: {
+      items: Array<{
+        id: string | null
+        url: string
+        filename: string
+        state: string
+        receivedBytes: number
+        totalBytes: number
+        startedAt: number
+        finishedAt: number
+        private: boolean
+        inFlight: boolean
+      }>
+      activity: { active: number; hasRecent: boolean; receivedBytes: number; totalBytes: number }
+    }) => void,
+  ) => () => void
+  downloadsList: () => Promise<{ ok: boolean; items?: unknown[]; activity?: unknown }>
+  downloadsAction: (
+    id: string,
+    action: 'cancel' | 'resume' | 'retry' | 'open' | 'show' | 'clear',
+  ) => Promise<{ ok: boolean }>
+  findControl: (
+    action: 'start' | 'next' | 'prev' | 'stop',
+    query?: string,
+  ) => Promise<{ ok: boolean; error?: string }>
+  onFindResult: (cb: (payload: { matches: number; activeMatchOrdinal: number }) => void) => () => void
+  onPermissionRequest: (
+    cb: (payload: {
+      id: number
+      origin: string | null
+      permission: string | null
+      mediaTypes: string[]
+    }) => void,
+  ) => () => void
+  permissionRespond: (id: number, allow: boolean) => void
 }
 
 declare global {
@@ -104,6 +149,8 @@ function makeStoreRecord(main: SpatialNodeRecord, now: number): SpatialTabNodeRe
     noCapture: main.private,
     ephemeral: false,
     viaAuth: false,
+    // §B.8.4 — sandbox nodes keep their session label through hydration.
+    partition: main.partition === 'sandbox' ? 'sandbox' : undefined,
     searchQuery: null,
     subPages: [],
     excerpt: null,
@@ -176,6 +223,9 @@ function pushDiff() {
           edges: [],
           pinned: node.isPinned,
           private: node.noCapture,
+          // §B.8.4 — the sandbox label rides the add op; main's
+          // normalizeNode drops anything it does not recognize.
+          partition: node.partition === 'sandbox' ? 'sandbox' : undefined,
         },
       })
       lastSyncedPositions.set(node.uuid, { x: Math.round(node.x), y: Math.round(node.y) })

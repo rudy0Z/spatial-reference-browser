@@ -51,15 +51,19 @@ import { ArrowLeftRight } from 'lucide-react'
 
 import BrowserTopBar from './components/chrome/BrowserTopBar'
 import ExtensionsDrawer from './components/chrome/ExtensionsDrawer'
+import ExternalHandoffToast from './components/chrome/ExternalHandoffToast'
+import FindBar from './components/chrome/FindBar'
 import FloatingIslandPill from './components/chrome/FloatingIslandPill'
 import NeighbourhoodGlance from './components/chrome/NeighbourhoodGlance'
+import PermissionPrompt from './components/chrome/PermissionPrompt'
 import ShortcutsSheet from './components/chrome/ShortcutsSheet'
 import ToastStack from './components/chrome/ToastStack'
+import DownloadsPanel, { noteDownloadToasts, type DownloadItem } from './components/chrome/DownloadsSurface'
 import ZenRail, { ZEN_RAIL_WIDTH } from './components/chrome/ZenRail'
 import SpatialCanvas from './components/canvas/SpatialCanvas'
 import MockWebReader from './components/viewport/MockWebReader'
 import { DEFAULT_PERFORMANCE_GUARDRAIL } from './lib/livePool'
-import { initSpatialBridge, spatialEnabled } from './lib/spatialBridge'
+import { initSpatialBridge, spatialApi, spatialEnabled } from './lib/spatialBridge'
 import { useGraphStore } from './store/useGraphStore'
 import type { GraphStore } from './store/useGraphStore'
 import { useToastStore } from './store/useToastStore'
@@ -237,6 +241,10 @@ function App() {
   /* --- overlays (top-bar buttons + ⌘/Ctrl+/ + layered Esc) --- */
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [extensionsOpen, setExtensionsOpen] = useState(false)
+  /* --- §B.8.1/§B.8.5 — matte find bar (⌘/Ctrl+F) + downloads (⌘/Ctrl+J) ---
+   * Declared here: the z-order guard effect below needs them. */
+  const [findOpen, setFindOpen] = useState(false)
+  const [downloadsOpen, setDownloadsOpen] = useState(false)
 
   /* --- Spatial shell bridge (real browser only; no-op under vite dev) ---
    * Phase 3: when this document runs as blanc-chrome://spatial/, main owns
@@ -254,9 +262,79 @@ function App() {
   useEffect(() => {
     spatialHandleRef.current?.setShellOverlaysOpen(shortcutsOpen || extensionsOpen)
   }, [shortcutsOpen, extensionsOpen])
+  /** §B.8 z-order honesty — plumbing surfaces that must paint OVER a live
+   *  view (⌘J panel, permission card, external-handoff toast) count as shell
+   *  overlays: main captures + hides the view so DOM can show above it. The
+   *  find bar deliberately does NOT: it docks inside the 48px top-bar band,
+   *  which no native view ever covers, so find highlights stay visible. */
+  const [promptVisible, setPromptVisible] = useState(false)
+  const [handoffVisible, setHandoffVisible] = useState(false)
+  const setPromptVisibleCb = useCallback((visible: boolean) => setPromptVisible(visible), [])
+  const setHandoffVisibleCb = useCallback((visible: boolean) => setHandoffVisible(visible), [])
+  useEffect(() => {
+    spatialHandleRef.current?.setShellOverlaysOpen(
+      shortcutsOpen || extensionsOpen || downloadsOpen || promptVisible || handoffVisible,
+    )
+  }, [shortcutsOpen, extensionsOpen, downloadsOpen, promptVisible, handoffVisible])
   useEffect(() => {
     spatialHandleRef.current?.setRailWidth(railOpen ? ZEN_RAIL_WIDTH : 0)
   }, [railOpen])
+
+  /* --- §B.8.1 — arbitrated shell shortcuts (page views only) ---
+   * When a live WebContentsView holds focus, main's arbitration consumes the
+   * shell accelerators and delivers them here; the shell document's own
+   * keydown handler below covers the same actions when the chrome itself is
+   * focused. One action = one owner per surface. */
+  /** Download toast state (§B.8.5): id → last seen state, so each download
+   *  toasts once per transition, not once per progress push. */
+  const downloadToastStatesRef = useRef<Map<string, string>>(new Map())
+
+  const dismissShellLayers = useCallback(() => {
+    const store = useGraphStore.getState()
+    if (shortcutsOpen) setShortcutsOpen(false)
+    else if (extensionsOpen) setExtensionsOpen(false)
+    else if (downloadsOpen) setDownloadsOpen(false)
+    else if (store.paletteOpen) store.setPaletteOpen(false)
+    else if (store.glanceOpen) store.setGlanceOpen(false)
+    else if (findOpen) setFindOpen(false)
+    else {
+      const strongestGhost = Object.values(store.nodes)
+        .filter((node) => node.nodeType === 'ghost-echo' && node.ghostTetherUuid === store.activeNodeUuid)
+        .sort((a, b) => (b.ghostMatch ?? 0) - (a.ghostMatch ?? 0))[0]
+      if (strongestGhost) {
+        store.dismissGhostEcho(strongestGhost.uuid)
+        return
+      }
+      if (store.viewMode === 'canvas') store.setViewMode('reading')
+    }
+  }, [shortcutsOpen, extensionsOpen, downloadsOpen, findOpen])
+
+  useEffect(() => {
+    if (!spatialApi || !spatialEnabled) return
+    const offShortcut = spatialApi.onShellShortcut(({ action }) => {
+      const store = useGraphStore.getState()
+      switch (action) {
+        case 'canvas': store.toggleCanvas(); break
+        case 'palette': store.togglePalette(); break
+        case 'rail': setRailOpen((open) => !open); break
+        case 'glance': store.toggleGlance(); break
+        case 'shortcuts': setShortcutsOpen((open) => !open); break
+        case 'quick-note': store.quickNoteOnActive(); break
+        case 'find': setFindOpen(true); break
+        case 'downloads': setDownloadsOpen((open) => !open); break
+        case 'escape': dismissShellLayers(); break
+        default: break
+      }
+    })
+    const offDownloads = spatialApi.onDownloadsUpdated((payload) => {
+      const next = noteDownloadToasts(payload.items as DownloadItem[], downloadToastStatesRef.current)
+      downloadToastStatesRef.current = next
+    })
+    return () => {
+      offShortcut()
+      offDownloads()
+    }
+  }, [spatialEnabled, dismissShellLayers])
 
   /* --- Split View (two reader panes, 1px divider) --- */
   const [splitOpen, setSplitOpen] = useState(false)
@@ -428,6 +506,20 @@ function App() {
         return
       }
 
+      // §B.8.1/§B.8.5 — matte find bar + downloads surface. When a live page
+      // holds focus these arrive through the arbitration lane instead; the
+      // chrome document covers its own focus context here.
+      if (mod && !event.shiftKey && !event.altKey && key === 'f') {
+        event.preventDefault()
+        setFindOpen(true)
+        return
+      }
+      if (mod && !event.shiftKey && !event.altKey && key === 'j') {
+        event.preventDefault()
+        setDownloadsOpen((open) => !open)
+        return
+      }
+
       // §10 — Alt+N: quick sticky note on the active node.
       if (event.altKey && !mod && !event.shiftKey && key === 'n') {
         event.preventDefault()
@@ -450,6 +542,17 @@ function App() {
         }
         if (extensionsOpen) {
           setExtensionsOpen(false)
+          return
+        }
+        // §B.8 — the find bar and downloads surface sit in the same layer
+        // order (both close before the store-owned overlays).
+        if (findOpen) {
+          void spatialApi?.findControl('stop')
+          setFindOpen(false)
+          return
+        }
+        if (downloadsOpen) {
+          setDownloadsOpen(false)
           return
         }
         if (store.paletteOpen) {
@@ -475,7 +578,7 @@ function App() {
 
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [shortcutsOpen, extensionsOpen])
+  }, [shortcutsOpen, extensionsOpen, findOpen, downloadsOpen])
 
   /* --- Mode B takeover closes reading-only overlays so they never
          re-appear stale when returning to the viewport --- */
@@ -483,6 +586,8 @@ function App() {
     if (viewMode === 'canvas') {
       setShortcutsOpen(false)
       setExtensionsOpen(false)
+      setFindOpen(false)
+      setDownloadsOpen(false)
     }
   }, [viewMode])
 
@@ -628,6 +733,16 @@ function App() {
       {/* toasts sit clear of the rail when it is open (its fixed left-3 default
           is overridden via twMerge in ToastStack) */}
       <ToastStack className={railOpen ? 'left-[236px]' : 'left-3'} />
+
+      {/* ---- §B.8 plumbing surfaces (real browser shell only) ---- */}
+      {spatialEnabled ? (
+        <>
+          <FindBar open={findOpen} onClose={() => setFindOpen(false)} />
+          <DownloadsPanel open={downloadsOpen} onClose={() => setDownloadsOpen(false)} />
+          <PermissionPrompt onVisible={setPromptVisibleCb} />
+          <ExternalHandoffToast onVisible={setHandoffVisibleCb} />
+        </>
+      ) : null}
     </div>
   )
 }

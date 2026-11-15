@@ -33,6 +33,10 @@ const { isVisiblePaneId, foregroundOpenRole } = require('./glance-focus');
 const { primeLoadingBackground } = require('./tab-loading-background');
 const { mayBuildFreshView, inertViewMayShow, inertPageUrl } = require('./document-policy');
 const { persistableUrl } = require('./session-snapshot');
+// §B.8 plumbing gates (pure policies — no Electron, no cycles):
+const { matchShellShortcut } = require('./spatial/focus-arbitration');
+const { classifyExternalScheme } = require('./spatial/scheme-classifier');
+const { resolveTabPartition } = require('./spatial/session-partitions');
 
 let deps = null;
 let mouseGestureSettings = null;
@@ -97,9 +101,18 @@ const liveContents = (tab) => liveViewContents(tab?.view);
 function createTabView(tab) {
   if (!mayBuildFreshView(tab)) return null;
   const profileId = tab?.profileId ?? 'default';
-  const browsingSession = tab?.private
-    ? getPrivateBrowsingSession(profileId)
-    : getNormalBrowsingSession(profileId);
+  // §B.8.4 — an optional node/tab `partition` field selects an isolated
+  // session: 'sandbox' → the in-memory `session.fromPartition('temp:sandbox')`
+  // the spec names (Electron memoizes partitions per name, so repeated calls
+  // return the one session). A private tab's own memory-only session wins
+  // (resolveTabPartition returns null for it). Everything else keeps the
+  // profile session path.
+  const partitionDecision = resolveTabPartition(tab?.partition, tab);
+  const browsingSession = partitionDecision
+    ? session.fromPartition(partitionDecision.partition)
+    : tab?.private
+      ? getPrivateBrowsingSession(profileId)
+      : getNormalBrowsingSession(profileId);
   const view = new WebContentsView({
     webPreferences: { ...TAB_WEB_PREFERENCES, session: browsingSession },
   });
@@ -211,9 +224,43 @@ function wireTabView(tab, view, { owner, adopted }) {
   const preWired = new Map(wc.eventNames().map((n) => [n, new Set(wc.listeners(n))]));
   const getOwner = () => windowRuntimes.runtimeForTab(id) ?? owner;
   installChromeShortcuts(wc, getOwner);
+  /** §B.8.2 — the Spatial lane for external-app schemes (figma://, vscode://,
+   *  cursor://, mailto:, discord://, spotify://, slack://). Returns true when
+   *  the navigation was consumed and must be prevented: the shell gets a
+   *  confirmation toast, and only a confirm launches shell.openExternal —
+   *  never a broken blank node. Unknown schemes return false and keep
+   *  Blanc's generic external-protocol consent path. */
+  const spatialExternalHandoff = (targetUrl) => {
+    if (!getOwner().spatialChrome) return false;
+    if (classifyExternalScheme(targetUrl).action !== 'handoff') return false;
+    return deps.requestSpatialExternalConfirm?.(getOwner(), { url: targetUrl, source: wc.getURL() }) === true;
+  };
   // Workspace residency can transfer a live view without navigation. Resolve
   // its current owner for each event, including shortcuts and popup policy.
   const boundToTab = (fn) => bindWindowRuntime(getOwner, fn);
+  // §B.8.1 — keyboard focus arbitration. When a live page holds focus the
+  // blanc-chrome:// shell document never sees the keyboard; this listener on
+  // EVERY view consumes the shell's accelerators (focus-arbitration.js) and
+  // forwards them to the shell document before the page — or Blanc's own
+  // strip-chrome shortcut set, whose shell-owned commands main gates off on
+  // spatial runtimes — can act. Builder-ergonomic actions (§B.8.3) run in
+  // MAIN on the pressed pane instead of being forwarded. The strip chrome
+  // (SPATIAL_CHROME=0) keeps every legacy behavior untouched.
+  wc.on('before-input-event', boundToTab((event, input) => {
+    const matched = matchShellShortcut(input);
+    if (!matched) return;
+    const ownerRuntime = getOwner();
+    if (!ownerRuntime.spatialChrome) return;
+    // Chromium's own Escape first leaves HTML fullscreen; the shell's
+    // layered dismissal must not fight it.
+    if (matched.action === 'escape' && wc.isFullScreen()) return;
+    event.preventDefault();
+    if (matched.scope === 'main') {
+      deps.onSpatialMainShortcut?.(ownerRuntime, matched.action, { tabId: id, wc });
+      return;
+    }
+    deps.forwardSpatialShellShortcut?.(ownerRuntime, matched.action, { tabId: id });
+  }));
   /** Show an inert tab's explanation page again, keeping its real address. */
   const restoreInertPage = () => {
     const back = inertPageUrl(persistableUrl(tab.url), tab.title);
@@ -514,6 +561,14 @@ function wireTabView(tab, view, { owner, adopted }) {
     }
     if (/^chrome-extension:/i.test(targetUrl) && !wc.getURL().startsWith('chrome-extension://')) { event.preventDefault(); return; }
     if (getOwner().resident && !/^https?:/i.test(targetUrl)) { event.preventDefault(); return; }
+    // §B.8.2 — a top-level page-initiated app-scheme navigation confirms
+    // through the shell toast on spatial windows (frame-level navigations
+    // and redirects take the same lane via installExternalNavigationHandlers
+    // above; the bridge dedupes the two deliveries).
+    if (spatialExternalHandoff(targetUrl)) {
+      event.preventDefault();
+      return;
+    }
     if (isForbiddenTopLevelUrl(targetUrl)) {
       event.preventDefault();
       return;
@@ -665,6 +720,15 @@ function wireTabView(tab, view, { owner, adopted }) {
   }));
   wc.on('found-in-page', boundToTab((_e, result) => {
     if (tab.sleeping || tab.view?.webContents !== wc) return;
+    // §B.8.1 — the spatial shell's matte find bar lives in the chrome
+    // document: forward every match count to its window regardless of which
+    // pane searched (main routes start/stop; the shell renders).
+    if (getOwner().spatialChrome) {
+      deps.spatialFindResult?.(getOwner(), {
+        activeMatchOrdinal: result.activeMatchOrdinal,
+        matches: result.matches,
+      });
+    }
     if (deps.isFindTarget?.(getOwner(), id) ?? id === getOwner().activeTabId) {
       getOwner().overlayView?.webContents.send('chrome:find-result', {
         activeMatchOrdinal: result.activeMatchOrdinal,
@@ -686,7 +750,12 @@ function wireTabView(tab, view, { owner, adopted }) {
   // requests (OAuth/SSO and payments) keep a real BrowserWindow so their
   // opener survives. Both paths preserve opener relationships.
   const applyWindowOpenPolicy = (targetWc) => {
-    installExternalNavigationHandlers(targetWc, boundToTab(handOffToOs),
+    // §B.8.2 — frame-level navigations route through the same spatial-aware
+    // wrapper: a classified app scheme gets the shell toast, everything else
+    // Blanc's native consent dialog.
+    installExternalNavigationHandlers(targetWc, boundToTab((url, opts) => (
+      spatialExternalHandoff(url) || handOffToOs(url, opts)
+    )),
       (url, source, event) => deps.allowManagedExtensionNavigation?.(tab, targetWc, url, source, event) === true);
     targetWc.setWindowOpenHandler(boundToTab(({ url: targetUrl, disposition, referrer, postBody }) => {
       if (getOwner().resident) return { action: 'deny' };
@@ -698,7 +767,9 @@ function wireTabView(tab, view, { owner, adopted }) {
       if (/^blanc:/i.test(targetUrl) && !targetWc.getURL().startsWith('blanc://')) return { action: 'deny' };
       const source = targetWc.getURL();
       const managedExtension = /^chrome-extension:/i.test(targetUrl) && deps.allowManagedExtensionNavigation?.(tab, targetWc, targetUrl, source, { isMainFrame: true }) === true;
-      if (!managedExtension && handOffToOs(targetUrl, { source })) return { action: 'deny' };
+      // §B.8.2 — an app-scheme popup/link confirms through the shell toast
+      // and is denied in-browser; no blank child node can exist.
+      if (!managedExtension && (spatialExternalHandoff(targetUrl) || handOffToOs(targetUrl, { source }))) return { action: 'deny' };
       // A link rule may send a link the person opened in a new tab to another
       // profile or Space (#1199). Popups ('new-window', opener intact), form
       // posts and anything a page opened on its own stay (routeInAppLink).
@@ -795,13 +866,14 @@ function wireTabView(tab, view, { owner, adopted }) {
     readerAction: () => deps.readerAction?.(tab),
     extensionItems: (params) => deps.extensionContextItems?.(tab, params) ?? [],
     openBackgroundTab: boundToTab((targetUrl) => {
-      if (handOffToOs(targetUrl)) return;
+      // §B.8.2 — app schemes confirm through the shell toast, never a node.
+      if (spatialExternalHandoff(targetUrl) || handOffToOs(targetUrl)) return;
       if (isForbiddenTopLevelUrl(targetUrl)) return;
       if (deps.routeInAppLink?.(tab, null, targetUrl, 'background-tab', { fromMenu: true })) return;
       createTab(targetUrl, { private: tab.private });
     }),
     openTab: boundToTab((targetUrl) => {
-      if (handOffToOs(targetUrl)) return;
+      if (spatialExternalHandoff(targetUrl) || handOffToOs(targetUrl)) return;
       if (isForbiddenTopLevelUrl(targetUrl)) return;
       if (deps.routeInAppLink?.(tab, null, targetUrl, 'foreground-tab', { fromMenu: true })) return;
       const role = foregroundOpenRole(getOwner(), tab.id);

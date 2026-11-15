@@ -10,6 +10,7 @@
 
 const { MODE_B_THUMB } = require('./canvas-layout');
 const { MAX_SUB_PAGES } = require('./branch-policy');
+const { normalizePartitionField } = require('./session-partitions');
 
 // Mode A warm pool (spec: ≤ 6 live WebContentsViews): the active node plus
 // LIVE_POOL_LIMIT background nodes, LRU-auto-quieted through Blanc's own
@@ -53,6 +54,11 @@ function normalizeNode(input) {
     mode: input.mode === 'canvas' ? 'canvas' : 'reading',
     pinned: input.pinned === true,
     private: input.private === true,
+    // §B.8.4 — optional session partition ('default' | 'sandbox' |
+    // 'persist:region-<id>'). Unknown values drop to null: the live view then
+    // uses the profile's ordinary session. session-partitions.js owns the
+    // policy; the model only normalizes what it persists.
+    partition: normalizePartitionField(input.partition),
     // Link branching (branch-policy.js): how this node came into being, and
     // whether it stands for a collapsed OAuth/SSO/payment chain.
     branchKind: input.branchKind === 'link' || input.branchKind === 'auth' ? input.branchKind : null,
@@ -263,6 +269,9 @@ function sessionNodesForTabIds(model, tabIds, tabIdByUuid) {
             edges: [...node.edges],
             branchKind: node.branchKind,
             viaAuth: node.viaAuth,
+            // §B.8.4 — the sandbox label survives session capture/restore,
+            // else a sandbox node resurrects as an ordinary dead https tab.
+            partition: normalizePartitionField(node.partition),
             subPages: [...node.subPages],
             createdAt: node.createdAt,
           };
@@ -293,6 +302,7 @@ function parseSessionNodes(column) {
       edges: Array.isArray(record.edges) ? record.edges.filter(isUuid) : [],
       branchKind: record.branchKind === 'link' || record.branchKind === 'auth' ? record.branchKind : null,
       viaAuth: record.viaAuth === true,
+      partition: normalizePartitionField(record.partition),
       subPages: (Array.isArray(record.subPages) ? record.subPages : [])
         .filter((page) => page && typeof page.url === 'string' && page.url.length <= 4096)
         .slice(-MAX_SUB_PAGES)

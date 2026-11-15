@@ -128,6 +128,8 @@ const {
   setupChromeProtocol,
 } = require('./chrome-protocol');
 const spatialRuntime = require('./spatial/spatial-runtime');
+// §B.8.4 — partition-field normalization for tab records (pure policy).
+const spatialPartitions = require('./spatial/session-partitions');
 const { tooltipRequest, tooltipBounds } = require('./tooltip-geometry');
 const { evaluateAdmission, evaluateDocumentVisible, isVisiblePane } = require('./display-capture-admission');
 const { parseDisplayMediaOptions } = require('./display-capture-constraints');
@@ -202,6 +204,13 @@ const {
   downloadsActivity,
   acknowledgeDownloads,
   discardProfileDownloads,
+  listDownloads,
+  cancelDownload,
+  resumeDownload,
+  retryDownload,
+  openDownload,
+  showDownloadInFolder,
+  clearFinishedDownloads,
 } = require('./downloads');
 const { attachAddressMenu } = require('./address-menu');
 const { installDockMenu } = require('./dock-menu');
@@ -7321,6 +7330,9 @@ function broadcastDownloadsActivity() {
   forEachWindowRuntime(() => {
     stripSurfaces(rt()).send('chrome:downloads', downloadsActivity());
   }, { liveOnly: true });
+  // §B.8.5 — spatial shells render their own downloads surface (⌘J +
+  // progress toasts); downloads.js's 250 ms coalescer already throttles us.
+  spatialRuntime.broadcastSpatialDownloads();
 }
 
 // The blocked-request counter can tick many times a second during a page
@@ -7716,10 +7728,30 @@ const executeBrowserCommand = createBrowserCommandExecutor({
   'next-tab-in-order': () => cycleTab(1),
   'previous-tab-in-order': () => cycleTab(-1),
   'copy-link': copyBrowserCommandLink,
-  address: toggleIsland,
-  find: (runtime, sender) => openFindBar(browserCommandTab(runtime, sender)?.id),
+  // §B.8.1/§B.8.3/§B.8.5 — on spatial windows the shell document owns the
+  // palette, the find bar, downloads and hard reload: tab-view.js's
+  // arbitration has already consumed the key and forwarded it, so the strip
+  // chrome's counterpart must NOT also fire here (one key, one owner).
+  address: (runtime) => {
+    if (runtime.spatialChrome) return false;
+    toggleIsland();
+  },
+  find: (runtime, sender) => {
+    if (runtime.spatialChrome) return false;
+    return openFindBar(browserCommandTab(runtime, sender)?.id);
+  },
+  downloads: (runtime) => {
+    if (runtime.spatialChrome) return false;
+    openInternalPage('blanc://downloads/');
+  },
   reload: (runtime, sender) => reloadBrowserCommandTab(runtime, false, sender),
-  'hard-reload': (runtime, sender) => reloadBrowserCommandTab(runtime, true, sender),
+  'hard-reload': (runtime, sender) => {
+    // §B.8.3 — spatial windows take hard reload through the arbitration
+    // path (reload-ignore-cache → reloadIgnoringCache on the pressed pane)
+    // so the strip's own reload bookkeeping never double-fires.
+    if (runtime.spatialChrome) return false;
+    return reloadBrowserCommandTab(runtime, true, sender);
+  },
   back: (runtime, sender) => {
     const tab = browserCommandTab(runtime, sender);
     if (readerMode.exit(tab)) return;
@@ -9464,6 +9496,30 @@ initTabView({
   syncFocusedPane,
   setGlanceTab,
   isFindTarget: (owner, tabId) => findTargetTabId(owner) === tabId,
+  // §B.8.1 — keyboard focus arbitration lanes (optional deps; the strip
+  // chrome ignores them because every consumer gates on spatialChrome).
+  forwardSpatialShellShortcut: (runtime, action, info) => {
+    if (runtime?.spatialChrome) spatialRuntime.spatialShellBridge()?.sendShellShortcut(runtime, action, info);
+  },
+  // §B.8.3 — builder ergonomics executed in MAIN on the pressed pane.
+  onSpatialMainShortcut: (runtime, action, { wc } = {}) => {
+    if (!runtime?.spatialChrome || !wc || wc.isDestroyed()) return false;
+    try {
+      if (action === 'reload-ignore-cache') wc.reloadIgnoringCache();
+      else if (action === 'toggle-devtools') wc.toggleDevTools();
+      else return false;
+    } catch { return false; }
+    return true;
+  },
+  // §B.8.2 — app-scheme handoff confirmation through the shell toast.
+  requestSpatialExternalConfirm: (runtime, { url, source } = {}) => {
+    if (!runtime?.spatialChrome) return false;
+    return spatialRuntime.spatialShellBridge()?.requestExternalConfirm(runtime, { url, source }) === true;
+  },
+  // §B.8.1 — matte find bar match counts.
+  spatialFindResult: (runtime, result) => {
+    if (runtime?.spatialChrome) spatialRuntime.spatialShellBridge()?.sendFindResult(runtime, result);
+  },
   dispatchMouseGesture(owner, tab, action) {
     if (!owner || owner.closing || !isVisiblePaneId(owner, tab.id) || liveContents(tab) == null) return;
     const wc = liveContents(tab);
@@ -9546,7 +9602,7 @@ initTabView({
   },
 });
 
-function createTab(url = newTabUrl(), { private: isPrivate = false, groupId = null, view = null, pinned = false, muted = false, restoreHistory = null, openerTabId = null, openedInBackground = false, asleep = false, title = null, favicon = null, customTitle = null, pinnedHomeUrl = null, lastViewedAt = null, adoptView = null, allowLocalFile = false, inheritsDocumentPolicy = false, httpReferrer = null, managedExtension = false } = {}) {
+function createTab(url = newTabUrl(), { private: isPrivate = false, groupId = null, view = null, pinned = false, muted = false, restoreHistory = null, openerTabId = null, openedInBackground = false, asleep = false, title = null, favicon = null, customTitle = null, pinnedHomeUrl = null, lastViewedAt = null, adoptView = null, allowLocalFile = false, inheritsDocumentPolicy = false, httpReferrer = null, managedExtension = false, partition = null } = {}) {
   if (/^chrome-extension:/i.test(url) && (isPrivate || !managedExtension)) return null;
   // Official builds load a granted local HTML file; a DRM build keeps a
   // granted local-file record as an inert placeholder (src/main/inert-local-file.js).
@@ -9604,6 +9660,9 @@ function createTab(url = newTabUrl(), { private: isPrivate = false, groupId = nu
   if (!bornQuiet) view ??= createTabView({
     private: isPrivate,
     profileId: owner.profileId,
+    // §B.8.4 — optional session partition ('sandbox' → temp:sandbox); null
+    // keeps the profile session path. session-partitions.js normalizes.
+    partition: spatialPartitions.normalizePartitionField(partition),
   });
 
   const tab = {
@@ -9630,6 +9689,10 @@ function createTab(url = newTabUrl(), { private: isPrivate = false, groupId = nu
     inertLocalFileTitle: localPlan.inertLocalFileUrl && typeof title === 'string' ? title : null,
     // Main-owned tool lifetime survives its temporary error URL during uBO reload.
     managedExtension: managedExtension === true && !isPrivate,
+    // §B.8.4 — the tab's session partition ('default' | 'sandbox' | a
+    // validated persist:region-<id>, else null). Sticky for the record's
+    // life: a rebuilt view (discard → wake) re-resolves the SAME session.
+    partition: spatialPartitions.normalizePartitionField(partition),
     // Never from tabs:create IPC. Sticky: no navigation or move clears it.
     inheritsDocumentPolicy: marked,
     // Never shows its own page again; see wakeTab.
@@ -11809,6 +11872,55 @@ async function runAllowAdsCommand() {
   return hostname;
 }
 
+/* ------------------------------------------------------------------ */
+/* §B.8 plumbing — Spatial shell lanes (find bar, permission prompts)   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * §B.8.1 find lane — matte find bar control from the shell document, bound
+ * to the SENDING runtime by chromeHandle's withWindowRuntime. The active
+ * pane's presentation contents is the search target; repeats use the query
+ * main recorded at start, so a forged 'next' can never search stale text.
+ */
+function spatialFindControl({ action, query }) {
+  const runtime = rt();
+  if (!runtime?.spatialChrome) return { ok: false, error: 'no-spatial' };
+  const tab = tabs.get(runtime.activeTabId);
+  const wc = tab ? presentationContents(tab) : null;
+  if (!wc || wc.isDestroyed()) return { ok: false, error: 'no-pane' };
+  try {
+    if (action === 'start') {
+      runtime.spatialFindQuery = query;
+      wc.findInPage(query, { forward: true, findNext: false });
+      return { ok: true };
+    }
+    if (action === 'next' || action === 'prev') {
+      if (!runtime.spatialFindQuery) return { ok: false, error: 'no-query' };
+      wc.findInPage(runtime.spatialFindQuery, { forward: action === 'next', findNext: true });
+      return { ok: true };
+    }
+    if (action === 'stop') {
+      runtime.spatialFindQuery = null;
+      wc.stopFindInPage('clearSelection');
+      return { ok: true };
+    }
+  } catch { /* a sleeping/destroyed pane is a no-op answer */ }
+  return { ok: false, error: 'invalid' };
+}
+
+/**
+ * §B.8 permission lane — resolve one pending prompt from the shell's matte
+ * prompt. Mirrors the strip's permissions:respond semantics (resolve →
+ * decision persists in permissions.js) minus the native prompt view, which
+ * spatial windows never attach.
+ */
+function resolveSpatialPermission(runtime, id, allow) {
+  const pending = runtime?.permissionPrompts?.get(id);
+  if (!pending) return;
+  runtime.permissionPrompts.delete(id);
+  pending.resolve(!!allow);
+}
+
 function registerIpcHandlers() {
   darkWebsites.install();
   // Spatial shell (Phase 3): main owns the node graph as pure modules; every
@@ -11834,6 +11946,25 @@ function registerIpcHandlers() {
       const tab = tabs.get(tabId);
       const contents = tab ? liveContents(tab) : null;
       if (contents) contents.loadURL(url);
+    },
+    // §B.8 — plumbing effects for the shell bridge (shortcuts, external
+    // handoff, downloads, find bar, permission prompts).
+    shell: {
+      openExternal: (url) => shell.openExternal(url),
+      effects: {
+        downloads: {
+          list: listDownloads,
+          activity: downloadsActivity,
+          cancel: cancelDownload,
+          resume: resumeDownload,
+          retry: retryDownload,
+          open: openDownload,
+          show: showDownloadInFolder,
+          clear: clearFinishedDownloads,
+        },
+        find: spatialFindControl,
+        permissionRespond: (id, allow) => resolveSpatialPermission(rt(), id, allow),
+      },
     },
   });
   chromeHandle('tabs:create', (_e, url, opts) => {
@@ -15605,6 +15736,14 @@ app.whenReady().then(bindWindowRuntime(primaryRuntime, async () => {
       // A prompt arrival replaces the user's working surface for the fill
       // flow too — invalidate a mid-broker fill, not just a visible capsule.
       bumpSurfaceGeneration(owner);
+      // §B.8 — spatial shells surface the SAME pending prompt as a matte
+      // in-shell card instead of the strip's floating permission view. The
+      // pending entry stays in owner.permissionPrompts, so the quiet sweep,
+      // tab-close cancellation and window-flush semantics are unchanged.
+      if (owner.spatialChrome) {
+        spatialRuntime.spatialShellBridge()?.sendPermissionRequest(owner, payload);
+        return;
+      }
       bindWindowRuntime(owner, () => {
         attachPermissionView();
         rt().permissionView.webContents.send('permissions:prompt', payload);

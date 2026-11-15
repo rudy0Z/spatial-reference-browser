@@ -11,8 +11,9 @@
  */
 import { create } from 'zustand'
 
-/** The two event families the SPEC names toasts for (§5.2, §6). */
-export type ToastKind = 'auto-hibernate' | 'ghost-echo'
+/** The event families the SPEC names toasts for (§5.2, §6), plus the
+ *  §B.8.5 download progress family (main → shell via spatialBridge). */
+export type ToastKind = 'auto-hibernate' | 'ghost-echo' | 'download'
 
 export type Toast = {
   id: string
