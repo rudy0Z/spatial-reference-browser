@@ -1948,7 +1948,13 @@ ipcMain.on(LINK_ROUTE_ACTIVATED_CHANNEL, (event, url) => {
 // does — top-level frames only, http(s) targets, bounded map.
 const SPATIAL_LINK_ACTIVATED_CHANNEL = 'spatial:link:activated';
 const SPATIAL_BRANCH_ACTIVATION_MS = 1000;
+// §B.7.1 — provenance transport caps; the preload already clamps, this
+// re-validates against a hostile or buggy renderer.
+const SPATIAL_PROVENANCE_TEXT_MAX = 512;
 const spatialLinkActivations = new Map();
+const clampProvenanceText = (value) => (
+  typeof value === 'string' && value.trim() ? value.trim().slice(0, SPATIAL_PROVENANCE_TEXT_MAX) : null
+);
 ipcMain.on(SPATIAL_LINK_ACTIVATED_CHANNEL, (event, info) => {
   // Only a tab's own top-level page; spatial-link-preload.js runs nowhere else.
   if (!event.senderFrame || event.senderFrame.parent) return;
@@ -1967,6 +1973,11 @@ ipcMain.on(SPATIAL_LINK_ACTIVATED_CHANNEL, (event, info) => {
     modified: info.modified === true,
     targetBlank: info.targetBlank === true,
     middle: info.middle === true,
+    // §B.7.1 — rich spawn provenance: exact clicked text/alt, surrounding
+    // sentence (the shell narrows to ≤140 chars), scroll offset at click.
+    anchorText: clampProvenanceText(info.anchorText),
+    contextSnippet: clampProvenanceText(info.contextSnippet),
+    scrollYAtSpawn: Number.isFinite(info.scrollYAtSpawn) ? Math.max(0, Math.round(info.scrollYAtSpawn)) : null,
     at: Date.now(),
   });
 });
@@ -9586,11 +9597,23 @@ initTabView({
   onSpatialBranch: (parentTabId, childTabId, info = {}) => {
     const runtime = windowRuntimes.runtimeForTab(parentTabId);
     if (!runtime?.spatialChrome) return;
-    const userRequested = spatialBranchActivationFor(parentTabId, info?.url) != null;
+    // §B.7.1 — the recorded activation rides the branch event: provenance
+    // (anchor text, surrounding sentence, scroll offset) travels with the
+    // spawn so the graph edge can answer "via what click did this exist?".
+    const activation = spatialBranchActivationFor(parentTabId, info?.url);
+    const userRequested = activation != null;
+    const provenance = activation
+      ? {
+          anchorText: activation.anchorText ?? null,
+          contextSnippet: activation.contextSnippet ?? null,
+          scrollYAtSpawn: activation.scrollYAtSpawn ?? null,
+        }
+      : null;
     try {
       spatialRuntime.handleSpatialBranch(runtime, parentTabId, childTabId, {
         ...info,
         userRequested,
+        provenance,
       });
     } catch { /* a failed branch record never breaks the tab open itself */ }
   },

@@ -37,6 +37,8 @@ export type SpatialNodeRecord = {
   private: boolean
   /** §B.8.4 — optional session partition ('sandbox' → temp:sandbox). */
   partition?: 'default' | 'sandbox' | string | null
+  /** §B.7.1 — spawn-edge provenance normalized by main's node-model. */
+  provenance?: { anchorText: string | null; contextSnippet: string | null; scrollYAtSpawn: number | null } | null
   thumb: string | null
   lastActiveAt: number
 }
@@ -154,6 +156,11 @@ function makeStoreRecord(main: SpatialNodeRecord, now: number): SpatialTabNodeRe
     searchQuery: null,
     subPages: [],
     excerpt: null,
+    // §B.7.1 — spawn provenance mirrors onto the store node so Glance/canvas
+    // hovers surface `via "…"` without an edge lookup.
+    anchorText: main.provenance?.anchorText ?? null,
+    contextSnippet: main.provenance?.contextSnippet ?? null,
+    scrollYAtSpawn: main.provenance?.scrollYAtSpawn ?? null,
     keywords: Array.from(new Set([domainOf(main.url)])).slice(0, 8),
     parentUuid: (main.parentUuid as NodeUuid | null) ?? null,
     ghostOfUuid: null,
@@ -175,7 +182,19 @@ function edgesForMain(main: SpatialNodeRecord, now: number): Record<EdgeId, Grap
   const edges: Record<EdgeId, GraphEdgeRecord> = {}
   if (main.parentUuid) {
     const id = `${main.parentUuid}->${main.uuid}` as EdgeId
-    edges[id] = { id, source: main.parentUuid as NodeUuid, target: main.uuid as NodeUuid, weight: 1, kind: 'spawn', createdAt: now }
+    edges[id] = {
+      id,
+      source: main.parentUuid as NodeUuid,
+      target: main.uuid as NodeUuid,
+      weight: 1,
+      kind: 'spawn',
+      createdAt: now,
+      // §B.7.1 — the incoming spawn edge carries the provenance the runtime
+      // recorded at link-branch time.
+      anchorText: main.provenance?.anchorText ?? null,
+      contextSnippet: main.provenance?.contextSnippet ?? null,
+      scrollYAtSpawn: main.provenance?.scrollYAtSpawn ?? null,
+    }
   }
   for (const child of main.edges) {
     const id = `${main.uuid}->${child}` as EdgeId

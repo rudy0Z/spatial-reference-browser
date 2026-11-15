@@ -64,6 +64,8 @@ import type { ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import { fnv1a32 } from '../../lib/embed'
 import { SPATIAL_DRAG_MIME, domainOf, formatDurationMs, urlHashOf } from '../../lib/types'
+import { captureAnchorProvenance } from '../../lib/trails'
+import type { SpawnProvenance } from '../../lib/trails'
 import type {
   MockLinkTarget,
   MockWebReaderProps,
@@ -800,10 +802,37 @@ type LinkHandlers = {
   onBranch: (target: MockLinkTarget) => void
 }
 
+/**
+ * §B.7.1 — rich provenance at the click: the anchor's own text (or a wrapped
+ * image's alt), the surrounding block's sentence (normalized to ≤140 chars
+ * by the pure capture shape), and the nearest scroll container's offset.
+ * Mirrors what the Electron spatial-link-preload records for real pages.
+ */
+function captureLinkProvenance(anchor: HTMLAnchorElement | null): SpawnProvenance | null {
+  if (!anchor) return null
+  const text = (anchor.textContent ?? '').replace(/\s+/g, ' ').trim()
+  const alt = anchor.querySelector('img[alt]')?.getAttribute('alt')?.trim() ?? ''
+  const block = anchor.closest('p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, dd, summary')
+  const context = (block?.textContent ?? '').replace(/\s+/g, ' ').trim()
+  let scrollY: number | null = null
+  let element: HTMLElement | null = anchor.parentElement
+  while (element) {
+    if (element.scrollHeight > element.clientHeight + 1) {
+      scrollY = Math.max(0, Math.round(element.scrollTop))
+      break
+    }
+    element = element.parentElement
+  }
+  if (scrollY === null) scrollY = Math.max(0, Math.round(window.scrollY))
+  return captureAnchorProvenance({ anchorText: text || null, altText: alt || null, contextText: context || null, scrollY })
+}
+
 function handleLinkActivate(event: MouseEvent<HTMLAnchorElement>, target: MockLinkTarget, handlers: LinkHandlers): void {
   event.preventDefault()
-  if (event.metaKey || event.ctrlKey) handlers.onBranch(target)
-  else handlers.onNavigate(target)
+  const provenance = captureLinkProvenance(event.currentTarget)
+  const enriched: MockLinkTarget = { ...target, provenance }
+  if (event.metaKey || event.ctrlKey) handlers.onBranch(enriched)
+  else handlers.onNavigate(enriched)
 }
 
 function handleLinkDragStart(event: DragEvent<HTMLAnchorElement>, target: MockLinkTarget): void {
@@ -825,7 +854,10 @@ function BranchButton({ target, onBranch, className }: { target: MockLinkTarget;
       onClick={(event) => {
         event.preventDefault()
         event.stopPropagation()
-        onBranch(target)
+        // §B.7.1 — the branch button sits beside the anchor; capture the
+        // provenance from the nearest anchor in the shared container.
+        const anchor = event.currentTarget.parentElement?.querySelector('a') ?? null
+        onBranch({ ...target, provenance: captureLinkProvenance(anchor) })
       }}
     >
       <GitBranch className="size-3" strokeWidth={1.75} />

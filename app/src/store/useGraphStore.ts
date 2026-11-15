@@ -35,6 +35,8 @@ import {
 } from '../lib/livePool'
 import type { PerformanceGuardrail } from '../lib/livePool'
 import { MOODBOARD_CARD_HEIGHT, MOODBOARD_CARD_WIDTH } from '../lib/moodboard'
+import { SUB_PAGES_NAV_CAP, captureAnchorProvenance, decideInPlaceNavigation } from '../lib/trails'
+import type { SpawnProvenance } from '../lib/trails'
 import {
   batchFuzzySearch,
   computeMoodboardGridCore,
@@ -137,6 +139,13 @@ export type GraphState = {
   hasHydrated: boolean
   paletteOpen: boolean
   glanceOpen: boolean
+  /**
+   * §B.7.3 Trace Rabbit Hole — a Glance-pinned trail focus ("Trace trail"
+   * action): the canvas illuminates the full upstream→downstream chain from
+   * this node while unrelated clusters dim. Runtime-only; hover trails
+   * (Alt+Hover) stay local to the canvas component.
+   */
+  trailFocusUuid: NodeUuid | null
   physicsFrozen: boolean
   /**
    * LOD lock: the semantic-zoom tier pinned when the lock was engaged
@@ -199,9 +208,20 @@ export type GraphActions = {
   /** Activate + switch to reading viewport ("Open Viewport" hover action). */
   openNodeInViewport(uuid: NodeUuid): void
   /** §5.1 normal click — navigates the ACTIVE node in place; oauth/payment URLs tag `viaAuth` (§7.2). */
-  navigateActiveNode(url: string, title?: string, searchQuery?: string): void
+  /**
+   * §B.7.2 — in-place navigation of the ACTIVE node, guarded by domain:
+   * same-domain → previous URL/title joins the subPages[] filmstrip (cap 20);
+   * cross-domain → the previous domain freezes as a hibernated parent at its
+   * current (x, y) and the new domain spawns as the active connected child
+   * (`kind: 'spawn'`). Never a silent overwrite.
+   */
+  navigateActiveNode(url: string, title?: string, searchQuery?: string, provenance?: SpawnProvenance | null): void
+  /** §B.7.3 — pin (or clear) the Trace-Rabbit-Hole focus shown by the Glance. */
+  setTrailFocus(uuid: NodeUuid | null): void
+  /** §B.7.3 — toggle the trail focus onto `uuid` (Glance "Trace trail" action). */
+  toggleTrailFocus(uuid: NodeUuid): void
   /** §5.1 Cmd/Ctrl+Click — spawns a live child satellite near its parent with a directional spawn edge. */
-  spawnChildNode(parentUuid: NodeUuid, seed: { url: string; title: string; searchQuery?: string }): NodeUuid
+  spawnChildNode(parentUuid: NodeUuid, seed: { url: string; title: string; searchQuery?: string; provenance?: SpawnProvenance | null }): NodeUuid
   /** §3 /new — fresh live tab near the active node, then activates it.
    *  §B.8.4 — `partition: 'sandbox'` marks the node for the isolated
    *  temp:sandbox session when the desktop build wakes its live view. */
@@ -584,6 +604,7 @@ const initialState: GraphState = {
   hasHydrated: false,
   paletteOpen: false,
   glanceOpen: false,
+  trailFocusUuid: null,
   physicsFrozen: false,
   semanticZoomOverride: null,
   zoom: 1,
@@ -795,6 +816,7 @@ export const useGraphStore = create<GraphStore>()(
           recordingNodeId: null,
           paletteOpen: false,
           glanceOpen: false,
+          trailFocusUuid: null,
           // A seed replaces the whole world — release a stale LOD lock so the
           // new world is always first seen at its natural seeded zoom tier.
           semanticZoomOverride: null,
@@ -905,17 +927,69 @@ export const useGraphStore = create<GraphStore>()(
           set({ viewMode: 'reading' })
         },
 
-        navigateActiveNode: (url, title, searchQuery) => {
+        navigateActiveNode: (url, title, searchQuery, provenance) => {
           const state = get()
           if (!state.activeNodeUuid) return
           const node = state.nodes[state.activeNodeUuid]
           if (!node) return
           const now = Date.now()
+
+          // §B.7.2 — Cross-Domain In-Place Navigation Guard. Same-domain
+          // navigation stays in place and joins the subPages filmstrip;
+          // cross-domain navigation never silently overwrites the node —
+          // the previous domain freezes as a hibernated parent at its
+          // current (x, y) and the new domain spawns one step forward as
+          // the active connected child (`kind: 'spawn'`), so the breadcrumb
+          // chain preserves itself.
+          const decision = decideInPlaceNavigation(node.domain, url)
+          if (decision.kind === 'cross-domain') {
+            const captured = captureAnchorProvenance(provenance ?? null)
+            const childUuid = get().spawnChildNode(node.uuid, {
+              url,
+              title: title ?? domainOf(url),
+              searchQuery,
+              provenance: captured,
+            })
+            if (!childUuid) return
+            // Freeze the previous domain at its CURRENT (x, y) — position is
+            // never touched (the "system pays, the user confirms" law).
+            const parent = get().nodes[node.uuid]
+            if (parent) {
+              set({
+                nodes: {
+                  ...get().nodes,
+                  [parent.uuid]: {
+                    ...parent,
+                    ramState: 'hibernated',
+                    ramMb: 0,
+                    isLoading: false,
+                    lastVisitedAt: now,
+                  },
+                },
+              })
+            }
+            // The spawned child becomes where the person is reading now.
+            set({
+              activeNodeUuid: childUuid,
+              workbenchUuids: [childUuid, ...state.workbenchUuids.filter((id) => id !== childUuid)].slice(0, WORKBENCH_SIZE),
+            })
+            scheduleLoadingPulse(childUuid)
+            return
+          }
+
+          // Same-domain: the filmstrip remembers where the domain has been
+          // (§7.3), capped at 20 entries for this navigation path.
+          const previousEntry = { url: node.url, title: node.title }
+          const appended =
+            node.subPages.some((existing) => existing.url === previousEntry.url) || previousEntry.url === url
+              ? node.subPages
+              : [...node.subPages, previousEntry].slice(-SUB_PAGES_NAV_CAP)
           set({
             nodes: {
               ...state.nodes,
               [node.uuid]: {
                 ...node,
+                subPages: appended,
                 url,
                 urlHash: urlHashOf(url),
                 domain: domainOf(url),
@@ -940,6 +1014,12 @@ export const useGraphStore = create<GraphStore>()(
           const angle = childCount * GOLDEN_ANGLE
           const uuid = newUuid()
           const url = seed.url
+          // §B.7.1 — provenance rides the spawn edge AND the child record
+          // (mirrored so hovers never need an edge lookup).
+          const captured = captureAnchorProvenance(seed.provenance ?? null)
+          const anchorText = captured?.anchorText ?? null
+          const contextSnippet = captured?.contextSnippet ?? null
+          const scrollYAtSpawn = captured?.scrollYAtSpawn ?? null
           const created: SpatialTabNodeRecord = {
             uuid,
             urlHash: urlHashOf(url),
@@ -959,6 +1039,9 @@ export const useGraphStore = create<GraphStore>()(
             searchQuery: seed.searchQuery ?? null,
             subPages: [],
             excerpt: null,
+            anchorText,
+            contextSnippet,
+            scrollYAtSpawn,
             keywords: Array.from(new Set([domainOf(url), ...tokenize(seed.title)])).slice(0, 8),
             parentUuid,
             ghostOfUuid: null,
@@ -977,7 +1060,18 @@ export const useGraphStore = create<GraphStore>()(
           const edgeId = `${parentUuid}->${uuid}`
           const nextEdges: Record<EdgeId, GraphEdgeRecord> = {
             ...state.edges,
-            [edgeId]: { id: edgeId, source: parentUuid, target: uuid, weight: 1, kind: 'spawn', createdAt: now },
+            [edgeId]: {
+              id: edgeId,
+              source: parentUuid,
+              target: uuid,
+              weight: 1,
+              kind: 'spawn',
+              createdAt: now,
+              // §B.7.1 — rich provenance on every spawn edge.
+              anchorText,
+              contextSnippet,
+              scrollYAtSpawn,
+            },
           }
           const pool = enforcePool(nextNodes, state.activeNodeUuid)
           scheduleLoadingPulse(uuid)
@@ -1545,6 +1639,7 @@ export const useGraphStore = create<GraphStore>()(
             lastEviction: null,
             paletteOpen: false,
             glanceOpen: false,
+            trailFocusUuid: null,
             physicsFrozen: false,
             audiblePausedAt: {},
             canvasFitRequest: null,
@@ -1583,6 +1678,9 @@ export const useGraphStore = create<GraphStore>()(
         togglePalette: () => set((state) => ({ paletteOpen: !state.paletteOpen })),
         setGlanceOpen: (open) => set({ glanceOpen: open }),
         toggleGlance: () => set((state) => ({ glanceOpen: !state.glanceOpen })),
+        setTrailFocus: (uuid) => set({ trailFocusUuid: uuid }),
+        toggleTrailFocus: (uuid) =>
+          set((state) => ({ trailFocusUuid: state.trailFocusUuid === uuid ? null : uuid })),
         setPhysicsFrozen: (frozen) => set({ physicsFrozen: frozen }),
         togglePhysicsFrozen: () => set((state) => ({ physicsFrozen: !state.physicsFrozen })),
         setSemanticZoomOverride: (tier) => set({ semanticZoomOverride: tier }),

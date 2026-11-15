@@ -11,7 +11,11 @@
  * signatures.
  */
 import type { Edge, Node, NodeProps } from '@xyflow/react'
-import { fnv1a32 } from './embed'
+// Explicit .ts extension: this value import must also resolve under
+// `node --test` type-stripping (app/tests/*.mjs import modules that reach
+// here), where relative ESM specifiers are resolved literally.
+import { fnv1a32 } from './embed.ts'
+import type { SpawnProvenance } from './trails'
 
 /* ------------------------------------------------------------------ */
 /* Identifier aliases                                                  */
@@ -169,6 +173,15 @@ export type SpatialTabNodeRecord = {
   fx: number | null
   fy: number | null
   /**
+   * §B.7.1 — how this node came into being: the anchor text / surrounding
+   * sentence / scroll offset captured at the link activation that spawned
+   * it. Mirrored from its incoming spawn edge so Glance + canvas hovers can
+   * surface `via "…"` without an edge lookup; absent in pre-3.4 state.
+   */
+  anchorText?: string | null
+  contextSnippet?: string | null
+  scrollYAtSpawn?: number | null
+  /**
    * Phase 1.5 — optional persisted preview directive. Absent in all
    * pre-1.5 persisted state, so old stores still load unchanged;
    * consumers MUST fall back to `defaultPreviewSpecFor(node)`
@@ -186,6 +199,14 @@ export type GraphEdgeRecord = {
   weight: number
   kind: GraphEdgeKind
   createdAt: number
+  /**
+   * §B.7.1 — rich spawn-edge provenance, present on edges born from a
+   * user link activation. Mirrored onto the child node for hover display
+   * ("via "Klim Söhne specimen""); absent in pre-3.4 persisted state.
+   */
+  anchorText?: string | null
+  contextSnippet?: string | null
+  scrollYAtSpawn?: number | null
 }
 
 /** §6 — regions replace workspaces: named spatial islands with a color. */
@@ -320,6 +341,8 @@ export type MockLinkTarget = {
   url: string
   title: string
   searchQuery?: string
+  /** §B.7.1 — provenance captured at the click that produced this target. */
+  provenance?: SpawnProvenance | null
 }
 
 /** §6 drag-to-anchor payload — reader drag source ⇄ pill drop zone contract. */
@@ -587,6 +610,10 @@ export type SpatialTabNodeProps = NodeProps<SpatialTabFlowNode>
 export type SpatialEdgeData = {
   kind: GraphEdgeKind
   weight: number
+  /** §B.7.1 — spawn-edge provenance, surfaced on canvas edge hover. */
+  anchorText?: string | null
+  contextSnippet?: string | null
+  scrollYAtSpawn?: number | null
 }
 
 /** React Flow edge shape used on the canvas. */

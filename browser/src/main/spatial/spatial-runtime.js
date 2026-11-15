@@ -640,6 +640,9 @@ function handleSpatialBranch(runtime, parentTabId, childTabId, info = {}) {
     private: parent.private === true,
     branchKind: classified === 'via-auth' ? 'auth' : 'link',
     viaAuth: classified === 'via-auth',
+    // §B.7.1 — rich provenance captured at the link activation (tab-view.js
+    // → onSpatialBranch). node-model.js normalizes; unknown shapes drop.
+    provenance: info.provenance ?? null,
     createdAt: at,
     lastActiveAt: at,
   });

@@ -31,7 +31,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { MousePointerClick, Radar, X } from 'lucide-react'
+import { MousePointerClick, Radar, Route, X } from 'lucide-react'
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import { selectGhostEchoNodes, selectNeighbourhood, useGraphStore } from '../../store/useGraphStore'
@@ -256,6 +256,8 @@ type GlanceForceGraphProps = {
   hoveredUuid: NodeUuid | null
   onHover: (uuid: NodeUuid | null) => void
   onFocus: (uuid: NodeUuid) => void
+  /** §B.7.1 — `via "…"` provenance for the hovered node (null when none). */
+  viaFor: (uuid: NodeUuid) => string | null
   width: number
   height: number
 }
@@ -268,6 +270,7 @@ function GlanceForceGraph({
   frozen,
   hoveredUuid,
   onHover,
+  viaFor,
   onFocus,
   width,
   height,
@@ -424,6 +427,7 @@ function GlanceForceGraph({
           if (!home) return null
           const isHovered = hoveredUuid === entry.node.uuid
           const visual = glanceNodeVisual(entry, isHovered)
+          const viaText = isHovered ? viaFor(entry.node.uuid) : null
           return (
             <g
               key={entry.node.uuid}
@@ -453,6 +457,25 @@ function GlanceForceGraph({
                   {truncateLabel(entry.node.title, 26)}
                 </text>
               ) : null}
+              {/* §B.7.1 — provenance under the hovered node's title. */}
+              {viaText ? (
+                <text
+                  y={visual.radius + 22}
+                  textAnchor="middle"
+                  style={{
+                    fontSize: 8.5,
+                    fontStyle: 'italic',
+                    fontFamily: 'var(--font-sans)',
+                    letterSpacing: '-0.015em',
+                    fill: 'var(--ink-muted)',
+                    paintOrder: 'stroke',
+                    stroke: 'color-mix(in srgb, var(--bg-canvas) 85%, transparent)',
+                    strokeWidth: 3,
+                  }}
+                >
+                  {truncateLabel(`via “${viaText}”`, 34)}
+                </text>
+              ) : null}
               <title>{entry.node.title}</title>
             </g>
           )
@@ -474,6 +497,9 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
   const physicsFrozen = useGraphStore((s) => s.physicsFrozen)
   const setGlanceOpen = useGraphStore((s) => s.setGlanceOpen)
   const focusNodeOnCanvas = useGraphStore((s) => s.focusNodeOnCanvas)
+  // §B.7.3 — "Trace trail" pins a full-chain illumination focus on the canvas.
+  const trailFocusUuid = useGraphStore((s) => s.trailFocusUuid)
+  const toggleTrailFocus = useGraphStore((s) => s.toggleTrailFocus)
 
   const [hoveredUuid, setHoveredUuid] = useState<NodeUuid | null>(null)
 
@@ -555,6 +581,24 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
   const hop2Count = entries.filter((entry) => !entry.isGhost && entry.depth === 2).length
   const ghostCount = entries.filter((entry) => entry.isGhost).length
 
+  /** §B.7.1 — `via "…"` provenance for one node: the mirrored anchor text
+   * first, else the anchor text carried by its incoming spawn edge. */
+  const viaTextFor = useCallback(
+    (uuid: NodeUuid): string | null => {
+      const node = nodesMap[uuid]
+      const mirrored = node?.anchorText?.trim()
+      if (mirrored) return mirrored
+      for (const edge of Object.values(edgesMap)) {
+        if (edge.target !== uuid || edge.kind !== 'spawn') continue
+        const anchor = edge.anchorText?.trim()
+        if (anchor) return anchor
+      }
+      return null
+    },
+    [nodesMap, edgesMap],
+  )
+  const tracingHere = active !== null && trailFocusUuid !== null && trailFocusUuid === active.uuid
+
   return (
     <AnimatePresence>
       {glanceOpen && active ? (
@@ -612,6 +656,23 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
             <span>{hop2Count} · 2 hops</span>
             {ghostCount > 0 ? <span>{ghostCount} · Ghost</span> : null}
             <span className="ml-auto">{entries.length} nodes</span>
+            {/* §B.7.3 — Trace Rabbit Hole: illuminate the whole chain from
+                the active node on the canvas; unrelated clusters dim. */}
+            <button
+              type="button"
+              aria-pressed={tracingHere}
+              onClick={() => toggleTrailFocus(active.uuid)}
+              className={cn(
+                'flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 tracking-ui transition-colors',
+                tracingHere
+                  ? 'border-[color:var(--border-active)] text-[color:var(--ink-primary)]'
+                  : 'border-transparent text-[color:var(--ink-muted)] hover:border-hairline hover:text-[color:var(--ink-secondary)]',
+              )}
+              title={tracingHere ? 'Tracing trail — click to clear' : 'Trace trail: illuminate the full research chain'}
+            >
+              <Route size={10} aria-hidden="true" />
+              {tracingHere ? 'Tracing' : 'Trace trail'}
+            </button>
           </div>
 
           {entries.length === 0 ? (
@@ -641,6 +702,7 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
                   hoveredUuid={hoveredUuid}
                   onHover={setHoveredUuid}
                   onFocus={focusNodeOnCanvas}
+                  viaFor={viaTextFor}
                   width={graphWidth}
                   height={GLANCE_GRAPH_HEIGHT}
                 />
@@ -651,6 +713,8 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
                 {sortedEntries.map((entry) => {
                   const uuid = entry.node.uuid
                   const chip = rowChip(entry)
+                  const isRowHovered = hoveredUuid === uuid
+                  const rowVia = isRowHovered ? viaTextFor(uuid) : null
                   return (
                     <button
                       key={uuid}
@@ -660,7 +724,7 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
                       onMouseLeave={() => setHoveredUuid(null)}
                       className={cn(
                         'flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[color:var(--border-active)]',
-                        hoveredUuid === uuid
+                        isRowHovered
                           ? 'bg-[color:var(--glass-soft)]'
                           : 'hover:bg-[color:var(--glass-soft)]',
                       )}
@@ -678,6 +742,13 @@ export function NeighbourhoodGlance({ className, width = 300 }: NeighbourhoodGla
                             </span>
                           ) : null}
                         </span>
+                        {/* §B.7.1 — how this node came into being, surfaced on
+                            hover in muted ink: via "Klim Söhne specimen". */}
+                        {rowVia ? (
+                          <span className="mt-0.5 block truncate text-[9.5px] italic text-[color:var(--ink-muted)]" title={rowVia}>
+                            via “{rowVia}”
+                          </span>
+                        ) : null}
                       </span>
                       <span
                         className={cn(

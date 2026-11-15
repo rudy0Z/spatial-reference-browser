@@ -33,6 +33,27 @@ const clampSize = (value) => {
   return Math.min(4096, Math.round(value));
 };
 
+// §B.7.1 — spawn-edge provenance (anchor text / surrounding sentence /
+// scroll offset at the click). Transport caps: the preload and main's IPC
+// validator already clamp to 512; the presentation caps (120/140) are the
+// shell's pure capture shape's business (app/src/lib/trails.ts).
+const PROVENANCE_TEXT_MAX = 512;
+const clampProvenanceText = (value) => (
+  typeof value === 'string' && value.trim() ? value.trim().slice(0, PROVENANCE_TEXT_MAX) : null
+);
+
+/** Validated §B.7.1 provenance, or null when nothing usable was recorded. */
+function normalizeProvenance(input) {
+  if (!input || typeof input !== 'object') return null;
+  const anchorText = clampProvenanceText(input.anchorText);
+  const contextSnippet = clampProvenanceText(input.contextSnippet);
+  const scrollYAtSpawn = isFiniteNumber(input.scrollYAtSpawn)
+    ? Math.max(0, Math.min(10_000_000, Math.round(input.scrollYAtSpawn)))
+    : null;
+  if (anchorText === null && contextSnippet === null && scrollYAtSpawn === null) return null;
+  return { anchorText, contextSnippet, scrollYAtSpawn };
+}
+
 /** A validated graph node. Unknown fields are dropped, never trusted. */
 function normalizeNode(input) {
   if (!input || typeof input !== 'object') return null;
@@ -63,6 +84,9 @@ function normalizeNode(input) {
     // whether it stands for a collapsed OAuth/SSO/payment chain.
     branchKind: input.branchKind === 'link' || input.branchKind === 'auth' ? input.branchKind : null,
     viaAuth: input.viaAuth === true,
+    // §B.7.1 — how the spawn happened: provenance from the recorded link
+    // activation. Unknown shapes drop to null, never trusted.
+    provenance: normalizeProvenance(input.provenance),
     // SPA filmstrip: same-document (pushState) commits, capped. Each record
     // keeps only its url and timestamp; anything else is dropped.
     subPages: (Array.isArray(input.subPages) ? input.subPages : [])

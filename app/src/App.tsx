@@ -367,7 +367,9 @@ function App() {
       // Normal click navigates the pane's own tab in place (§5.1); focusing a
       // split pane first keeps the store's single active-node model honest.
       if (state.activeNodeUuid !== uuid) state.activateNode(uuid)
-      useGraphStore.getState().navigateActiveNode(target.url, target.title, target.searchQuery)
+      // §B.7.1/§B.7.2 — the click's provenance rides along; the cross-domain
+      // guard mirrors it onto the spawned successor node's spawn edge.
+      useGraphStore.getState().navigateActiveNode(target.url, target.title, target.searchQuery, target.provenance)
     },
     [pushHistory],
   )
@@ -377,6 +379,7 @@ function App() {
       url: target.url,
       title: target.title,
       searchQuery: target.searchQuery,
+      provenance: target.provenance,
     })
   }, [])
 

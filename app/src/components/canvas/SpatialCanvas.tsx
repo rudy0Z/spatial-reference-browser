@@ -80,6 +80,7 @@ import { useHybridForceLayout } from '../../hooks/useHybridForceLayout'
 import type { LayoutLinkInput, LayoutNodeInput, LayoutPositions } from '../../hooks/useHybridForceLayout'
 import { lodForZoom } from '../../lib/types'
 import type {
+  EdgeId,
   NodeUuid,
   Region,
   RegionId,
@@ -90,6 +91,7 @@ import type {
   SpatialTabNodeRecord,
   ViewMode,
 } from '../../lib/types'
+import { collectTrailChain } from '../../lib/trails'
 import SpatialTabNode from './nodes/SpatialTabNode'
 import { createSpatialCuller, getSpatialCoreBackend } from '../../lib/spatialCore'
 import type { SpatialCullerHandle, SpatialCoreBackend } from '../../lib/spatialCore'
@@ -165,6 +167,9 @@ const CANVAS_STYLES = `
   [data-sp-focus='on'] .react-flow__node {
     opacity: 0.25;
   }
+  [data-sp-trace='on'] .react-flow__node {
+    opacity: 0.18;
+  }
   [data-sp-focus='on'] .react-flow__node.sp-hop {
     opacity: 1;
   }
@@ -202,14 +207,34 @@ const CANVAS_STYLES = `
  * context; node dimming itself is a single CSS rule keyed off
  * `[data-sp-focus]` on the canvas root, so 700 nodes dim without any
  * per-node JS work.
+ *
+ * §B.7.3 — Alt+Hover (or the Glance's "Trace trail" action) extends the
+ * 1-hop machinery to the FULL chain: `trailUuids` is then the collected
+ * upstream→root + downstream→descendants closure (pure
+ * `collectTrailChain`), and unrelated clusters dim to 0.18 via
+ * `[data-sp-trace]`.
  */
 type CanvasFocus = {
   focusUuid: NodeUuid | null
   hopUuids: Set<NodeUuid> | null
   focusRegionId: RegionId | null
+  /** Full-chain trail set when a trace is active, else null. */
+  trailUuids: Set<NodeUuid> | null
 }
 
-const CanvasFocusContext = createContext<CanvasFocus>({ focusUuid: null, hopUuids: null, focusRegionId: null })
+const CanvasFocusContext = createContext<CanvasFocus>({
+  focusUuid: null,
+  hopUuids: null,
+  focusRegionId: null,
+  trailUuids: null,
+})
+
+/**
+ * §B.7.1 — which spawn edge is hovered, for the muted `via "…"` label
+ * rendered on the edge itself. Separate from CanvasFocus so an edge hover
+ * never re-renders a single node.
+ */
+const EdgeProvenanceContext = createContext<EdgeId | null>(null)
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                       */
@@ -255,9 +280,12 @@ function regionBox(members: SpatialTabNodeRecord[], region: Region): { x: number
  * One static curve for every edge kind. Rest: 1px var(--border-subtle)
  * (≈ rgba(255,255,255,0.07) in dark graphite, a warm hairline in Paper).
  * Hover focus: edges incident to the hovered node illuminate to
- * var(--ink-primary) @ 45% opacity; every other edge dims to 0.25. Both are
- * plain style flips covered by the .sp-edge-line ease — no dash, no glow, no
- * direction markers, no animated overlay path.
+ * var(--ink-primary) @ 45% opacity; every other edge dims to 0.25. Under a
+ * §B.7.3 trace the whole chain illuminates instead (both endpoints inside
+ * `trailUuids`) and unrelated edges dim to 0.18. Plain style flips covered
+ * by the .sp-edge-line ease — no dash, no glow, no direction markers, no
+ * animated overlay path. Hovering a spawn edge surfaces its provenance as a
+ * muted `via "…"` label on the curve (§B.7.1).
  */
 function SpatialFlowEdgeView({
   id,
@@ -269,9 +297,11 @@ function SpatialFlowEdgeView({
   targetX,
   targetY,
   targetPosition,
+  data,
 }: EdgeProps<SpatialFlowEdge>) {
   const focus = useContext(CanvasFocusContext)
-  const [path] = getBezierPath({
+  const hoveredEdgeId = useContext(EdgeProvenanceContext)
+  const [path, labelX, labelY] = getBezierPath({
     sourceX,
     sourceY,
     targetX,
@@ -281,23 +311,56 @@ function SpatialFlowEdgeView({
     curvature: 0.35,
   })
 
-  const lit = focus.focusUuid !== null && (source === focus.focusUuid || target === focus.focusUuid)
-  const dimmed = focus.focusUuid !== null && !lit
+  const inTrail = focus.trailUuids !== null && focus.trailUuids.has(source) && focus.trailUuids.has(target)
+  const lit =
+    (focus.focusUuid !== null && (source === focus.focusUuid || target === focus.focusUuid)) || inTrail
+  const dimmed = focus.trailUuids !== null ? !lit : focus.focusUuid !== null && !lit
+  const isHovered = hoveredEdgeId !== null && hoveredEdgeId === id
+  const viaLabel = isHovered && data?.anchorText ? `via “${truncateEdgeLabel(data.anchorText)}”` : null
 
   return (
-    <BaseEdge
-      id={id}
-      path={path}
-      className="sp-edge-line"
-      interactionWidth={12}
-      style={{
-        stroke: lit ? 'var(--ink-primary)' : 'var(--border-subtle)',
-        strokeOpacity: lit ? 0.45 : 1,
-        strokeWidth: 1,
-        opacity: dimmed ? 0.25 : 1,
-      }}
-    />
+    <g>
+      <BaseEdge
+        id={id}
+        path={path}
+        className="sp-edge-line"
+        interactionWidth={12}
+        style={{
+          stroke: lit ? 'var(--ink-primary)' : 'var(--border-subtle)',
+          strokeOpacity: lit ? 0.45 : 1,
+          strokeWidth: 1,
+          opacity: dimmed ? (focus.trailUuids !== null ? 0.18 : 0.25) : 1,
+        }}
+      />
+      {viaLabel ? (
+        <g style={{ pointerEvents: 'none' }}>
+          <text
+            x={labelX}
+            y={labelY - 6}
+            textAnchor="middle"
+            style={{
+              fontSize: 10,
+              fontFamily: 'var(--font-sans)',
+              letterSpacing: '-0.015em',
+              fill: 'var(--ink-muted)',
+              paintOrder: 'stroke',
+              stroke: 'color-mix(in srgb, var(--bg-canvas) 85%, transparent)',
+              strokeWidth: 3,
+            }}
+          >
+            {viaLabel}
+          </text>
+        </g>
+      ) : null}
+      {isHovered && data?.contextSnippet ? <title>{data.contextSnippet}</title> : null}
+    </g>
   )
+}
+
+/** One-line cap for the on-edge provenance label (full text in <title>). */
+function truncateEdgeLabel(text: string): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim()
+  return collapsed.length <= 34 ? collapsed : `${collapsed.slice(0, 33).trimEnd()}…`
 }
 
 /* ------------------------------------------------------------------ */
@@ -874,8 +937,46 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
     return { noteCountByUrlHash, memoNodeIds, childCountByParent }
   }, [notesRecord, memosRecord, nodesRecord])
 
-  /* ---- hover-focus (1-hop lineage illumination) ---- */
+  /* ---- hover-focus (1-hop lineage illumination) + §B.7.3 trail trace ---- */
   const [focusUuid, setFocusUuid] = useState<NodeUuid | null>(null)
+  // §B.7.3 — Alt held while hovering walks the FULL rabbit hole, not just
+  // 1 hop. The ref survives across renders; the state copy re-renders the
+  // illumination when Alt is pressed while a node is already hovered.
+  const [altHeld, setAltHeld] = useState(false)
+  const altHeldRef = useRef(false)
+  useEffect(() => {
+    const syncAlt = (held: boolean) => {
+      if (altHeldRef.current === held) return
+      altHeldRef.current = held
+      setAltHeld(held)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Alt') syncAlt(true)
+    }
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === 'Alt') syncAlt(false)
+    }
+    const onBlur = () => syncAlt(false)
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
+      window.removeEventListener('blur', onBlur)
+    }
+  }, [])
+
+  // §B.7.3 — the Glance's "Trace trail" action pins a trail focus in the
+  // store; the canvas treats it exactly like an Alt+Hover trace.
+  const trailFocusUuid = useGraphStore((state) => state.trailFocusUuid)
+
+  // §B.7.1 — hovered spawn edge → muted `via "…"` label on the curve.
+  const [hoveredEdgeId, setHoveredEdgeId] = useState<EdgeId | null>(null)
+  const handleEdgeMouseEnter = useCallback((_event: ReactMouseEvent, edge: SpatialFlowEdge) => {
+    setHoveredEdgeId(edge.id as EdgeId)
+  }, [])
+  const handleEdgeMouseLeave = useCallback(() => setHoveredEdgeId(null), [])
 
   const adjacencyByUuid = useMemo(() => {
     const map = new Map<NodeUuid, Set<NodeUuid>>()
@@ -896,19 +997,33 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
     return map
   }, [canvasEdges])
 
+  /** The node whose trail is being traced (Glance pin wins over Alt+Hover).
+   * `altHeld` (state) makes the trace re-render on Alt press/release while
+   * `altHeldRef` covers the enter-then-press ordering within one frame. */
+  const traceUuid = trailFocusUuid ?? (focusUuid !== null && (altHeld || altHeldRef.current) ? focusUuid : null)
+
+  // §B.7.3 — the full chain: upstream via parentUuid + incoming spawn/visit
+  // edges to the root, downstream to all descendants (pure collectTrailChain).
+  const trailUuids = useMemo(() => {
+    if (traceUuid === null) return null
+    return collectTrailChain(traceUuid, nodesRecord, edgesRecord)
+  }, [traceUuid, nodesRecord, edgesRecord])
+
+  // 1-hop machinery, unchanged when no trace is active.
   const hopUuids = useMemo(() => {
     if (!focusUuid) return null
+    if (trailUuids) return trailUuids
     const hops = new Set<NodeUuid>([focusUuid])
     const direct = adjacencyByUuid.get(focusUuid)
     if (direct) for (const uuid of direct) hops.add(uuid)
     return hops
-  }, [focusUuid, adjacencyByUuid])
+  }, [focusUuid, trailUuids, adjacencyByUuid])
 
   const focusRegionId = focusUuid ? (nodesRecord[focusUuid]?.regionId ?? null) : null
 
   const focusValue = useMemo<CanvasFocus>(
-    () => ({ focusUuid, hopUuids, focusRegionId }),
-    [focusUuid, hopUuids, focusRegionId],
+    () => ({ focusUuid, hopUuids, focusRegionId, trailUuids }),
+    [focusUuid, hopUuids, focusRegionId, trailUuids],
   )
 
   /* Hybrid physics inputs — persisted home coordinates (never the orbit-wobbled
@@ -1158,10 +1273,18 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
         source: edge.source,
         target: edge.target,
         type: 'spatialFlow',
-        data: { kind: edge.kind, weight: edge.weight },
+        // §B.7.1 — spawn-edge provenance rides the flow edge for the muted
+        // `via "…"` hover label.
+        data: {
+          kind: edge.kind,
+          weight: edge.weight,
+          anchorText: edgesRecord[edge.id]?.anchorText ?? null,
+          contextSnippet: edgesRecord[edge.id]?.contextSnippet ?? null,
+          scrollYAtSpawn: edgesRecord[edge.id]?.scrollYAtSpawn ?? null,
+        },
         zIndex: 2,
       })),
-    [canvasEdges],
+    [canvasEdges, edgesRecord],
   )
 
   /* ---- viewport / interaction wiring ---- */
@@ -1264,7 +1387,12 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
     useGraphStore.getState().toggleStack(node.id)
   }, [])
 
-  const handleNodeMouseEnter = useCallback((_event: ReactMouseEvent, node: SpatialTabFlowNode) => {
+  const handleNodeMouseEnter = useCallback((event: ReactMouseEvent, node: SpatialTabFlowNode) => {
+    // §B.7.3 — entering a node with Alt already down starts the trace.
+    if (event.altKey && !altHeldRef.current) {
+      altHeldRef.current = true
+      setAltHeld(true)
+    }
     setFocusUuid(node.id)
   }, [])
 
@@ -1421,11 +1549,13 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
           className={cn('fixed inset-0 z-10 overflow-hidden bg-void', className)}
           data-lod={lod}
           data-sp-focus={focusUuid !== null ? 'on' : 'off'}
+          data-sp-trace={trailUuids !== null ? 'on' : 'off'}
           style={{ '--stn-beacon-scale': beaconScale } as CSSProperties}
         >
           <style>{CANVAS_STYLES}</style>
           <CanvasLodContext.Provider value={lodValue}>
           <CanvasFocusContext.Provider value={focusValue}>
+          <EdgeProvenanceContext.Provider value={hoveredEdgeId}>
             <div ref={containerRef} className="relative h-full w-full">
               <ReactFlow<SpatialTabFlowNode, SpatialFlowEdge>
                 nodes={flowNodes}
@@ -1445,6 +1575,9 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
                 onNodeDragStart={handleNodeDragStart}
                 onNodeDrag={handleNodeDrag}
                 onNodeDragStop={handleNodeDragStop}
+                // §B.7.1 — hovering a spawn edge surfaces its provenance.
+                onEdgeMouseEnter={handleEdgeMouseEnter}
+                onEdgeMouseLeave={handleEdgeMouseLeave}
                 elementsSelectable={false}
                 nodesConnectable={false}
                 zoomOnDoubleClick={false}
@@ -1486,6 +1619,7 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
                 onTidyRegion={handleTidyRegion}
               />
             </div>
+          </EdgeProvenanceContext.Provider>
           </CanvasFocusContext.Provider>
           </CanvasLodContext.Provider>
         </motion.div>
