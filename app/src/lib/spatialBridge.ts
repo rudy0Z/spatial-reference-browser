@@ -45,6 +45,25 @@ export type SpatialNodeRecord = {
 
 export type SpatialGraphPayload = { version: number; nodes: SpatialNodeRecord[] }
 
+/** §B.9 — one domain-keyed Live-Mod record, as persisted with the graph. */
+export type LiveModRecord = {
+  id: string
+  domainPattern: string
+  name: string
+  enabled: boolean
+  css: string
+  zapSelectors: string[]
+}
+
+/** §B.9 — the presets main offers for one-click application. */
+export type LiveModPreset = {
+  id: string
+  name: string
+  description: string
+  /** Variant keys for presets like 'surface' (paper | graphite); null = single. */
+  variants: string[] | null
+}
+
 type SpatialAPI = {
   load: () => Promise<{ ok: boolean; graph: SpatialGraphPayload }>
   mutate: (ops: unknown[]) => Promise<{ ok: boolean; reason?: string }>
@@ -111,6 +130,26 @@ type SpatialAPI = {
     }) => void,
   ) => () => void
   permissionRespond: (id: number, allow: boolean) => void
+  // §B.9 Live Mods — every path below is a trust-gated spatial:* command.
+  modsList: () => Promise<{
+    ok: boolean
+    mods?: LiveModRecord[]
+    zapArmed?: boolean
+    presets?: LiveModPreset[]
+  }>
+  modSetEnabled: (id: string, enabled: boolean) => Promise<{ ok: boolean }>
+  modSetCss: (domain: string, css: string) => Promise<{ ok: boolean }>
+  modApplyPreset: (
+    domain: string,
+    presetId: string,
+    variant?: 'paper' | 'graphite' | string,
+  ) => Promise<{ ok: boolean }>
+  modRemove: (id: string) => Promise<{ ok: boolean }>
+  modRemoveZap: (id: string, selector: string) => Promise<{ ok: boolean }>
+  zapArm: () => Promise<{ ok: boolean; armed?: boolean; error?: string }>
+  zapDisarm: () => Promise<{ ok: boolean; armed?: boolean }>
+  onModsUpdated: (cb: (payload: { mods: LiveModRecord[]; zapArmed: boolean }) => void) => () => void
+  onZapChanged: (cb: (payload: { armed: boolean }) => void) => () => void
 }
 
 declare global {

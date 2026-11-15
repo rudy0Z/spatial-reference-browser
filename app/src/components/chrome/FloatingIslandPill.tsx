@@ -46,6 +46,7 @@
  */
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -61,6 +62,7 @@ import {
   Boxes,
   Columns2,
   Download,
+  Eraser,
   ExternalLink,
   Globe,
   Heart,
@@ -82,6 +84,7 @@ import type { LucideIcon } from 'lucide-react'
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import { PreviewArt, previewSpecForNode } from '../canvas/nodes/PreviewArt'
+import { spatialApi } from '../../lib/spatialBridge'
 import {
   SLASH_COMMANDS,
   SPATIAL_DRAG_MIME,
@@ -379,6 +382,7 @@ const COMMAND_ICONS: Record<SlashCommandId, LucideIcon> = {
   cluster: Boxes,
   sandbox: ShieldCheck,
   mods: Puzzle,
+  zap: Eraser,
 }
 
 /** Quiet sentence-case result categories — no uppercase mono chips. */
@@ -505,6 +509,7 @@ function runSlashCommand(
     parkSessionToArchive: () => number
     createNewTab: (init?: { title?: string; url?: string; partition?: 'default' | 'sandbox' }) => string
     createClusterFromActive: () => unknown
+    zapToggle: () => void
   },
 ) {
   switch (id) {
@@ -535,6 +540,12 @@ function runSlashCommand(
       break
     case 'mods':
       nav.onToggleExtensions?.()
+      actions.setPaletteOpen(false)
+      break
+    case 'zap':
+      // §B.9 — arm/disarm the Element Zapper on the active live view
+      // (Alt+Shift+Click hides; the selector persists on the domain).
+      actions.zapToggle()
       actions.setPaletteOpen(false)
       break
   }
@@ -571,9 +582,17 @@ function OmniboxResults({
   const [selectedIndex, setSelectedIndex] = useState(0)
   const listRef = useRef<HTMLDivElement | null>(null)
 
+  // §B.9 — the /zap toggle tracks the runtime's armed state (main pushes
+  // spatial:zap:changed; without the runtime the command is a quiet no-op).
+  const [zapArmed, setZapArmed] = useState(false)
+  useEffect(() => spatialApi?.onZapChanged((payload) => setZapArmed(payload.armed === true)) ?? undefined, [])
+  const zapToggle = useCallback(() => {
+    void (zapArmed ? spatialApi?.zapDisarm() : spatialApi?.zapArm())
+  }, [zapArmed])
+
   const actions = useMemo(
-    () => ({ setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive }),
-    [setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive],
+    () => ({ setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive, zapToggle }),
+    [setPaletteOpen, toggleCanvas, quickNoteOnActive, parkSessionToArchive, createNewTab, createClusterFromActive, zapToggle],
   )
 
   const filteredCommands = useMemo(() => {

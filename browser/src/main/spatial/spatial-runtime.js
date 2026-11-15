@@ -45,6 +45,7 @@ const {
 const { createGraphIpc } = require('./graph-ipc');
 const { createShellBridge } = require('./shell-bridge');
 const { isSandboxPartition } = require('./session-partitions');
+const { createLiveMods } = require('../live-mods');
 
 // uuid → live tab id. Tab ids are process-local; entries for dead tabs are
 // pruned lazily and never persist (the session column carries uuids only).
@@ -66,6 +67,9 @@ let store = null;
 // §B.8 plumbing bridge (shortcuts / external handoff / downloads / find /
 // permission prompts). Created once in initSpatial; null until then.
 let shellBridge = null;
+// §B.9 Live Mods engine — persists with the graph store, injects into live
+// views, owns the armed Element Zapper. Null until initSpatial.
+let liveMods = null;
 
 /* ------------------------------------------------------------------ */
 /* State (per runtime, on runtime.* so window teardown needs no map)    */
@@ -263,6 +267,8 @@ function wireGraphNodeSync(tabId, uuid) {
   const tab = deps.tabs.get(tabId);
   const wc = tab ? deps.liveContents(tab) : null;
   if (!wc) return;
+  // §B.9 — the fresh view joins Live-Mod injection + zap coverage.
+  liveMods?.attachView(tabId, wc);
   wc.on('did-navigate', (_event, url) => {
     const node = model.nodes.get(uuid);
     if (!node || typeof url !== 'string' || !url) return;
@@ -296,7 +302,15 @@ function ensureLiveView(runtime, node) {
         // load has finished. The cached WebP cover is already on the node —
         // the shell paints it while this view loads.
         void Promise.resolve(deps.wakeTab(existing.tabId))
-          .then((woke) => { if (woke) return restoreHibernation(existing.tabId, node.uuid); })
+          .then((woke) => {
+            if (!woke) return undefined;
+            // The woken view's webContents is fresh — rejoin it to §B.9
+            // injection/zap coverage (restored tabs were never wired).
+            const tab = deps.tabs.get(existing.tabId);
+            const wc = tab ? deps.liveContents(tab) : null;
+            if (wc) liveMods?.attachView(existing.tabId, wc);
+            return restoreHibernation(existing.tabId, node.uuid);
+          })
           .catch(() => { /* bounds below still apply */ });
       } catch { /* fall through to bounds */ }
     }
@@ -517,6 +531,7 @@ function closeNode(runtime, uuid) {
   const result = model.applyOp({ type: 'remove', uuid });
   if (entry) {
     try { deps.closeTab(entry.tabId); } catch { /* already closing */ }
+    liveMods?.forgetView(entry.tabId);
     tabIdByUuid.delete(uuid);
   }
   hibernationByUuid.delete(uuid);
@@ -545,6 +560,7 @@ function closeTabsForRemovedOps(ops) {
         live.delete(op.uuid);
       }
       try { deps.closeTab(tabId); } catch { /* already closing */ }
+      liveMods?.forgetView(tabId);
       tabIdByUuid.delete(op.uuid);
     }
     hibernationByUuid.delete(op.uuid);
@@ -792,6 +808,34 @@ function registerGraphIpc() {
 }
 
 /* ------------------------------------------------------------------ */
+/* §B.9 Live-Mod view discovery                                        */
+/* ------------------------------------------------------------------ */
+
+/** The focused runtime's active live view, for the Element-Zapper arm. */
+function activeLiveView(runtime) {
+  if (!runtime || !runtime.spatialChrome) return null;
+  const uuid = runtime.spatialActiveUuid;
+  const entry = uuid ? liveMap(runtime).get(uuid) : null;
+  const tab = entry ? deps.tabs.get(entry.tabId) : null;
+  const wc = tab ? deps.liveContents(tab) : null;
+  return wc ? { tabId: entry.tabId, wc } : null;
+}
+
+/** Every live view across spatial runtimes (mod toggle re-injection). */
+function allLiveViews() {
+  const out = [];
+  for (const runtime of deps.allRuntimes()) {
+    if (!runtime.spatialChrome) continue;
+    for (const entry of liveMap(runtime).values()) {
+      const tab = deps.tabs.get(entry.tabId);
+      const wc = tab ? deps.liveContents(tab) : null;
+      if (wc) out.push({ tabId: entry.tabId, wc });
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
 /* Init                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -829,13 +873,31 @@ function ensureFirstRunSeed() {
 
 function initSpatial(injected) {
   deps = injected;
-  store = new JsonStore('spatial-graph', { version: 1, nodes: [] }, { scope: 'device', quietErrors: true });
+  store = new JsonStore('spatial-graph', { version: 1, nodes: [], mods: [] }, { scope: 'device', quietErrors: true });
   const saved = store.data && Array.isArray(store.data.nodes) ? store.data.nodes : [];
   model = createGraphModel(saved);
   // Rebind persisted nodes to no tabs: tab ids are process-local.
   for (const node of model.nodes.values()) node.lastActiveAt = node.lastActiveAt ?? 0;
   ensureFirstRunSeed();
   registerGraphIpc();
+  // §B.9 Live Mods — mod records persist beside the graph nodes (the same
+  // JsonStore), every channel rides the same trust-gated registrars, and
+  // injection targets the live views this runtime already owns.
+  liveMods = createLiveMods({
+    chromeHandle: deps.chromeHandle,
+    chromeOn: deps.chromeOn,
+    store,
+    getActiveView: () => activeLiveView(deps.rt()),
+    iterViews: () => allLiveViews(),
+    notifyShell: (channel, payload) => {
+      for (const runtime of deps.allRuntimes()) {
+        if (runtime.spatialChrome && runtime.window && !runtime.window.isDestroyed()) {
+          runtime.window.webContents.send(channel, payload);
+        }
+      }
+    },
+  });
+  liveMods.register();
   // §B.8 plumbing bridge: shell shortcuts, external-app handoff toasts,
   // download progress, the matte find bar and permission prompts — all on
   // the same trust-gated registrars the graph seam uses.

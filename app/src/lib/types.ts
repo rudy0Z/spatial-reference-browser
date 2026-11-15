@@ -358,7 +358,7 @@ export const SPATIAL_DRAG_MIME = 'application/x-spatial-tab-seed'
 /** §B.2 header-omnibox slash commands. Per the Fresh-State Browser Law
  * (master spec §0.2) no test/stress generator is user-facing — the 700-node
  * fixture lives behind `window.__devStressSeed`. */
-export type SlashCommandId = 'canvas' | 'park' | 'new' | 'note' | 'cluster' | 'sandbox' | 'mods'
+export type SlashCommandId = 'canvas' | 'park' | 'new' | 'note' | 'cluster' | 'sandbox' | 'mods' | 'zap'
 
 export type SlashCommand = {
   id: SlashCommandId
@@ -374,6 +374,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { id: 'cluster', label: '/cluster', description: 'Wrap the active 1-hop neighbourhood into a region' },
   { id: 'sandbox', label: '/sandbox', description: 'Isolated sandbox tab for logged-out client testing' },
   { id: 'mods', label: '/mods', description: 'Studio Plugins & Mods drawer' },
+  { id: 'zap', label: '/zap', description: 'Arm the element zapper — Alt+Shift+Click hides an element' },
 ]
 
 /* ------------------------------------------------------------------ */

@@ -55,6 +55,18 @@ contextBridge.exposeInMainWorld('spatialAPI', {
   // Matte permission prompt
   onPermissionRequest: on('spatial:permission:request'),
   permissionRespond: (id, allow) => ipcRenderer.send('spatial:permission:respond', { id, allow }),
+  // §B.9 Live Mods — mod state crosses only these trust-gated command paths
+  modsList: () => ipcRenderer.invoke('spatial:mods:list'),
+  modSetEnabled: (id, enabled) => ipcRenderer.invoke('spatial:mods:set-enabled', { id, enabled }),
+  modSetCss: (domain, css) => ipcRenderer.invoke('spatial:mods:set-css', { domain, css }),
+  modApplyPreset: (domain, presetId, variant) =>
+    ipcRenderer.invoke('spatial:mods:apply-preset', { domain, presetId, variant }),
+  modRemove: (id) => ipcRenderer.invoke('spatial:mods:remove', { id }),
+  modRemoveZap: (id, selector) => ipcRenderer.invoke('spatial:mods:zap-remove', { id, selector }),
+  zapArm: () => ipcRenderer.invoke('spatial:zap:arm'),
+  zapDisarm: () => ipcRenderer.invoke('spatial:zap:disarm'),
+  onModsUpdated: on('spatial:mods:updated'),
+  onZapChanged: on('spatial:zap:changed'),
   // Window controls (existing trust-gated channels)
   win: {
     minimize: send('window:minimize'),
