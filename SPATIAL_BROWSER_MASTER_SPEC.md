@@ -192,3 +192,27 @@ Before tagging the final release, the browser MUST pass and log real measurement
    - Verify `noCapture` private tabs never write WebP thumbnails or Readability excerpts to disk[cite: 3].
 6. **Head-to-Head Benchmark Table:**
    - Record measured Cold Start (ms), Idle RAM (MB), 6-Heavy-Tab RAM (MB), 100-Sleeping-Tab RAM (MB), and Tab Switch Latency (ms) comparing **Spatial Browser** against **Upstream Blanc** (`research/blanc-src/`) and reference **Zen Browser / Chrome** baselines[cite: 2].
+
+---
+
+## ADDENDUM: LOCAL MCP SERVER BRIDGE (`browser/src/main/mcp-server.js`)
+
+Instead of bloating the UI with an in-browser AI chat sidebar, expose the Spatial Browser as a local Model Context Protocol (MCP) server from the Electron main process (`127.0.0.1` local-only transport + stdio CLI wrapper):
+
+1. **Read Tools:**
+   - `get_active_tab`: Returns active node metadata, `excerpt` (Readability markdown), `subPages`, and `StickyNote`s for its `urlHash`.
+   - `get_neighbourhood`: Returns the 1-hop and 2-hop connected nodes and edges (`selectNeighbourhood`).
+   - `search_spatial_graph`: Searches across all live/hibernated nodes, regions, and sticky notes (`selectSearchResults`).
+2. **Write Tools (Honoring "The System Pays, the User Confirms"):**
+   - `branch_hibernated_nodes(parentUuid, targets[])`: Spawns child satellite nodes around `parentUuid` with `ramState: 'hibernated'` (0 MB RAM) or `nodeType: 'ghost-echo'` so external agents never evict the user's 6-tab live warm pool.
+   - `add_sticky_note(url, text)`: Attaches a sticky note to the canonical `urlHash`.
+   - `tidy_region_moodboard(regionId)`: Runs `tidyToMoodboard(regionId)` to snap unpinned cards into the 16:10 contact sheet while preserving `isPinned` anchors and all graph edges.
+3. **Security & Privacy Guardrails:**
+   - Strictly strip any node where `noCapture === true` or `viaAuth === true` from all MCP responses.
+   - Never expose cookies, `sessionStorage`, credentials, or `ipc-trust.js` tokens over MCP.
+
+### Addendum hardening notes (2026-11-15, adopted with the addendum)
+- **Per-launch bearer token:** a 127.0.0.1 port is reachable by EVERY local process — the HTTP transport MUST require a bearer token generated at browser launch and handed only to the stdio CLI wrapper (env), and reject unauthenticated calls. Never log the token.
+- **Private tabs excluded entirely:** Blanc private-session tabs are never recorded anywhere — MCP responses exclude them in addition to the noCapture/viaAuth strip.
+- **Writes route through main-process command paths:** every MCP write tool calls the same store/main actions the UI uses (never direct vault/DB writes) so undo, persistence and edge consistency hold.
+- **Unit tests** for the pure handler parts live under `browser/tests/` (stripping rules, token rejection, url_hash dedupe for branch_hibernated_nodes).
