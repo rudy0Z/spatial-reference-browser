@@ -6,7 +6,7 @@
 
 ## 1. The 30-second brief
 
-> We are building **a spatial graph desktop browser for a designer with 600–700 open visual-reference tabs**: tabs are nodes on an infinite canvas, sleeping tabs cost 0 MB and keep their position, edges and thumbnail; link clicks spawn connected child nodes; clustering is suggest-only. **The fork base is locked: Blanc** (MIT Electron browser, Chromium 156 via Electron 45). Execution follows **`ZCODE_MASTER_PROMPT.md`** — the binding spec — in strict closed-loop phases, each gated by build + tests + live screenshot anti-slop audit + git tag. **Status: Phase 0 ✅ tagged; Phase 1.5 redesign built + verified except the fps number (measuring instrument limitation — see §4); Phases 2–6 not started.** Next action on resume: measure fps via puppeteer-core + Edge/Chrome headless CDP → tag `checkpoint/phase-1.5-clean-design` → Phase 2 (Rust core).
+> We are building **a spatial graph desktop browser for a designer with 600–700 open visual-reference tabs**: tabs are nodes on an infinite canvas, sleeping tabs cost 0 MB and keep their position, edges and thumbnail; link clicks spawn connected child nodes; clustering is suggest-only. **The fork base is locked: Blanc** (MIT Electron browser, Chromium 156 via Electron 45). Execution follows **`SPATIAL_BROWSER_MASTER_SPEC.md`** — the binding spec (incl. ADDENDUM B, the 3-Stage Island Continuum scope) — in strict closed-loop phases, each gated by build + tests + measured perf + live screenshot anti-slop audit + git tag. **Status (2026-11-15): Phases 0 / 1.5 / 2 ✅ TAGGED; Phase 3 foundation committed (`6f8db2f`: `browser/` fork rebranded "Spatial", telemetry stripped, adblock verified); Phases 3 completion → 6 executing as one checkpoint-per-stage workflow (200M-token / 12h envelope — see §8).**
 
 ---
 
@@ -120,19 +120,38 @@ The full Zen × Blanc × Obsidian Minimal redesign + the master spec's Phase 1.5
 
 ---
 
-## 8. Remaining phases (in strict order)
+## 8. Remaining phases (in strict order) — UPDATED 2026-11-15 with ADDENDUM B scope
 
 | Phase | Tag | Status | What it delivers | Exit gate |
 |---|---|---|---|---|
 | 0 — repo + prototype checkpoint | `checkpoint/phase-1-prototype` | ✅ done | git monorepo, eol protection, frozen baseline | tag exists, clean tree |
-| 1.5 — anti-slop redesign + Fresh-State law | `checkpoint/phase-1.5-clean-design` | ✅ done, tagged `c2228cb` | matte-graphite redesign, silent grammar, Zen chrome, empty first run, livePool fix, real fps bench | 115.6fps / 0% dropped / p95 15.5ms @ 700 nodes — measured (`audits/fps-bench-latest.json`); 13/13 unit tests; visual audit clean |
-| 2 — Rust spatial core | `checkpoint/phase-2-rust-core` | ⬜ not started | `crates/spatial-core`: R-tree, force+grid solver, fuzzy search + ghost scorer; TS wrapper `src/lib/spatialCore.ts` wired into `app/` | `cargo test --release`; <2ms @ 1,000 nodes; 700-node pan ≥55–60fps |
-| 3 — real browser + **local MCP bridge** | `checkpoint/phase-3-real-browser` | 🟡 in progress (fork ✅, shell ✅, plumbing+MCP+boids running) | fork `research/blanc-src` → `browser/` (keep clone pristine), rebrand (`brand:check`), strip telemetry/updater/sync/Mac-SHA1 preflight, mount redesigned shell on `blanc-chrome://` via `ipc-trust` gates, Two-Mode Warm Pool (6 live views / WebP-hidden canvas mode), **empty first run**, document-policy fix, real link-branching, **local MCP server bridge** (spec ADDENDUM: get_active_tab / get_neighbourhood / search_spatial_graph / branch_hibernated_nodes / add_sticky_note / tidy_region_moodboard — bearer-token + noCapture/viaAuth/private guardrails) | real sites (Figma, Are.na, YouTube-audio, GitHub login) load + branch + hibernate with real Task-Manager RAM drop + survive restart; `node --test` pure-module & trust tests; MCP guardrail tests |
-| 4 — Chrome extensions | `checkpoint/phase-4-chrome-extensions` | ⬜ not started | `electron-chrome-extensions` v4.10+ + `session.extensions.loadExtension()`; toolbar popover; Settings → Extensions (Load Unpacked + Web Store CRX3 1-click); keep Ghostery/uBO/1Password working. Known constraint: MV3 service-worker backgrounds pending upstream Electron (#44411) — MV2 + best-effort MV3, capability badge for gaps | unpacked extension (MV2 or MV3 content-script) injects into a real page, popup opens, survives restart |
-| 5 — 700-tab vault & local AI | `checkpoint/phase-5-700-tab-vault` | ⬜ not started | `better-sqlite3` WAL vault + disk WebP + 5 rolling backups + `.spatial-backup` export; MiniLM ONNX in `worker_thread`; importer from Chrome/Arc/bookmarks/URL-paste → nodes **born hibernated**, throttled thumbnail crawler | 700-tab import <3s with 0 live renderers; kill + corrupt `graph.sqlite` → backup recovery restores 100% |
-| 6 — release candidate | `checkpoint/phase-6-release-candidate` | ⬜ not started | main-process undo/redo, `Shift+Drag` marquee, domain/age/notes filter chips, `FOUNDER_GUIDE.md`, `electron-builder --dir` packaged Windows app | packaged `.exe` passes functional + perf + visual + zero-branding-remnant sweep |
+| 1.5 — anti-slop redesign + Fresh-State law | `checkpoint/phase-1.5-clean-design` | ✅ done | matte-graphite redesign, silent grammar, Zen chrome, empty first run, livePool fix, real fps bench | 115.6fps / 0% dropped / p95 15.5ms @ 700 nodes — measured (`audits/fps-bench-latest.json`); 13/13 unit tests; visual audit clean |
+| 2 — Rust spatial core | `checkpoint/phase-2-rust-core` | ✅ done | `crates/spatial-core` (cull/moodboard/force/search/boids) + WASM/TS seam | `cargo test --release`: layout median 1.58ms @ 1,000 nodes; 72/72 lib + golden parity tests |
+| 3 — real browser + 3-Stage Island + trails + plumbing + mods + plugins + MCP | `checkpoint/phase-3-real-browser` | 🟡 foundation committed (`6f8db2f`), completion in flight | fork+rebrand ✅; shell mount on `blanc-chrome://`; Two-Mode Warm Pool + Z-Order Guard + 0 MB hibernation; document-policy fix; **3-Stage Island Continuum** (resting pill dot-morph → dual-horizon deck → Mode B) with **elastic disclosure** + **Flows** + **Satellite Flow Notches** + guardrail store (spec ADDENDUM B); **path-preserving trails** (anchorText/contextSnippet/scrollYAtSpawn, cross-domain guard, Alt+Hover trace); **6 invisible plumbing gates**; **Live Mods** + **Studio Plugins A–D**; ambient boids new-tab; **local MCP bridge** | spec B.12 tests (trail/plumbing/mods/island) + real-site load/branch/hibernate with measured RAM drop + `node --test` suites + zero-branding check |
+| 4 — Chrome extensions | `checkpoint/phase-4-chrome-extensions` | ⬜ not started | `electron-chrome-extensions` v4.10+; ExtensionsDrawer (Load Unpacked + CRX3 1-click); toolbar popups under the Z-Order Guard; MV2 + best-effort MV3 w/ capability badge (#44411 pending) | unpacked extension injects into a real page, popup opens, survives restart |
+| 5 — 700-tab vault & local AI | `checkpoint/phase-5-700-tab-vault` | ⬜ not started | `better-sqlite3` WAL vault + disk WebP + 5 rolling backups; MiniLM ONNX worker; importer (Chrome/Zen-Firefox/Arc/Vivaldi/HTML) → **born hibernated**, throttled thumb crawler | 700-tab import <3s, 0 live renderers; kill + corrupt `graph.sqlite` → 100% recovery |
+| 6 — release candidate | `checkpoint/phase-6-release-candidate` | ⬜ not started | undo/redo, `Shift+Drag` marquee, filter chips, torture matrix + head-to-head benchmark (`audits/phase-6-torture-and-benchmark-report.md`), `FOUNDER_GUIDE.md`, `electron-builder --dir` Windows `.exe` | packaged `.exe` passes functional + perf + visual + zero-branding sweep |
 
-**Order after resuming:** fps measure → tag 1.5 → Phase 2 → Phase 3 → 4 → 5 → 6. Never batch; every gate before every tag.
+### Execution: one checkpoint-per-stage workflow (v4)
+
+The founder's envelope: **~200M tokens / ~12h**. The workflow executes Phase 3 as 8 sub-stages and Phases 4–6 as one stage each; **every stage ends with `git add -A && git commit`** so completed work survives between token pools. Interrupted work = audit disk, complete, never restart. Budget discipline in every builder persona: named-file reads only, all build/test output piped to files (exit code + tail only).
+
+| # | Stage | Commit checkpoint |
+|---|---|---|
+| A | Disk audit & resume inventory (what survived the stopped v3 run) | — |
+| B | Phase 3.1: shell mount (`blanc-chrome://` + ipc-trust) + Two-Mode Warm Pool + Z-Order Guard + 0 MB hibernation + document-policy fix | ✅ commit |
+| C | Phase 3.2: 3-Stage Island Continuum (Stage 0/1/2, elastic disclosure, Flows, Satellite Notches, guardrail store) | ✅ commit |
+| D | Phase 3.3: 6 invisible plumbing gates | ✅ commit |
+| E | Phase 3.4: path-preserving trails (provenance edges, cross-domain guard, Alt+Hover trace) | ✅ commit |
+| F | Phase 3.5: Live Mods engine + zapper + presets + Studio & Mods tab | ✅ commit |
+| G | Phase 3.6: Studio Plugins A–D | ✅ commit |
+| H | Phase 3.7: local MCP bridge + guardrail tests | ✅ commit |
+| I | Phase 3.8: integrated gates → tag `checkpoint/phase-3-real-browser` | ✅ tag |
+| J | Phase 4: Chrome extensions → tag | ✅ tag |
+| K | Phase 5: SQLite vault + importer → tag | ✅ tag |
+| L | Phase 6: RC + torture/benchmark + packaging → tag | ✅ tag |
+
+**Order after resuming:** audit disk (stage A) → resume from the first incomplete stage. Never batch phases; every gate before every tag; commit after every stage.
 
 ---
 

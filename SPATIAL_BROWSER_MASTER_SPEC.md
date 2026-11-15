@@ -216,3 +216,83 @@ Instead of bloating the UI with an in-browser AI chat sidebar, expose the Spatia
 - **Private tabs excluded entirely:** Blanc private-session tabs are never recorded anywhere — MCP responses exclude them in addition to the noCapture/viaAuth strip.
 - **Writes route through main-process command paths:** every MCP write tool calls the same store/main actions the UI uses (never direct vault/DB writes) so undo, persistence and edge consistency hold.
 - **Unit tests** for the pure handler parts live under `browser/tests/` (stripping rules, token rejection, url_hash dedupe for branch_hibernated_nodes).
+
+---
+
+## ADDENDUM B — 3-STAGE ISLAND CONTINUUM, PATH-PRESERVING TRAILS, INVISIBLE PLUMBING, LIVE MODS & STUDIO PLUGINS (2026-11-15, founder directive — BINDING for Phase 3+)
+
+Read alongside Phases 3–6 above. Integrate into Phase 3 (`browser/` Electron main + `app/src/` shell) and Phase 5 (SQLite vault). Positioning: we are NOT building another chat-sidebar browser — this is the 3-Stage Progressive Spatial Continuum that keeps Blanc's ultra-calm resting pill while solving the 600+ tab problem the moment the user interacts.
+
+### B.0 LAW OF MODULARITY
+Every power feature below (Live Mods, Studio Plugins) is a **toggleable, zero-clutter module** managed from a clean "Studio & Mods" tab inside `ExtensionsDrawer.tsx` (quick-toggles `/mods` and `/plugins` in `FloatingIslandPill.tsx`). Toggled off = **0 px screen real estate + 0 MB background overhead**; the resting `BrowserTopBar.tsx` and `SpatialCanvas.tsx` stay 100% matte-neutral.
+
+### B.1 STAGE 0 — RESTING ISLAND PILL + VISUAL DOT-MORPH (Mode A default)
+- Geometry: Blanc's floating pill, top-center, 36–40px height, matte graphite (`--bg-glass`/`#121215`), `1px var(--border-subtle)` hairline, Warm-Paper support.
+  - Left cluster: `<` Back, `>` Forward, up to **6 Smart Relational Dots** (`selectPillNeighbours`: came-from parent, live siblings, high-confidence Ghost Echo ≥ 0.78).
+  - Center trigger: active favicon + domain (`blanc.day` style) → click opens Stage 1; `Cmd/Ctrl+L` opens Stage 1 with input focused. `isLoading` pulse, `isAudible` waveform, `isRecording` dot.
+  - Right cluster: `+` (new tab), Adblock Shield w/ blocked count, Reload `↻`, Pin/Heart anchor toggle, Close `×`.
+- **Dot-morph hover:** hovering a dot springs it into that tab's 16px favicon (`stiffness 380, damping 30`) and drops a compact matte-glass **Visual Peek Card** (~232px wide): `16:10` cached WebP preview (even if sleeping @ 0 MB), full title, domain, and relationship subtitle in `var(--ink-muted)` (`↳ Branched from Are.na · Live` / `Sleeping · 0 MB`) — the WHY, not just the what.
+
+### B.2 STAGE 1 — EXPANDED DUAL-HORIZON ISLAND DECK (click island or `Cmd/Ctrl+L`)
+Morph via `layoutId="floating-island"` into a 720–760px wide (max `calc(100vw-24px)`) matte-glass popover (`var(--bg-elevated)`, `var(--shadow-pop)`, `rounded-[20px]`):
+- **Native `WebContentsView` Z-Order Guard (mandatory):** on open, `capturePage()` the active view → crisp static backdrop; `view.setVisible(false)` until close; `backdrop-filter: blur(20px)` renders cleanly above the page.
+- **Header row (48px):** security lock + unified omnibox (URL / search / `!bang` / `/command`), `<` `>` `↻`, Live-Mod trigger, Split-View toggle, Pin toggle, Collapse `^`.
+- **Horizon 1 — Active Working Session (`ramState === 'live'`):** header `Active session · {n}` + quiet `Park session ☾` action (`parkSessionToArchive()`); horizontal strip of live pills (favicon, readable title, audio indicator, per-pill `☾` = `parkNodeToArchive(uuid)`).
+- **Horizon 2 — Sleeping Visual Archive (`ramState === 'hibernated'`, 0 MB):**
+  - Filter bar: `All · {count}`, per-Flow/Region chips with counts, `Ghost Echoes · {n}`, `Notes · {n}` + instant fuzzy filter.
+  - **3–4 column 16:10 Visual Bento Scrub Grid** (`max-h-[340px]`, smooth scroll): thumbnail cards; **In-Place Stack Scrubbing** — a parent with `childCount > 0` shows a `+N` badge and a segmented scrub bar; sweeping the cursor across the card previews each child's thumbnail+title in place (video-timeline scrub, NOT Vivaldi's nested flyout column); **1-Hop Trail Connectors** — hovering a card lights sibling/parent cards sharing a `spawn`/`visit` edge (`var(--border-active)`) with a subtle 1px hairline between them; `via "Parent Title"` provenance line; click wakes (`openNodeInViewport`) and closes.
+- **Footer Utility Dock (40px):** left `+ New tab (Ctrl+T)`, `Sandbox (/sandbox)`, `Sleep session`; right Workspaces/Flows, Notes & Memos, Trail History, Downloads, Split View, **Studio Plugins & Mods (`Puzzle`)**, primary `[ ⤢ Open Spatial Canvas (Cmd+Space) ]`.
+
+### B.3 STAGE 2 — FULL MODE B CONTINUUM
+Clicking the Canvas button, pressing `Cmd/Ctrl+Space` (`Alt+Space`), or pinch-zooming out on the Stage 1 popover expands it into the full-viewport `SpatialCanvas.tsx`. The pill remains anchored top-center in Mode B — one consistent anchor across the whole browser.
+
+### B.4 ELASTIC ISLAND DISCLOSURE (3 tabs → 600+ tabs, never a forced mega-grid)
+- **Compact Mode (`totalNodes ≤ 8` and `hibernatedCount === 0`):** Blanc-minimal `480px`: omnibox header + clean vertical open-tab list (1-level indent for branched children) + utility row. Hide all Archive headers/filter bars when nothing is hibernated.
+- **Expanded Deck Mode (`totalNodes > 8` or `hibernatedCount > 0`):** spring-widen (`760px`) to the dual-horizon deck of B.2.
+
+### B.5 FLOWS REPLACE WALLED WORKSPACES & BOOKMARKS
+- A `Region` is reframed as a **Flow — a non-exclusive rooted tab tree** living in the same global session. Wake and work tabs from multiple Flows simultaneously; no workspace switcher, no context switch, nothing hidden.
+- **Pinning replaces bookmarks:** the Heart/Pin (`pinNode`) marks a permanent anchor in its Flow; parked-to-0MB pinned nodes keep their 16:10 thumbnail + StickyNotes in the Flow tree. No separate bookmark folders.
+- **Satellite Flow Notches:** with ≥2 active Flows (or a pinned Flow), render compact Satellite Pills (32px, `rounded-full`, `bg-surface-glass`, hairline) flanking the main island: 6px `region.color` dot + Flow name + `· count`. Hover → focused 320px mini-tree popover (root anchor + branched child thumbnails). Click a node → wakes into the current session without hiding other Flows. Click the pill header → Mode B pans (`fitView`) to that Flow's bounding box.
+
+### B.6 WORKING-SESSION GUARDRAILS (`useGraphStore.ts`)
+- Replace the hard `LIVE_POOL_LIMIT = 5` with user-configurable `performanceGuardrail: { maxLiveSessionTabs: 25 | number('5..100') | 'unlimited'; idleHibernateMinutes: 60 | 15|30|60|'never'; ramCeilingMb?: number }`.
+- `enforceLivePool` evicts the oldest non-immune live tab only past the ceiling; **immune: `isPinned`, `isAudible` (2.5s pause debounce), `recordingNodeId`** — never killed behind the user's back.
+- New actions: `parkNodeToArchive(uuid)` (hibernate + leave `workbenchUuids`), `parkSessionToArchive()` (all non-active, non-immune live tabs → 0 MB).
+- Startup restoration: persisted tabs boot `hibernated` (0 MB), showing cached WebPs in Stage 1/2. First run stays 1 clean New Tab (`https://new-tab.spatial/local`); `/seed-700` stays out of user UI (Phase 1.5 law); `window.__devStressSeed` is bench-only.
+- Fix `browser/`'s `document-policy.js` so `Cmd/Ctrl+Click` / `target="_blank"` branches spawn fresh main-process tabs (`noopener` + `parentUuid`) and are NEVER `inheritsDocumentPolicy`.
+
+### B.7 PATH-PRESERVING TRAILS (core graph lineage)
+1. **Rich provenance on every spawn edge** (`GraphEdgeRecord`/`SpatialTabNodeRecord` in `types.ts`; `spawnChildNode` in `useGraphStore.ts`; Electron link interceptor `tab-view.js:495-514, 687-715`): capture `anchorText` (exact clicked text/alt), `contextSnippet` (≤140 chars of surrounding sentence), `scrollYAtSpawn`. Hovering a spawn edge / node in `NeighbourhoodGlance.tsx` surfaces `via "Klim Söhne specimen"` in muted `var(--ink-muted)`.
+2. **Cross-Domain In-Place Navigation Guard:** in `navigateActiveNode(url, title)` — same-domain click → append previous URL/title to `subPages[]` filmstrip (cap 20); cross-domain click (`domainOf(newUrl) !== node.domain`) → do NOT overwrite: freeze the previous domain as a hibernated parent node (0 MB) at the current `(x, y)` and spawn the new domain as the active connected child (`kind: 'spawn'`) one step forward — the breadcrumb chain preserves itself.
+3. **Trace Rabbit Hole (full-chain lineage illumination):** hover = 1-hop neighbors (`opacity 1`, stroke `var(--ink-primary)` @ 0.45); **Alt+Hover** (or "Trace trail" in Glance) walks `parentUuid` + incoming `spawn`/`visit` edges upstream to the root hub and downstream to all descendants — the entire chronological research chain illuminates while unrelated clusters dim to `opacity 0.18`.
+
+### B.8 THE 6 INVISIBLE PLUMBING GATES (`browser/` main + `tab-view.js`) — MANDATORY PHASE 3 EXIT ITEMS
+1. **Keyboard focus arbitration:** `webContents.on('before-input-event')` on EVERY `WebContentsView` intercepts shell shortcuts before the page sees them and forwards to the `blanc-chrome://` shell: `Cmd/Ctrl+Space` & `Alt+Space` → canvas, `Cmd/Ctrl+L` → palette, `Cmd/Ctrl+S` → rail, `Cmd/Ctrl+Shift+G` → glance, `Cmd/Ctrl+/` → shortcuts, `Alt+N` → quick note, `Cmd/Ctrl+F` → find bar, `Esc` → layered dismissal.
+2. **External OS protocol handoff:** in `will-navigate`/`setWindowOpenHandler`, route non-HTTP(S) app schemes (`figma://`, `vscode://`, `cursor://`, `mailto:`, `discord://`, `spotify://`, `slack://`) to `shell.openExternal(url)` behind a clean confirmation toast — never a broken blank node.
+3. **Builder ergonomics:** `Cmd/Ctrl+Shift+R` → `reloadIgnoringCache()`; `Cmd/Ctrl+Alt+I`/`F12` → `toggleDevTools()` for the focused pane; "Inspect Element" at cursor on right-click.
+4. **Session partitions:** optional `partition` field on `SpatialTabNodeRecord` (`'default' | 'sandbox'` / `persist:region-<id>`); `/sandbox` spawns a live tab in isolated `session.fromPartition('temp:sandbox')` for logged-out localhost/client testing.
+5. **Native file drag-and-drop:** OS file drags pass into `WebContentsView` upload dropzones; drag-out of a view to the desktop triggers native Chromium download; `will-download` progress UI + `Cmd/Ctrl+J`.
+6. **Widevine DRM & hardware decode:** when stripping telemetry/updaters, preserve castLabs ECS Electron 45.2.1 Widevine CDM init + GPU rasterization flags (Spotify Web, Apple Music, 4K) + Ghostery/uBlock + 1Password.
+
+### B.9 ZERO-EXTENSION "LIVE MODS" ENGINE (`browser/src/main/live-mods.js`)
+- Domain-keyed mod records `{ id, domainPattern, name, enabled, css, zapSelectors: string[] }` in the store / Phase 5 vault. On `dom-ready` + `did-navigate-in-page` of a matching view, inject `zapSelectors.join(', ') + ' { display: none !important; }\n' + css` via `webContents.insertCSS(compiled, { cssOrigin: 'user' })`; `removeInsertedCSS(key)` on toggle-off.
+- **Interactive Element Zapper (`/zap`, armed `Alt+Shift+Click`):** hovered elements get a crisp `1px solid rgba(255,255,255,0.35)` outline; clicking a sticky banner/modal generates a resilient CSS selector, hides it immediately, and saves to that domain's `zapSelectors[]`. Survives reload.
+- **Per-domain CSS scratchpad** (JetBrains Mono, scoped to `activeNode.domain`) + 3 one-click presets: **Matte Reader** (strip sidebars/ads, `65ch` measure, clean type), **Desaturate Chrome** (dims noisy UI until hover), **Force Paper / Graphite Surface** (clean dark/warm-paper override for unstyled docs).
+
+### B.10 TOGGLEABLE STUDIO PLUGINS (`app/src/lib/plugins.ts` + preload injected only while active)
+- **Plugin A — Token & Typography X-Ray (`/xray`):** hovering any element shows a compact matte HUD pill (`#18181C`, 1px hairline): resolved `@font-face` family, weight, size, line-height, letter-spacing; text/bg color in HEX **and** OKLCH; computed `transition`/`cubic-bezier()`. **Click to capture:** formats the tokens to Markdown → `addStickyNote(activeNode.urlHash, spec)`.
+- **Plugin B — Drag-to-Clip Media Cards:** extends `parseSpatialDrop` (Pill) + drop handler (Canvas): dragging `<img>`/`<svg>`/`<video>` from a live page extracts the source URL, caches a local copy into `userData/media/`, and spawns a node tagged `mediaClip: { kind: 'image'|'video'|'svg', src, sourcePageUrl }` connected to `activeNodeUuid` via a `spawn` edge. Media cards render edge-to-edge art with source-domain attribution on hover — zero-friction Eagle/Are.na moodboarding beside full web tabs.
+- **Plugin C — Shader & Motion HUD (`/shader-hud`):** detects `<canvas>` elements, reports context type (`2d`/`webgl2`/`webgpu`), pixel resolution, live frame time (ms/fps); **5-Second Motion Loop Capture** records a `640×400` WebM compositor loop attached to the node so `RichCard` plays it on hover in Mode B.
+- **Plugin D — Split-View Responsive & Onion-Skin Compare:** extends the existing 2-pane split: right-pane header with breakpoint presets (`1440/1024/768/375`) via `webContents.enableDeviceEmulation()`; **Onion-Skin Overlay** superimposes a translucent snapshot of the left reference pane over the right pane (`opacity 0.0–1.0` slider + `mix-blend-mode: difference` toggle) for pixel-matching.
+
+### B.11 RESOURCE & CHECKPOINT PROTOCOL (founder directive, 2026-11-15)
+- **Envelope: ~200M tokens / ~12 hours** for Phases 3–6. Budget discipline is mandatory: agents read only named spec sections/files (never >400-line whole files), ALL build/install/test output is piped to files (read exit code + last 40 lines only), no raw tool-output flooding.
+- **Every stage ends with a git commit (checkpoint)** so no completed work is ever lost between token pools; phase tags (`checkpoint/phase-N-*`) remain the only release boundaries. Work interrupted mid-stage survives on disk and the next session audits-then-completes, never restarts from scratch.
+- The goal, scope, and workflow are documented in-repo: this addendum + `HANDOFF.md` §8 stage table.
+
+### B.12 VERIFICATION & EXIT CRITERIA FOR THIS ADDENDUM (Phase 3 gates)
+1. **Trail Preservation Test:** a 4-step cross-domain research chain + 3 branched children shows `anchorText`/`contextSnippet` in Glance; cross-domain in-place clicks preserve the prior domain as a hibernated parent; `Alt+Hover` illuminates the full multi-hop chain.
+2. **Plumbing Test:** focused inside a live YouTube/Figma view, `Cmd/Ctrl+Space` and `Cmd/Ctrl+L` still fire (before-input-event); `figma://` hands off to the OS with a toast.
+3. **Live Mods & Plugins Test:** zap an element → reload → stays hidden; X-Ray a heading → typography spec lands in the node's StickyNote; drag an image onto the pill → a connected media card spawns on the canvas.
+4. **Island Continuum Test:** resting pill dot-morph peek cards; Stage 1 dual-horizon deck with live strip + 0 MB scrub grid; elastic compact↔expanded transition; satellite flow notch hover/click behaviors; Stage 1 → Stage 2 expansion. All under the Anti-Slop checklist (matte, sentence case, canonical vars, spring motion only).
