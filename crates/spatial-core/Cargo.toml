@@ -1,0 +1,30 @@
+[package]
+name = "spatial-core"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic spatial engine core for the Spatial Browser (SPATIAL_BROWSER_MASTER_SPEC.md Phase 2): rstar R-tree viewport culling, moodboard contact-sheet solver, hybrid force relaxer, batch fuzzy search + Ghost Echo scorer, boids flocking."
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+rstar = "0.12"
+serde = { version = "1", features = ["derive"] }
+
+# WASM-only glue (feature `wasm`, built by wasm-pack)
+serde_json = { version = "1", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:serde_json"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

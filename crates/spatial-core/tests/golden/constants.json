@@ -1,0 +1,11 @@
+{
+ "cardWidth": 260,
+ "cardHeight": 199,
+ "pitchAspect": 1.6,
+ "pitchPaddingY": 41,
+ "pitchHeight": 240,
+ "pitchWidth": 384,
+ "slotInsetX": 62,
+ "slotInsetY": 20.5,
+ "overlapMargin": 12
+}

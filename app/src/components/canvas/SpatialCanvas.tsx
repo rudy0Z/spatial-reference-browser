@@ -91,6 +91,8 @@ import type {
   ViewMode,
 } from '../../lib/types'
 import SpatialTabNode from './nodes/SpatialTabNode'
+import { createSpatialCuller, getSpatialCoreBackend } from '../../lib/spatialCore'
+import type { SpatialCullerHandle, SpatialCoreBackend } from '../../lib/spatialCore'
 import { CanvasLodContext } from './canvasLodContext'
 import type { CanvasLodValue } from './canvasLodContext'
 
@@ -118,6 +120,18 @@ const ECHO_TOLERANCE_PX = 6
 
 /** Max nodes whose position is pushed into React Flow per animation frame. */
 const MAX_POSITION_UPDATES_PER_TICK = 40
+
+/**
+ * Phase 2 spatial core — viewport culling of per-frame position pushes. Card
+ * footprint for the culler's AABB index (the Phase 1.5 reference card shell)
+ * and the visibility margin grown around the live viewport. The margin also
+ * absorbs satellite-relaxation displacement (link distance ≤ ~290 px) and the
+ * ±5.5 px idle-orbit band, so a card about to enter the viewport is already
+ * receiving position updates when it becomes visible.
+ */
+const CULL_CARD_WIDTH_PX = 260
+const CULL_CARD_HEIGHT_PX = 199
+const CULL_MARGIN_PX = 320
 
 /**
  * Ambient orbit (§6 satellite wobble) runs only up to this node count — at
@@ -781,6 +795,10 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
   const lastAppliedRef = useRef<LayoutPositions>({})
   /** Last persisted (store) position seen per uuid — detects external moves (tidy). */
   const persistedPosRef = useRef<Map<NodeUuid, { x: number; y: number }>>(new Map())
+  /* Phase 2 spatial core — R-tree culler gating per-frame position pushes. */
+  const cullerRef = useRef<SpatialCullerHandle | null>(null)
+  const cullerBackendRef = useRef<SpatialCoreBackend>('ts')
+  const uuidByIndexRef = useRef<NodeUuid[]>([])
   const prevViewModeRef = useRef<ViewMode | null>(null)
 
   /* §4 semantic zoom — the tier is re-evaluated on GESTURE SETTLE, never
@@ -939,8 +957,32 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
     (positions: LayoutPositions) => {
       const byId = new Map<NodeUuid, { x: number; y: number }>()
       let budget = MAX_POSITION_UPDATES_PER_TICK
+      /* Phase 2 spatial core: R-tree viewport query — position pushes are
+         gated to cards intersecting the live viewport (+ margin), so
+         off-screen relaxation/orbit work never reaches React Flow. No
+         container, no index, or a stale index → no culling (safe default:
+         the push loop below behaves exactly as before Phase 2). */
+      let visibleUuids: Set<NodeUuid> | null = null
+      const culler = cullerRef.current
+      const container = containerRef.current
+      if (culler && container && culler.len() > 0 && uuidByIndexRef.current.length === culler.len()) {
+        const viewport = getViewport()
+        if (Number.isFinite(viewport.zoom) && viewport.zoom > 0) {
+          const minX = -viewport.x / viewport.zoom
+          const minY = -viewport.y / viewport.zoom
+          const maxX = (container.clientWidth - viewport.x) / viewport.zoom
+          const maxY = (container.clientHeight - viewport.y) / viewport.zoom
+          const uuidByIndex = uuidByIndexRef.current
+          visibleUuids = new Set<NodeUuid>()
+          for (const id of culler.queryViewport(minX, minY, maxX, maxY, CULL_MARGIN_PX)) {
+            const uuid = uuidByIndex[id]
+            if (uuid !== undefined) visibleUuids.add(uuid)
+          }
+        }
+      }
       for (const [uuid, position] of Object.entries(positions)) {
         if (draggingUuidsRef.current.has(uuid)) continue
+        if (visibleUuids && !visibleUuids.has(uuid)) continue
         const previous = lastAppliedRef.current[uuid]
         if (
           previous &&
@@ -966,7 +1008,7 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
         }),
       )
     },
-    [setNodes],
+    [setNodes, getViewport],
   )
 
   const handleSettle = useCallback((uuid: NodeUuid, x: number, y: number) => {
@@ -983,6 +1025,29 @@ function SpatialCanvasInner({ className }: SpatialCanvasProps) {
     onTick: handleTick,
     onSettle: handleSettle,
   })
+
+  /* Phase 2 spatial core — keep the culler's AABB index in sync with the
+     canvas node set (store home positions; relaxation/orbit displacement is
+     absorbed by CULL_MARGIN_PX). The handle is rebuilt when the spatial-core
+     backend upgrades (ts → wasm) so the R-tree picks up WASM once it lands. */
+  useEffect(() => {
+    const backend = getSpatialCoreBackend()
+    let culler = cullerRef.current
+    if (!culler || cullerBackendRef.current !== backend) {
+      culler?.free()
+      culler = createSpatialCuller()
+      cullerRef.current = culler
+      cullerBackendRef.current = backend
+    }
+    const uuidByIndex: NodeUuid[] = []
+    culler.setBoxes(
+      canvasNodes.map((node, index) => {
+        uuidByIndex.push(node.uuid)
+        return { id: index, x: node.x, y: node.y, width: CULL_CARD_WIDTH_PX, height: CULL_CARD_HEIGHT_PX }
+      }),
+    )
+    uuidByIndexRef.current = uuidByIndex
+  }, [canvasNodes])
 
   /* ---- external position changes → re-home through the solver ----
      The store owns persisted positions; when something other than a drag or a

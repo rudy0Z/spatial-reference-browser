@@ -24,7 +24,16 @@ import { persist } from 'zustand/middleware'
 import type { PersistStorage, StorageValue } from 'zustand/middleware'
 import { cosineSimilarity, embedText, tokenize } from '../lib/embed'
 import { enforceLivePool, isNodeImmune } from '../lib/livePool'
-import { computeMoodboardGrid } from '../lib/moodboard'
+import { MOODBOARD_CARD_HEIGHT, MOODBOARD_CARD_WIDTH } from '../lib/moodboard'
+import {
+  batchFuzzySearch,
+  computeMoodboardGridCore,
+  fuzzyScore,
+  getSharedSpatialCuller,
+  scoreGhostEchoes,
+  urlHashToNumber,
+} from '../lib/spatialCore'
+import type { GhostCandidateCoreInput, SearchDocCoreInput } from '../lib/spatialCore'
 import {
   buildCleanFirstRunState,
   buildStressSeed700,
@@ -342,10 +351,32 @@ function materializeGhosts(
   if (candidates.length === 0) return { nodes, edges }
   const nextNodes = { ...nodes }
   const nextEdges = { ...edges }
+  /* Phase 2 spatial core — the shared culler indexes every existing card
+     footprint so a ghost echo NEVER spawns on top of one (spec Phase 2 §1a,
+     "fast AABB collision checks"). Deterministic: the tether angle advances
+     by golden-angle steps until a free slot is found; when every attempt is
+     blocked it falls back to the original angle (pre-Phase-2 placement). */
+  const keepOut = getSharedSpatialCuller()
+  keepOut.setBoxes(
+    Object.values(nodes).map((node, index) => ({
+      id: index,
+      x: node.x,
+      y: node.y,
+      width: MOODBOARD_CARD_WIDTH,
+      height: MOODBOARD_CARD_HEIGHT,
+    })),
+  )
   candidates.forEach((candidate, index) => {
     const ghostUuid = `ghost:${active.uuid}:${candidate.node.uuid}`
     if (nextNodes[ghostUuid]) return
-    const angle = index * GOLDEN_ANGLE
+    const baseAngle = index * GOLDEN_ANGLE
+    let angle = baseAngle
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const probeX = active.x + Math.cos(angle) * GHOST_TETHER_DISTANCE
+      const probeY = active.y + Math.sin(angle) * GHOST_TETHER_DISTANCE
+      if (!keepOut.overlapsAny(probeX, probeY, MOODBOARD_CARD_WIDTH, MOODBOARD_CARD_HEIGHT)) break
+      angle += GOLDEN_ANGLE
+    }
     const ghost: SpatialTabNodeRecord = {
       uuid: ghostUuid,
       urlHash: candidate.node.urlHash,
@@ -390,6 +421,13 @@ function materializeGhosts(
  * §6 Ghost Echo matcher — scores every non-live, non-ghost node against the
  * active node and returns those at or above GHOST_ECHO_THRESHOLD, strongest
  * first, capped at `limit`.
+ *
+ * Phase 2 spatial core: the filter/sort/cap shell and the batch cosine + co-
+ * visit + recency scoring both run through `lib/spatialCore` (Rust WASM when
+ * ready, its exact-port TS mirror otherwise). The shell mirrors the previous
+ * in-store loop (skip self / ghosts / live / same urlHash / suppressed) so
+ * results are identical — `scoreGhostEcho` above stays as the single-pair TS
+ * reference.
  */
 export function computeGhostEchoCandidates(
   active: SpatialTabNodeRecord,
@@ -402,20 +440,51 @@ export function computeGhostEchoCandidates(
   const adjacency = buildAdjacency(edges)
   const activeEntry = adjacency.get(active.uuid)
   const maxEdgeWeightFromActive = activeEntry?.maxWeight ?? 0
-  const candidates: GhostEchoCandidate[] = []
+  const candidateInputs: GhostCandidateCoreInput[] = []
   for (const node of Object.values(nodes)) {
-    if (node.uuid === active.uuid) continue
-    if (node.nodeType === 'ghost-echo') continue
-    if (node.ramState === 'live') continue
-    if (node.urlHash === active.urlHash) continue
-    if (suppressedHashes.includes(node.urlHash)) continue
-    const weight = activeEntry?.targets.get(node.uuid) ?? 0
-    const breakdown = scoreGhostEcho(active, node, weight, maxEdgeWeightFromActive, now)
-    if (breakdown.relevance >= GHOST_ECHO_THRESHOLD) {
-      candidates.push({ node, ...breakdown })
-    }
+    candidateInputs.push({
+      uuid: node.uuid,
+      title: node.title,
+      domain: node.domain,
+      keywords: node.keywords,
+      searchQuery: node.searchQuery,
+      excerpt: node.excerpt,
+      edgeWeight: activeEntry?.targets.get(node.uuid) ?? 0,
+      lastVisitedAt: node.lastVisitedAt,
+      isGhostEcho: node.nodeType === 'ghost-echo',
+      isLive: node.ramState === 'live',
+      urlHash: urlHashToNumber(node.urlHash),
+      urlHashSuppressed: suppressedHashes.includes(node.urlHash),
+    })
   }
-  return candidates.sort((a, b) => b.relevance - a.relevance).slice(0, limit)
+  const scored = scoreGhostEchoes(
+    {
+      uuid: active.uuid,
+      title: active.title,
+      domain: active.domain,
+      keywords: active.keywords,
+      searchQuery: active.searchQuery,
+      excerpt: active.excerpt,
+      urlHash: urlHashToNumber(active.urlHash),
+    },
+    candidateInputs,
+    maxEdgeWeightFromActive,
+    now,
+    limit,
+  )
+  const candidates: GhostEchoCandidate[] = []
+  for (const entry of scored) {
+    const node = nodes[entry.uuid]
+    if (!node) continue
+    candidates.push({
+      node,
+      cosine: entry.cosine,
+      coVisit: entry.coVisit,
+      recency: entry.recency,
+      relevance: entry.relevance,
+    })
+  }
+  return candidates
 }
 
 /* ------------------------------------------------------------------ */
@@ -663,7 +732,7 @@ export const useGraphStore = create<GraphStore>()(
             (node) => node.regionId === regionId && node.nodeType !== 'ghost-echo',
           )
           if (members.length === 0) return
-          const result = computeMoodboardGrid(
+          const result = computeMoodboardGridCore(
             members.map((node) => ({ uuid: node.uuid, x: node.x, y: node.y, isPinned: node.isPinned })),
           )
           const nextNodes: Record<NodeUuid, SpatialTabNodeRecord> = { ...state.nodes }
@@ -1498,23 +1567,6 @@ export function selectCanvasEdges(state: GraphStore): GraphEdgeRecord[] {
   return Object.values(state.edges).filter((edgeRecord) => visible.has(edgeRecord.source) && visible.has(edgeRecord.target))
 }
 
-/** Subsequence fuzzy score; exact substring hits rank highest. */
-function fuzzyScore(query: string, text: string): number {
-  if (!text) return 0
-  const haystack = text.toLowerCase()
-  const exact = haystack.indexOf(query)
-  if (exact >= 0) return 3 - Math.min(1.5, exact * 0.02)
-  let cursor = 0
-  let gaps = 0
-  for (let i = 0; i < query.length; i++) {
-    const found = haystack.indexOf(query[i], cursor)
-    if (found === -1) return 0
-    gaps += found - cursor
-    cursor = found + 1
-  }
-  return Math.max(0.4, 1.4 - gaps * 0.015)
-}
-
 function snippetAround(text: string, query: string, radius = 56): string {
   const index = text.toLowerCase().indexOf(query)
   if (index === -1) return text.slice(0, radius * 2)
@@ -1527,42 +1579,44 @@ function snippetAround(text: string, query: string, radius = 56): string {
  * §3 palette fuzzy search across open tabs, hibernated nodes, sticky note
  * text and voice-note titles. Empty query → empty result (the palette shows
  * its own recents/slash commands).
+ *
+ * Phase 2 spatial core: tab scoring is batched through `lib/spatialCore`
+ * (Rust WASM when ready, its exact-port TS mirror otherwise); notes and voice
+ * memos keep the single-pair scorer, which both backends share bit-for-bit.
+ * Snippet construction stays here (UI-only, as the Rust doc comment states).
  */
 export function selectSearchResults(state: GraphStore, rawQuery: string, limit = 12): SearchResult[] {
   const query = rawQuery.trim().toLowerCase()
   if (!query) return []
   const results: SearchResult[] = []
 
+  const docs: SearchDocCoreInput[] = []
+  const nodeByUuid = new Map<NodeUuid, SpatialTabNodeRecord>()
   for (const node of Object.values(state.nodes)) {
     if (node.nodeType === 'ghost-echo') continue
-    const candidates: Array<{ text: string; weight: number }> = [
-      { text: node.title, weight: 1.0 },
-      { text: node.domain, weight: 0.7 },
-      { text: node.url, weight: 0.6 },
-      { text: node.searchQuery ?? '', weight: 0.7 },
-    ]
-    for (const keyword of node.keywords) candidates.push({ text: keyword, weight: 0.7 })
-    let best = 0
-    let bestText = ''
-    for (const candidate of candidates) {
-      const score = fuzzyScore(query, candidate.text) * candidate.weight
-      if (score > best) {
-        best = score
-        bestText = candidate.text
-      }
-    }
-    if (best > 0) {
-      results.push({
-        kind: 'tab',
-        id: node.uuid,
-        nodeId: node.uuid,
-        noteId: null,
-        memoId: null,
-        title: node.title,
-        snippet: `${node.domain} · ${node.ramState === 'live' ? 'Live tab' : isColdArchive(node, Date.now()) ? 'Cold archive' : 'Hibernated'}${bestText ? ` — ${bestText}` : ''}`,
-        score: best,
-      })
-    }
+    nodeByUuid.set(node.uuid, node)
+    docs.push({
+      uuid: node.uuid,
+      title: node.title,
+      domain: node.domain,
+      url: node.url,
+      searchQuery: node.searchQuery,
+      keywords: node.keywords,
+    })
+  }
+  for (const hit of batchFuzzySearch(query, docs, limit)) {
+    const node = nodeByUuid.get(hit.uuid)
+    if (!node) continue
+    results.push({
+      kind: 'tab',
+      id: node.uuid,
+      nodeId: node.uuid,
+      noteId: null,
+      memoId: null,
+      title: node.title,
+      snippet: `${node.domain} · ${node.ramState === 'live' ? 'Live tab' : isColdArchive(node, Date.now()) ? 'Cold archive' : 'Hibernated'}${hit.bestText ? ` — ${hit.bestText}` : ''}`,
+      score: hit.score,
+    })
   }
 
   for (const note of Object.values(state.notes)) {
